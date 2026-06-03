@@ -17,9 +17,9 @@ HF_ENDPOINT=https://hf-mirror.com hf download jingyaogong/minimind-o_dataset \
 
 ln -sf /home/jovyan/h800fast/wangzekai/minimind-o/dataset /home/jovyan/h800fast/wangzekai/ctm_llm/dataset_data
 
-# ----- Tokenizer (来自 minimind-o 模型) -----
+# ----- Tokenizer (来自 minimind-3o 模型) -----
 mkdir -p /home/jovyan/h800fast/wangzekai/minimind-o/model
-HF_ENDPOINT=https://hf-mirror.com hf download jingyaogong/minimind-o \
+HF_ENDPOINT=https://hf-mirror.com hf download jingyaogong/minimind-3o \
   --local-dir /home/jovyan/h800fast/wangzekai/minimind-o/model \
   --include "tokenizer*"
 
