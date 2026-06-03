@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Generated outputs (weights, checkpoints, visualizations)
+out/
+
+# SwanLab experiment logs
+trainer/swanlog/
+
+# External data (symlink to minimind-o/dataset, ~17GB parquet)
+dataset_data
+
+# Reference tokenizer (symlink to minimind-o/model)
+model_tokenizer
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
