@@ -8,14 +8,20 @@ CTM-LLM 目前只使用文本对话数据，来自 minimind-o 项目。
 export http_proxy="http://public-proxy.qihoo.net:3128"
 export https_proxy="http://public-proxy.qihoo.net:3128"
 
-# 创建数据目录并下载
+# ----- 训练数据 -----
 mkdir -p /home/jovyan/h800fast/wangzekai/minimind-o/dataset
 HF_ENDPOINT=https://hf-mirror.com hf download jingyaogong/minimind-o_dataset \
   --local-dir /home/jovyan/h800fast/wangzekai/minimind-o/dataset \
   --repo-type dataset \
   --include "sft_t2a_mini.parquet"
 
-# 创建符号链接 (仓库 .gitignore 已排除 dataset_data)
-cd /home/jovyan/h800fast/wangzekai/ctm_llm
-ln -sf /home/jovyan/h800fast/wangzekai/minimind-o/dataset dataset_data
+ln -sf /home/jovyan/h800fast/wangzekai/minimind-o/dataset /home/jovyan/h800fast/wangzekai/ctm_llm/dataset_data
+
+# ----- Tokenizer (来自 minimind-o 模型) -----
+mkdir -p /home/jovyan/h800fast/wangzekai/minimind-o/model
+HF_ENDPOINT=https://hf-mirror.com hf download jingyaogong/minimind-o \
+  --local-dir /home/jovyan/h800fast/wangzekai/minimind-o/model \
+  --include "tokenizer*"
+
+ln -sf /home/jovyan/h800fast/wangzekai/minimind-o/model /home/jovyan/h800fast/wangzekai/ctm_llm/model_tokenizer
 ```
