@@ -7,8 +7,11 @@ import warnings
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import torch
+import torch.distributed as dist
 from torch import optim
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from model.config import CTMLLMConfig
 from dataset.text_dataset import TextDataset
 from trainer.trainer_utils import (
@@ -27,7 +30,20 @@ def format_time(seconds):
     return f'{seconds / 3600:.2f}h'
 
 
-def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args, swanlab, start_step=0):
+def setup_ddp():
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
+                swanlab, start_step=0, rank=0):
     model.train()
     epoch_start = time.time()
     total_loss = 0.0
@@ -52,7 +68,6 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
 
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -60,7 +75,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
         total_loss += loss.item() * args.accumulation_steps
         total_steps += 1
 
-        if step % args.log_interval == 0 or step == iters:
+        if rank == 0 and (step % args.log_interval == 0 or step == iters):
             avg_loss = total_loss / total_steps
             best_tick_mean = losses_per_tick.argmin(dim=1).float().mean().item()
             conf_tick_mean = (1 - certainties).argmax(dim=1).float().mean().item()
@@ -94,16 +109,17 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             total_loss = 0.0
             total_steps = 0
 
-        if step % args.save_interval == 0 or step == iters:
+        if rank == 0 and (step % args.save_interval == 0 or step == iters):
             save_path = os.path.join(args.save_dir, f'{args.save_weight}_{args.hidden_size}.pth')
             resume_path = os.path.join(args.save_dir, f'{args.save_weight}_{args.hidden_size}_resume.pth')
-            raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+            raw = model.module._orig_mod if hasattr(model.module, '_orig_mod') else model.module
             save_checkpoint(raw, optimizer, epoch, step, resume_path, scaler)
             torch.save(
                 {k: v.half().cpu() for k, v in raw.state_dict().items()}, save_path)
 
-    epoch_time = time.time() - epoch_start
-    Logger(f'Epoch {epoch + 1} done in {format_time(epoch_time)}')
+    if rank == 0:
+        epoch_time = time.time() - epoch_start
+        Logger(f'Epoch {epoch + 1} done in {format_time(epoch_time)}')
     return step
 
 
@@ -114,8 +130,6 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=5e-4)
-    parser.add_argument('--device', type=str,
-                        default='cuda:0' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--dtype', type=str, default='bfloat16')
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--accumulation_steps', type=int, default=4)
@@ -145,6 +159,14 @@ if __name__ == '__main__':
     parser.add_argument('--use_compile', type=int, default=0, choices=[0, 1])
     args = parser.parse_args()
 
+    ddp = int(os.environ.get('WORLD_SIZE', 1)) > 1
+    if ddp:
+        local_rank, rank, world_size = setup_ddp()
+        args.device = f'cuda:{local_rank}'
+    else:
+        local_rank, rank, world_size = 0, 0, 1
+        args.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
     os.makedirs(args.save_dir, exist_ok=True)
     setup_seed(args.seed)
 
@@ -161,7 +183,8 @@ if __name__ == '__main__':
         n_synch_action=args.n_synch_action,
         synapse_depth=args.synapse_depth,
     )
-    Logger(f'Config: {config}')
+    if rank == 0:
+        Logger(f'Config: {config}')
 
     device_type = 'cuda' if 'cuda' in args.device else 'cpu'
     dtype = torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16
@@ -170,7 +193,11 @@ if __name__ == '__main__':
     model = create_model(config, args.device)
     if args.use_compile:
         model = torch.compile(model)
-        Logger('torch.compile enabled')
+        if rank == 0:
+            Logger('torch.compile enabled')
+    if ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
     tokenizer = load_tokenizer(args.tokenizer_path)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -178,7 +205,7 @@ if __name__ == '__main__':
     scaler = torch.amp.GradScaler(device_type, enabled=use_fp16)
 
     swanlab = None
-    if args.use_swanlab:
+    if args.use_swanlab and rank == 0:
         import swanlab
         run_name = args.swanlab_name or f'CTM-LLM-{args.hidden_size}d-{args.d_model}m-{args.iterations}iter'
         swanlab = swanlab.init(project=args.swanlab_project, name=run_name, config=vars(args))
@@ -196,25 +223,41 @@ if __name__ == '__main__':
             else:
                 state = torch.load(weight_path, map_location=args.device, weights_only=False)
                 model.load_state_dict(state, strict=False)
-                Logger(f'Loaded weights: {weight_path}')
+                if rank == 0:
+                    Logger(f'Loaded weights: {weight_path}')
 
     dataset = TextDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    Logger(f'Dataset: {len(dataset)} samples')
+    if rank == 0:
+        Logger(f'Dataset: {len(dataset)} samples')
 
     train_start = time.time()
     for epoch in range(start_epoch, args.epochs):
         setup_seed(args.seed + epoch)
-        loader = DataLoader(
-            dataset, batch_size=args.batch_size, shuffle=True,
-            num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        if ddp:
+            sampler = DistributedSampler(dataset, shuffle=True, num_replicas=world_size, rank=rank)
+            sampler.set_epoch(epoch)
+            loader = DataLoader(
+                dataset, batch_size=args.batch_size, sampler=sampler,
+                num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        else:
+            loader = DataLoader(
+                dataset, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.num_workers, pin_memory=True, drop_last=True)
+
+        iters = len(loader)
         skip = start_step if epoch == start_epoch and start_step > 0 else 0
-        if skip > 0:
+        if skip > 0 and rank == 0:
             Logger(f'Epoch[{epoch + 1}]: skip first {skip} steps')
         last_step = train_epoch(
-            epoch, loader, len(loader), model, optimizer, scaler, autocast_ctx, args, swanlab, start_step=skip)
+            epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args, swanlab,
+            start_step=skip, rank=rank)
         start_step = 0
 
-    total_time = time.time() - train_start
-    Logger(f'Training complete! Total: {format_time(total_time)}')
-    if swanlab:
-        swanlab.finish()
+    if rank == 0:
+        total_time = time.time() - train_start
+        Logger(f'Training complete! Total: {format_time(total_time)}')
+        if swanlab:
+            swanlab.finish()
+
+    if ddp:
+        cleanup_ddp()
