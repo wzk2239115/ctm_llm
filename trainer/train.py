@@ -60,7 +60,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             pg['lr'] = lr
 
         with autocast_ctx:
-            loss, losses_per_tick, certainties = model.forward_train(
+            loss, losses_per_tick, certainties = raw_model.forward_train(
                 input_ids, labels, num_iters=args.iterations)
             loss = loss / args.accumulation_steps
 
@@ -112,7 +112,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
         if rank == 0 and (step % args.save_interval == 0 or step == iters):
             save_path = os.path.join(args.save_dir, f'{args.save_weight}_{args.hidden_size}.pth')
             resume_path = os.path.join(args.save_dir, f'{args.save_weight}_{args.hidden_size}_resume.pth')
-            raw = model.module._orig_mod if hasattr(model.module, '_orig_mod') else model.module
+            raw = raw_model._orig_mod if hasattr(raw_model, '_orig_mod') else raw_model
             save_checkpoint(raw, optimizer, epoch, step, resume_path, scaler)
             torch.save(
                 {k: v.half().cpu() for k, v in raw.state_dict().items()}, save_path)
@@ -197,6 +197,8 @@ if __name__ == '__main__':
             Logger('torch.compile enabled')
     if ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    raw_model = model.module if hasattr(model, 'module') else model
 
     tokenizer = load_tokenizer(args.tokenizer_path)
 
