@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import math
@@ -38,7 +39,16 @@ def create_model(config: CTMLLMConfig, device='cpu'):
 
 
 def load_tokenizer(tokenizer_path):
-    return AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    if tokenizer.chat_template is None:
+        config_path = os.path.join(tokenizer_path, 'tokenizer_config.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            if 'chat_template' in config:
+                tokenizer.chat_template = config['chat_template']
+                Logger(f'chat_template loaded from {config_path}')
+    return tokenizer
 
 
 def save_checkpoint(model, optimizer, epoch, step, save_path, scaler=None):
