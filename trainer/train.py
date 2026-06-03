@@ -109,7 +109,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CTM-LLM Training')
-    parser.add_argument('--save_dir', type=str, default='../out')
+    parser.add_argument('--save_dir', type=str, default='out')
     parser.add_argument('--save_weight', type=str, default='ctm_llm')
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=8)
@@ -136,7 +136,7 @@ if __name__ == '__main__':
     parser.add_argument('--data_path', type=str,
                         default='dataset_data/sft_t2a_mini.parquet')
     parser.add_argument('--tokenizer_path', type=str,
-                        default='../model_tokenizer')
+                        default='model_tokenizer')
     parser.add_argument('--from_weight', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use_swanlab', action='store_true')
