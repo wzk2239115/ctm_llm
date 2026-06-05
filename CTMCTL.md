@@ -68,6 +68,16 @@ repository changed, the worker restarts itself so the latest pool/training code
 is loaded. This means you usually do not need to rebuild the pool after a
 `git push`; leave workers online and submit the next task.
 
+If the cluster needs a proxy for Git, set it in the cluster config:
+
+```bash
+GIT_HTTP_PROXY=http://public-proxy.qihoo.net:3128
+GIT_HTTPS_PROXY=http://public-proxy.qihoo.net:3128
+```
+
+This proxy is used only for `git pull`. Pool HTTP traffic to the master remains
+direct and does not use proxy settings.
+
 Disable this during debugging if needed:
 
 ```bash

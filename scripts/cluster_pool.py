@@ -281,13 +281,21 @@ def git_head():
         return "unknown"
 
 
-def git_pull_ff_only():
+def git_pull_ff_only(config):
     before = git_head()
+    env = os.environ.copy()
+    if config.get("GIT_HTTP_PROXY"):
+        env["http_proxy"] = config["GIT_HTTP_PROXY"]
+        env["HTTP_PROXY"] = config["GIT_HTTP_PROXY"]
+    if config.get("GIT_HTTPS_PROXY"):
+        env["https_proxy"] = config["GIT_HTTPS_PROXY"]
+        env["HTTPS_PROXY"] = config["GIT_HTTPS_PROXY"]
     proc = subprocess.run(
         ["git", "pull", "--ff-only"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=env,
     )
     after = git_head()
     return {
@@ -358,7 +366,7 @@ def run_worker(args):
                 })
             else:
                 if args.auto_pull:
-                    pull = git_pull_ff_only()
+                    pull = git_pull_ff_only(config)
                     if pull["ok"]:
                         print(
                             f"[worker] git pull ok: {pull['before']} -> {pull['after']}",
