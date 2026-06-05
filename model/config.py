@@ -22,6 +22,10 @@ class CTMLLMConfig:
         self.num_hidden_layers = kwargs.get('num_hidden_layers', 12)
         self.tie_word_embeddings = kwargs.get('tie_word_embeddings', True)
 
+        self.self_cond = kwargs.get('self_cond', True)
+        self.cross_layer_state = kwargs.get('cross_layer_state', True)
+        self.block_size = kwargs.get('block_size', 4)
+
         assert self.d_model >= max(self.n_synch_out, self.n_synch_action), \
             f"d_model({self.d_model}) must >= n_synch_out({self.n_synch_out}) and n_synch_action({self.n_synch_action})"
         assert self.d_input % self.heads == 0, \

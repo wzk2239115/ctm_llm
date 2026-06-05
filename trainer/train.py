@@ -146,6 +146,9 @@ if __name__ == '__main__':
     parser.add_argument('--n_synch_out', type=int, default=512)
     parser.add_argument('--n_synch_action', type=int, default=512)
     parser.add_argument('--synapse_depth', type=int, default=3)
+    parser.add_argument('--self_cond', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--cross_layer_state', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--block_size', type=int, default=4)
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--data_path', type=str,
                         default='dataset_data/sft_t2a_mini.parquet')
@@ -182,6 +185,9 @@ if __name__ == '__main__':
         n_synch_out=args.n_synch_out,
         n_synch_action=args.n_synch_action,
         synapse_depth=args.synapse_depth,
+        self_cond=bool(args.self_cond),
+        cross_layer_state=bool(args.cross_layer_state),
+        block_size=args.block_size,
     )
     if rank == 0:
         Logger(f'Config: {config}')

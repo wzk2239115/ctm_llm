@@ -43,6 +43,7 @@ class CTMBlock(nn.Module):
         self.heads = config.heads
         self.head_dim = config.d_input // config.heads
         self.neuron_select_type = config.neuron_select_type
+        self.self_cond = config.self_cond
 
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -57,6 +58,9 @@ class CTMBlock(nn.Module):
         self.attn_drop = nn.Dropout(config.dropout)
 
         synapse_in = config.d_input + config.d_model
+        if config.self_cond:
+            synapse_in += config.d_model
+            self.self_cond_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         if config.synapse_depth == 1:
             self.synapses = nn.Sequential(
                 nn.Dropout(config.dropout),
@@ -153,7 +157,8 @@ class CTMBlock(nn.Module):
         return alpha / torch.sqrt(beta), alpha, beta
 
     def forward(self, x, pos_emb=None, past_kv=None, use_cache=False, track=False,
-                num_iters=None, return_all_ticks=False):
+                num_iters=None, return_all_ticks=False,
+                prev_activated=None, prev_trace=None):
         B, T, _ = x.shape
         device = x.device
 
@@ -170,10 +175,16 @@ class CTMBlock(nn.Module):
         present_kv = (k, v) if use_cache else None
         S = k.size(1)
 
-        state_trace = self.start_trace.view(1, 1, self.d_model, self.memory_length) \
-            .expand(B, T, -1, -1).contiguous()
-        activated = self.start_activated_state.view(1, 1, self.d_model) \
-            .expand(B, T, -1).contiguous()
+        if prev_trace is not None:
+            state_trace = prev_trace
+        else:
+            state_trace = self.start_trace.view(1, 1, self.d_model, self.memory_length) \
+                .expand(B, T, -1, -1).contiguous()
+        if prev_activated is not None:
+            activated = prev_activated
+        else:
+            activated = self.start_activated_state.view(1, 1, self.d_model) \
+                .expand(B, T, -1).contiguous()
 
         self.decay_action.data.clamp_(0, 15)
         self.decay_out.data.clamp_(0, 15)
@@ -197,6 +208,7 @@ class CTMBlock(nn.Module):
 
         num_iters = num_iters if num_iters is not None else self.iterations
         all_tick_outs = [] if (track or return_all_ticks) else None
+        prev_sync_o_activated = None
 
         for tick in range(num_iters):
             sync_a, alpha_a, beta_a = self._compute_synch(
@@ -217,7 +229,13 @@ class CTMBlock(nn.Module):
             attn = self.attn_drop(
                 self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1)))
 
-            pre_syn = torch.cat([attn, activated], dim=-1)
+            pre_syn_parts = [attn, activated]
+            if self.self_cond:
+                if prev_sync_o_activated is not None:
+                    pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
+                else:
+                    pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
+            pre_syn = torch.cat(pre_syn_parts, dim=-1)
             state = self.synapses(pre_syn)
 
             state_trace = torch.cat(
@@ -225,9 +243,9 @@ class CTMBlock(nn.Module):
 
             activated = self.trace_processor(state_trace)
 
-            # Compute output synchronisation at every tick
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
+            prev_sync_o_activated = activated
             tick_out = self.output_proj(sync_o)
             if all_tick_outs is not None:
                 all_tick_outs.append(tick_out)
@@ -238,7 +256,6 @@ class CTMBlock(nn.Module):
                 tracking['sync_action'].append(sync_a[0].detach().cpu().numpy())
                 tracking['state_trace'].append(state_trace[0].detach().cpu().numpy())
 
-        # Main output = last tick's output
         ctm_out = all_tick_outs[-1] if all_tick_outs is not None else \
             self.output_proj(self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)[0])
@@ -252,6 +269,9 @@ class CTMBlock(nn.Module):
             for k_arr in ['pre_activations', 'post_activations', 'sync_action', 'state_trace']:
                 tracking[k_arr] = np.array(tracking[k_arr])
             extras['tracking'] = tracking
+
+        extras['final_activated'] = activated
+        extras['final_trace'] = state_trace
 
         if extras:
             return x, present_kv, extras
@@ -280,11 +300,17 @@ class CTMModel(nn.Module):
         tracking_all = {}
         last_tick_outs = None
 
+        prev_activated = None
+        prev_trace = None
+
         for layer, past_kv in zip(self.layers, past_key_values):
             is_last = layer.layer_id == len(self.layers) - 1
             layer_kwargs = dict(
                 pos_emb=pos_emb, past_kv=past_kv,
-                use_cache=use_cache, num_iters=num_iters)
+                use_cache=use_cache, num_iters=num_iters,
+                prev_activated=prev_activated if self.config.cross_layer_state else None,
+                prev_trace=prev_trace if self.config.cross_layer_state else None,
+            )
 
             if track and not is_last:
                 result = layer(h, track=True, return_all_ticks=False, **layer_kwargs)
@@ -298,7 +324,17 @@ class CTMModel(nn.Module):
                 if return_all_ticks:
                     last_tick_outs = extras.get('tick_outputs')
             else:
-                h, present = layer(h, **layer_kwargs)
+                result = layer(h, **layer_kwargs)
+                if len(result) == 3:
+                    h, present, extras = result
+                else:
+                    h, present = result
+                    extras = {}
+
+            if self.config.cross_layer_state and isinstance(extras, dict):
+                prev_activated = extras.get('final_activated', prev_activated)
+                prev_trace = extras.get('final_trace', prev_trace)
+
             presents.append(present)
 
         h = self.norm(h)
@@ -330,6 +366,7 @@ class CTMForCausalLM(nn.Module):
         logits = self.lm_head(h)
         loss = None
         if labels is not None:
+            bs = self.config.block_size
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
@@ -339,14 +376,16 @@ class CTMForCausalLM(nn.Module):
 
     def forward_train(self, input_ids, labels, num_iters=None):
         B = input_ids.size(0)
+        bs = self.config.block_size
         h, _, tick_outs = self.model(
             input_ids, track=False, num_iters=num_iters, return_all_ticks=True)
         num_ticks = tick_outs.size(-1)
 
-        # Per-tick CE: per-sample mean over non-padded tokens → (B, num_ticks)
         shift_labels = labels[..., 1:].contiguous()
         label_mask = (shift_labels != -100)
+
         losses = []
+        certainties = []
         for t in range(num_ticks):
             logits_t = self.lm_head(tick_outs[..., t])
             shift_logits = logits_t[..., :-1, :].contiguous()
@@ -356,26 +395,18 @@ class CTMForCausalLM(nn.Module):
             per_token_loss = per_token_loss.view(B, -1)
             per_sample_loss = (per_token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
             losses.append(per_sample_loss)
-        losses = torch.stack(losses, dim=1)  # (B, num_ticks)
 
-        # Per-tick normalized entropy (certainty) → (B, num_ticks)
-        certainties = []
-        for t in range(num_ticks):
-            logits_t = self.lm_head(tick_outs[..., t])
             probs = F.softmax(logits_t, dim=-1)
             entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
             norm_ent = entropy / math.log(logits_t.size(-1))
-            # Mean over non-padded positions
             norm_ent_valid = (norm_ent[..., :-1] * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
             certainties.append(norm_ent_valid)
-        certainties = torch.stack(certainties, dim=1)  # (B, num_ticks)
-        # Certainty measure: 1 - normalized_entropy
+
+        losses = torch.stack(losses, dim=1)
+        certainties = torch.stack(certainties, dim=1)
         confidence = 1 - certainties
 
-        # Strategy 1: per-sample min-CE (oracle)
         loss_min = losses.min(dim=1).values.mean()
-
-        # Strategy 2: most certain tick per sample
         best_conf_tick = confidence.argmax(dim=1)
         batch_idx = torch.arange(B, device=losses.device)
         loss_conf = losses[batch_idx, best_conf_tick].mean()
@@ -400,49 +431,66 @@ class CTMForCausalLM(nn.Module):
     def generate(self, input_ids, max_new_tokens=512, temperature=0.85,
                  top_p=0.85, top_k=50, eos_token_id=2, use_cache=True,
                  repetition_penalty=1.0, num_iters=None):
+        bs = self.config.block_size
         past_kv = None
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
 
-        for _ in range(max_new_tokens):
+        remaining = max_new_tokens
+        while remaining > 0:
+            step = min(bs, remaining)
             inp = input_ids if past_kv is None else input_ids[:, -1:]
             out = self.forward(inp, past_key_values=past_kv, use_cache=use_cache, num_iters=num_iters)
-            logits = out['logits'][:, -1, :] / temperature
+            logits = out['logits'][:, -step:, :] / temperature
+
+            if logits.dim() == 2:
+                logits = logits.unsqueeze(1)
 
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i])
-                    score = logits[i, seen]
-                    logits[i, seen] = torch.where(
-                        score > 0, score / repetition_penalty, score * repetition_penalty)
+                    for s in range(logits.size(1)):
+                        score = logits[i, s, seen]
+                        logits[i, s, seen] = torch.where(
+                            score > 0, score / repetition_penalty, score * repetition_penalty)
 
-            if top_k > 0:
-                topk_val = torch.topk(logits, top_k)[0][..., -1, None]
-                logits[logits < topk_val] = float('-inf')
+            next_tokens = []
+            for s in range(logits.size(1)):
+                token_logits = logits[:, s, :]
 
-            if top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                mask = cum_probs > top_p
-                mask[..., 1:] = mask[..., :-1].clone()
-                mask[..., 0] = False
-                logits[mask.scatter(1, sorted_idx, mask)] = float('-inf')
+                if top_k > 0:
+                    topk_val = torch.topk(token_logits, top_k)[0][..., -1, None]
+                    token_logits[token_logits < topk_val] = float('-inf')
 
-            probs = torch.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+                if top_p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(token_logits, descending=True)
+                    cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    mask = cum_probs > top_p
+                    mask[..., 1:] = mask[..., :-1].clone()
+                    mask[..., 0] = False
+                    token_logits[mask.scatter(1, sorted_idx, mask)] = float('-inf')
+
+                probs = torch.softmax(token_logits, dim=-1)
+                token = torch.multinomial(probs, num_samples=1)
+                next_tokens.append(token)
+
+            new_tokens = torch.cat(next_tokens, dim=1)
 
             if eos_token_id is not None:
-                next_token = torch.where(
-                    finished.unsqueeze(-1),
-                    next_token.new_full(next_token.shape, eos_token_id),
-                    next_token)
+                new_tokens = torch.where(
+                    finished.unsqueeze(-1).expand_as(new_tokens),
+                    new_tokens.new_full(new_tokens.shape, eos_token_id),
+                    new_tokens)
 
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            input_ids = torch.cat([input_ids, new_tokens], dim=-1)
             past_kv = out['past_key_values'] if use_cache else None
 
             if eos_token_id is not None:
-                finished |= next_token.squeeze(-1).eq(eos_token_id)
+                for s in range(new_tokens.size(1)):
+                    finished |= new_tokens[:, s].eq(eos_token_id)
                 if finished.all():
                     break
+
+            remaining -= step
 
         return input_ids
 
