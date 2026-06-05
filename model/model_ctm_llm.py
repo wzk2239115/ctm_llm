@@ -377,13 +377,18 @@ class CTMForCausalLM(nn.Module):
 
     def forward_train(self, input_ids, labels, num_iters=None):
         B = input_ids.size(0)
-        bs = self.config.block_size
         h, _, tick_outs = self.model(
             input_ids, track=False, num_iters=num_iters, return_all_ticks=True)
         num_ticks = tick_outs.size(-1)
 
         shift_labels = labels[..., 1:].contiguous()
         label_mask = (shift_labels != -100)
+
+        final_logits = self.lm_head(h)
+        final_shift_logits = final_logits[..., :-1, :].contiguous()
+        final_loss = F.cross_entropy(
+            final_shift_logits.view(-1, final_shift_logits.size(-1)),
+            shift_labels.view(-1), ignore_index=-100)
 
         losses = []
         certainties = []
@@ -412,7 +417,8 @@ class CTMForCausalLM(nn.Module):
         batch_idx = torch.arange(B, device=losses.device)
         loss_conf = losses[batch_idx, best_conf_tick].mean()
 
-        loss = (loss_min + loss_conf) / 2.0
+        tick_loss = (loss_min + loss_conf) / 2.0
+        loss = 0.5 * final_loss + 0.5 * tick_loss
 
         return loss, losses, certainties
 
