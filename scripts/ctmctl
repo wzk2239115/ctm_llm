@@ -8,7 +8,7 @@ Usage:
 
 Commands:
   pool server [args...]          Start no-SSH pool server
-  pool worker [CONFIG] [args...] Start worker and auto-detect rank
+  pool worker [CONFIG] [args...] Start worker, auto rank, auto-pull before tasks
   pool submit [CONFIG] [args...] Submit task to pool
   pool status [args...]          Show pool status JSON
   train cluster --config CONFIG  Start cluster torchrun with auto rank
@@ -45,23 +45,28 @@ case "$cmd" in
         exec python scripts/cluster_pool.py server "$@"
         ;;
       worker)
-        config="${1:-infra/clusters/h100_2nodes.env}"
-        if [[ $# -gt 0 ]]; then
+        config="infra/clusters/h100_2nodes.env"
+        if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
+          config="$1"
           shift
         fi
         exec python scripts/cluster_pool.py worker --config "$config" "$@"
         ;;
       submit)
-        config="${1:-infra/clusters/h100_2nodes.env}"
-        if [[ $# -gt 0 ]]; then
+        config="infra/clusters/h100_2nodes.env"
+        if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
+          config="$1"
           shift
         fi
-        control_args=()
+        if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+          exec python scripts/cluster_pool.py submit --config "$config" "$1"
+        fi
         train_args=()
+        cmd_args=(python scripts/cluster_pool.py submit --config "$config")
         while [[ $# -gt 0 ]]; do
           case "$1" in
             --master_addr|--port|--wait)
-              control_args+=("$1" "${2:-}")
+              cmd_args+=("$1" "${2:-}")
               shift 2
               ;;
             --)
@@ -75,7 +80,8 @@ case "$cmd" in
               ;;
           esac
         done
-        exec python scripts/cluster_pool.py submit --config "$config" "${control_args[@]}" -- "${train_args[@]}"
+        cmd_args+=(-- "${train_args[@]}")
+        exec "${cmd_args[@]}"
         ;;
       status)
         exec python scripts/cluster_pool.py status "$@"

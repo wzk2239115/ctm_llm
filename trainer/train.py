@@ -123,6 +123,11 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             torch.save(
                 {k: v.half().cpu() for k, v in raw.state_dict().items()}, save_path)
 
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            if rank == 0:
+                Logger(f'Max steps reached: {args.max_steps}')
+            break
+
     if rank == 0:
         epoch_time = time.time() - epoch_start
         Logger(f'Epoch {epoch + 1} done in {format_time(epoch_time)}')
@@ -142,6 +147,8 @@ if __name__ == '__main__':
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--log_interval', type=int, default=50)
     parser.add_argument('--save_interval', type=int, default=500)
+    parser.add_argument('--max_steps', type=int, default=0,
+                        help='Stop training after this many global steps; 0 disables.')
     parser.add_argument('--hidden_size', type=int, default=768)
     parser.add_argument('--num_hidden_layers', type=int, default=12)
     parser.add_argument('--d_model', type=int, default=512)
@@ -282,6 +289,8 @@ if __name__ == '__main__':
             epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
             tb_writer, swanlab,
             start_step=skip, rank=rank)
+        if args.max_steps > 0 and epoch * iters + last_step >= args.max_steps:
+            break
         start_step = 0
 
     if rank == 0:

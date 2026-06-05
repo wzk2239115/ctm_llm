@@ -270,6 +270,39 @@ def format_gpu_lines(devices):
     return "\n".join(lines)
 
 
+def git_head():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def git_pull_ff_only():
+    before = git_head()
+    proc = subprocess.run(
+        ["git", "pull", "--ff-only"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    after = git_head()
+    return {
+        "ok": proc.returncode == 0,
+        "before": before,
+        "after": after,
+        "output": proc.stdout.strip(),
+    }
+
+
+def restart_worker_process():
+    print("[worker] restarting to load updated code", flush=True)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 def run_worker(args):
     config = load_cluster_config(args.config)
     node_addr = args.node_addr or detect_node_addr(config)
@@ -324,6 +357,28 @@ def run_worker(args):
                     "message": msg,
                 })
             else:
+                if args.auto_pull:
+                    pull = git_pull_ff_only()
+                    if pull["ok"]:
+                        print(
+                            f"[worker] git pull ok: {pull['before']} -> {pull['after']}",
+                            flush=True,
+                        )
+                        if pull["before"] != pull["after"] and args.restart_on_update:
+                            restart_worker_process()
+                    else:
+                        msg = f"git pull failed: {pull['output']}"
+                        print(f"[worker] task {task['task_id']} rejected: {msg}", flush=True)
+                        post_json(f"{base}/ack", {
+                            "node_addr": node_addr,
+                            "task_id": task["task_id"],
+                            "status": "pull_failed",
+                            "message": msg,
+                        })
+                        last_task_id = task["task_id"]
+                        time.sleep(args.interval)
+                        continue
+
                 extra = shlex.split(task.get("extra_args", ""))
                 cmd = ["bash", "scripts/train_cluster.sh", "--config", task["config"], *extra]
                 env = os.environ.copy()
@@ -395,6 +450,9 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--node_addr", default=None)
     p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument("--no_auto_pull", action="store_false", dest="auto_pull")
+    p.add_argument("--no_restart_on_update", action="store_false", dest="restart_on_update")
+    p.set_defaults(auto_pull=True, restart_on_update=True)
     p.set_defaults(func=run_worker)
 
     p = sub.add_parser("submit")

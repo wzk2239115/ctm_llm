@@ -63,6 +63,18 @@ rank from `NODE_ADDRS`, reports GPU model/memory, then waits for tasks.
 ./scripts/ctmctl pool worker infra/clusters/h100_2nodes.env --port 8765
 ```
 
+By default, a worker runs `git pull --ff-only` before starting each task. If the
+repository changed, the worker restarts itself so the latest pool/training code
+is loaded. This means you usually do not need to rebuild the pool after a
+`git push`; leave workers online and submit the next task.
+
+Disable this during debugging if needed:
+
+```bash
+./scripts/ctmctl pool worker infra/clusters/h100_2nodes.env --no_auto_pull
+./scripts/ctmctl pool worker infra/clusters/h100_2nodes.env --no_restart_on_update
+```
+
 If IP auto-detection fails:
 
 ```bash
