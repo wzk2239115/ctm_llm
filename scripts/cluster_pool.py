@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import contextmanager
 
 
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -59,6 +60,12 @@ def load_cluster_config(path):
 
     data["NODE_ADDRS"] = node_addrs
     return data
+
+
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def local_ipv4_addrs():
@@ -281,8 +288,39 @@ def git_head():
         return "unknown"
 
 
-def git_pull_ff_only(config):
+@contextmanager
+def repo_update_lock(config):
+    if not parse_bool(config.get("SHARED_REPO"), default=False):
+        yield
+        return
+
+    repo_dir = config.get("REPO_DIR") or os.getcwd()
+    lock_dir = os.path.join(repo_dir, ".ctm_pool")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(lock_dir, "git_update.lock")
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def git_update_ff_only(config, process_head=None):
     before = git_head()
+    remote = config.get("GIT_REMOTE", "origin")
+    branch = config.get("GIT_BRANCH")
+    if not branch:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
     env = os.environ.copy()
     if config.get("GIT_HTTP_PROXY"):
         env["http_proxy"] = config["GIT_HTTP_PROXY"]
@@ -290,19 +328,44 @@ def git_pull_ff_only(config):
     if config.get("GIT_HTTPS_PROXY"):
         env["https_proxy"] = config["GIT_HTTPS_PROXY"]
         env["HTTPS_PROXY"] = config["GIT_HTTPS_PROXY"]
-    proc = subprocess.run(
-        ["git", "pull", "--ff-only"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-    )
+    with repo_update_lock(config):
+        before = git_head()
+        fetch_proc = subprocess.run(
+            ["git", "fetch", remote, branch],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        if fetch_proc.returncode != 0:
+            after = git_head()
+            return {
+                "ok": False,
+                "before": before,
+                "after": after,
+                "restart_needed": process_head not in (None, after),
+                "output": fetch_proc.stdout.strip(),
+            }
+
+        proc = subprocess.run(
+            ["git", "merge", "--ff-only", f"{remote}/{branch}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        after = git_head()
+
     after = git_head()
+    output = "\n".join(
+        chunk for chunk in (fetch_proc.stdout.strip(), proc.stdout.strip()) if chunk
+    )
     return {
         "ok": proc.returncode == 0,
         "before": before,
         "after": after,
-        "output": proc.stdout.strip(),
+        "restart_needed": process_head not in (None, after),
+        "output": output,
     }
 
 
@@ -322,6 +385,7 @@ def run_worker(args):
     status = "idle"
     proc = None
     last_task_id = None
+    process_head = git_head()
 
     print(f"CTM worker online: addr={node_addr} rank={rank} host={hostname}", flush=True)
     print(gpu_summary, flush=True)
@@ -366,16 +430,16 @@ def run_worker(args):
                 })
             else:
                 if args.auto_pull:
-                    pull = git_pull_ff_only(config)
+                    pull = git_update_ff_only(config, process_head=process_head)
                     if pull["ok"]:
                         print(
-                            f"[worker] git pull ok: {pull['before']} -> {pull['after']}",
+                            f"[worker] git update ok: {pull['before']} -> {pull['after']}",
                             flush=True,
                         )
-                        if pull["before"] != pull["after"] and args.restart_on_update:
+                        if pull.get("restart_needed") and args.restart_on_update:
                             restart_worker_process()
                     else:
-                        msg = f"git pull failed: {pull['output']}"
+                        msg = f"git update failed: {pull['output']}"
                         print(f"[worker] task {task['task_id']} rejected: {msg}", flush=True)
                         post_json(f"{base}/ack", {
                             "node_addr": node_addr,

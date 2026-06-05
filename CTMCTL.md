@@ -63,10 +63,31 @@ rank from `NODE_ADDRS`, reports GPU model/memory, then waits for tasks.
 ./scripts/ctmctl pool worker infra/clusters/h100_2nodes.env --port 8765
 ```
 
-By default, a worker runs `git pull --ff-only` before starting each task. If the
-repository changed, the worker restarts itself so the latest pool/training code
-is loaded. This means you usually do not need to rebuild the pool after a
-`git push`; leave workers online and submit the next task.
+By default, a worker updates the repo before starting each task with an explicit
+`git fetch <remote> <branch>` followed by `git merge --ff-only <remote>/<branch>`.
+If the repository changed, the worker restarts itself so the latest
+pool/training code is loaded. This means you usually do not need to rebuild the
+pool after a `git push`; leave workers online and submit the next task.
+
+If multiple machines mount the same repository directory, set:
+
+```bash
+SHARED_REPO=1
+```
+
+With `SHARED_REPO=1`, workers serialize the Git update through
+`.ctm_pool/git_update.lock`. This avoids two machines touching the same `.git`
+directory at the same time. Every worker still checks whether the shared repo
+HEAD changed since that worker started; if it changed, the worker restarts
+itself before launching the training task.
+
+The default Git target is the current branch from `origin`. You can pin it in
+the cluster config:
+
+```bash
+GIT_REMOTE=origin
+GIT_BRANCH=master
+```
 
 If the cluster needs a proxy for Git, set it in the cluster config:
 
@@ -75,8 +96,8 @@ GIT_HTTP_PROXY=http://public-proxy.qihoo.net:3128
 GIT_HTTPS_PROXY=http://public-proxy.qihoo.net:3128
 ```
 
-This proxy is used only for `git pull`. Pool HTTP traffic to the master remains
-direct and does not use proxy settings.
+This proxy is used only for Git fetch/merge updates. Pool HTTP traffic to the
+master remains direct and does not use proxy settings.
 
 Disable this during debugging if needed:
 
@@ -221,6 +242,21 @@ Check that every node has an active worker terminal:
 ```bash
 ./scripts/ctmctl pool status --master_addr 11.131.210.78
 ```
+
+### Git Update Fails On A Shared Repo
+
+If workers report a Git update failure while all machines mount the same repo,
+make sure the cluster config has:
+
+```bash
+SHARED_REPO=1
+GIT_REMOTE=origin
+GIT_BRANCH=master
+```
+
+Then restart the worker terminals once so they load the shared-repo locking
+logic. After that, workers can stay online across normal `git push` / task
+submit cycles.
 
 ### Torchrun Rendezvous Fails
 
