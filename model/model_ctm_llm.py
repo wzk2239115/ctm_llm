@@ -186,8 +186,9 @@ class CTMBlock(nn.Module):
             activated = self.start_activated_state.view(1, 1, self.d_model) \
                 .expand(B, T, -1).contiguous()
 
-        self.decay_action.data.clamp_(0, 15)
-        self.decay_out.data.clamp_(0, 15)
+        with torch.no_grad():
+            self.decay_action.clamp_(0, 15)
+            self.decay_out.clamp_(0, 15)
         r_a = torch.exp(-self.decay_action).view(1, 1, -1).expand(B, T, -1)
         r_o = torch.exp(-self.decay_out).view(1, 1, -1).expand(B, T, -1)
 
@@ -431,53 +432,40 @@ class CTMForCausalLM(nn.Module):
     def generate(self, input_ids, max_new_tokens=512, temperature=0.85,
                  top_p=0.85, top_k=50, eos_token_id=2, use_cache=True,
                  repetition_penalty=1.0, num_iters=None):
-        bs = self.config.block_size
         past_kv = None
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
 
-        remaining = max_new_tokens
-        while remaining > 0:
-            step = min(bs, remaining)
+        for _ in range(max_new_tokens):
             inp = input_ids if past_kv is None else input_ids[:, -1:]
             out = self.forward(inp, past_key_values=past_kv, use_cache=use_cache, num_iters=num_iters)
-            logits = out['logits'][:, -step:, :] / temperature
-
-            if logits.dim() == 2:
-                logits = logits.unsqueeze(1)
+            token_logits = out['logits'][:, -1, :] / temperature
 
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i])
-                    for s in range(logits.size(1)):
-                        score = logits[i, s, seen]
-                        logits[i, s, seen] = torch.where(
-                            score > 0, score / repetition_penalty, score * repetition_penalty)
+                    score = token_logits[i, seen]
+                    token_logits[i, seen] = torch.where(
+                        score > 0, score / repetition_penalty, score * repetition_penalty)
 
-            next_tokens = []
-            for s in range(logits.size(1)):
-                token_logits = logits[:, s, :]
+            if top_k > 0:
+                top_k_eff = min(top_k, token_logits.size(-1))
+                topk_val = torch.topk(token_logits, top_k_eff)[0][..., -1, None]
+                token_logits[token_logits < topk_val] = float('-inf')
 
-                if top_k > 0:
-                    topk_val = torch.topk(token_logits, top_k)[0][..., -1, None]
-                    token_logits[token_logits < topk_val] = float('-inf')
+            if top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(token_logits, descending=True)
+                cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                mask = cum_probs > top_p
+                mask[..., 1:] = mask[..., :-1].clone()
+                mask[..., 0] = False
+                token_logits[mask.scatter(1, sorted_idx, mask)] = float('-inf')
 
-                if top_p < 1.0:
-                    sorted_logits, sorted_idx = torch.sort(token_logits, descending=True)
-                    cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                    mask = cum_probs > top_p
-                    mask[..., 1:] = mask[..., :-1].clone()
-                    mask[..., 0] = False
-                    token_logits[mask.scatter(1, sorted_idx, mask)] = float('-inf')
-
-                probs = torch.softmax(token_logits, dim=-1)
-                token = torch.multinomial(probs, num_samples=1)
-                next_tokens.append(token)
-
-            new_tokens = torch.cat(next_tokens, dim=1)
+            probs = torch.softmax(token_logits, dim=-1)
+            new_tokens = torch.multinomial(probs, num_samples=1)
 
             if eos_token_id is not None:
                 new_tokens = torch.where(
-                    finished.unsqueeze(-1).expand_as(new_tokens),
+                    finished.unsqueeze(-1),
                     new_tokens.new_full(new_tokens.shape, eos_token_id),
                     new_tokens)
 
@@ -485,12 +473,9 @@ class CTMForCausalLM(nn.Module):
             past_kv = out['past_key_values'] if use_cache else None
 
             if eos_token_id is not None:
-                for s in range(new_tokens.size(1)):
-                    finished |= new_tokens[:, s].eq(eos_token_id)
+                finished |= new_tokens.squeeze(1).eq(eos_token_id)
                 if finished.all():
                     break
-
-            remaining -= step
 
         return input_ids
 
