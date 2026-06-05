@@ -2,6 +2,8 @@
 
 This repo uses `torchrun` for both single-node and multi-node training.
 
+For the unified CLI reference, see `CTMCTL.md`.
+
 ## Files
 
 - `scripts/run_train.sh`: launches `trainer/train.py` with an env template.

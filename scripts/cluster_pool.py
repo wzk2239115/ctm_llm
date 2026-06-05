@@ -14,6 +14,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 STATE = {
     "nodes": {},
     "task": None,
@@ -98,12 +100,12 @@ def post_json(url, payload, timeout=10):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with URL_OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
 def get_json(url, timeout=10):
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    with URL_OPENER.open(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
