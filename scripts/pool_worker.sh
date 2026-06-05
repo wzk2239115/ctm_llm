@@ -6,4 +6,4 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 
-exec python scripts/cluster_pool.py worker --config "$CONFIG" "$@"
+exec scripts/ctmctl pool worker "$CONFIG" "$@"

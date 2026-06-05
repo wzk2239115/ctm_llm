@@ -7,7 +7,8 @@ This repo uses `torchrun` for both single-node and multi-node training.
 - `scripts/run_train.sh`: launches `trainer/train.py` with an env template.
 - `scripts/train_cluster.sh`: launches from a cluster node list and auto-detects node rank.
 - `scripts/cluster_pool.py`: no-SSH pool server/worker/task submitter.
-- `scripts/pool_server.sh`, `scripts/pool_worker.sh`, `scripts/pool_submit.sh`, `scripts/pool_status.sh`: short wrappers for the pool.
+- `scripts/ctmctl`: main CLI for pool, train, and check commands.
+- `scripts/pool_server.sh`, `scripts/pool_worker.sh`, `scripts/pool_submit.sh`, `scripts/pool_status.sh`: compatibility wrappers for the pool.
 - `scripts/dispatch_cluster.sh`: SSH dispatch from one node to every node in a node list.
 - `scripts/check_cluster.sh`: checks GPUs, symlinks, Python packages, and master address.
 - `infra/clusters/h100_2nodes.env`: current 2-node cluster table.
@@ -69,27 +70,28 @@ On master `11.131.210.78`, terminal 1:
 ```bash
 cd /home/jovyan/h800fast/wangzekai/ctm_llm
 git pull
-bash scripts/pool_server.sh
+scripts/ctmctl pool server
 ```
 
 The server prints the pool when workers come online and when they acknowledge a
-task.
+task. Each online node includes GPU model and memory, for example
+`8x NVIDIA H100 80GB`.
 
 On every node, including master and `11.131.210.3`, open one terminal:
 
 ```bash
 cd /home/jovyan/h800fast/wangzekai/ctm_llm
 git pull
-bash scripts/pool_worker.sh infra/clusters/h100_2nodes.env
+scripts/ctmctl pool worker infra/clusters/h100_2nodes.env
 ```
 
 Each worker prints its detected address/rank, then prints a message when it
-receives a task.
+receives a task. It also prints every visible GPU with model and memory.
 
 On master, terminal 2, submit a task:
 
 ```bash
-bash scripts/pool_submit.sh infra/clusters/h100_2nodes.env
+scripts/ctmctl pool submit infra/clusters/h100_2nodes.env
 ```
 
 The submit command waits for acknowledgements by default and prints which nodes
@@ -98,14 +100,14 @@ started the task. Use `--wait 0` if you only want to submit.
 Pass trainer overrides after the config:
 
 ```bash
-bash scripts/pool_submit.sh infra/clusters/h100_2nodes.env \
+scripts/ctmctl pool submit infra/clusters/h100_2nodes.env \
   --cross_layer_state 0 --iterations 5 --swanlab_name cross0-iter5
 ```
 
 Check pool state any time:
 
 ```bash
-bash scripts/pool_status.sh --master_addr 11.131.210.78
+scripts/ctmctl pool status --master_addr 11.131.210.78
 ```
 
 Run the same command on every node. The script auto-detects `NODE_RANK` from
@@ -115,7 +117,7 @@ the machine's IPv4 address:
 cd /home/jovyan/h800fast/wangzekai/ctm_llm
 git pull
 
-bash scripts/train_cluster.sh --config infra/clusters/h100_2nodes.env
+scripts/ctmctl train cluster --config infra/clusters/h100_2nodes.env
 ```
 
 If auto-detection fails because the visible network address differs, force the

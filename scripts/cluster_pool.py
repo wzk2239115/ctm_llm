@@ -117,10 +117,11 @@ def print_pool():
     print("\n=== CTM Pool ===", flush=True)
     for addr, node in sorted(nodes.items()):
         age = now - node["last_seen"]
+        gpu_summary = node.get("gpu_summary") or f"{node.get('gpus', '?')} GPU(s)"
         print(
             f"  {addr:15s} rank={node.get('rank', '?')} "
             f"host={node.get('hostname', '?')} status={node.get('status', '?')} "
-            f"gpus={node.get('gpus', '?')} seen={age:.1f}s",
+            f"gpus={gpu_summary} seen={age:.1f}s",
             flush=True,
         )
     if task:
@@ -221,16 +222,50 @@ def run_server(args):
     server.serve_forever()
 
 
-def gpu_count():
+def gpu_inventory():
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
             text=True,
             stderr=subprocess.DEVNULL,
         )
-        return len([line for line in out.splitlines() if line.strip()])
+        devices = []
+        for line in out.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 3:
+                continue
+            devices.append({
+                "index": int(parts[0]),
+                "name": parts[1],
+                "memory_mb": int(float(parts[2])),
+            })
+        return devices
     except Exception:
-        return 0
+        return []
+
+
+def summarize_gpus(devices):
+    if not devices:
+        return "0 GPU(s)"
+    groups = {}
+    for dev in devices:
+        key = (dev["name"], dev["memory_mb"])
+        groups[key] = groups.get(key, 0) + 1
+    chunks = []
+    for (name, memory_mb), count in sorted(groups.items()):
+        memory_gb = int(round(memory_mb / 1024))
+        chunks.append(f"{count}x {name} {memory_gb}GB")
+    return " + ".join(chunks)
+
+
+def format_gpu_lines(devices):
+    if not devices:
+        return "  GPUs: none detected"
+    lines = ["  GPUs:"]
+    for dev in devices:
+        memory_gb = dev["memory_mb"] / 1024
+        lines.append(f"    [{dev['index']}] {dev['name']} {memory_gb:.1f}GB")
+    return "\n".join(lines)
 
 
 def run_worker(args):
@@ -239,11 +274,15 @@ def run_worker(args):
     rank = config.get("NODE_ADDRS", []).index(node_addr) if node_addr in config.get("NODE_ADDRS", []) else "?"
     base = f"http://{args.master_addr}:{args.port}"
     hostname = socket.gethostname()
+    gpus = gpu_inventory()
+    gpu_summary = summarize_gpus(gpus)
     status = "idle"
     proc = None
     last_task_id = None
 
     print(f"CTM worker online: addr={node_addr} rank={rank} host={hostname}", flush=True)
+    print(gpu_summary, flush=True)
+    print(format_gpu_lines(gpus), flush=True)
     print(f"Polling pool server: {base}", flush=True)
 
     while True:
@@ -256,7 +295,9 @@ def run_worker(args):
             "rank": rank,
             "hostname": hostname,
             "status": status,
-            "gpus": gpu_count(),
+            "gpus": len(gpus),
+            "gpu_summary": gpu_summary,
+            "gpu_devices": gpus,
             "pid": proc.pid if proc else None,
         }
         try:
@@ -367,7 +408,11 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=run_status)
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    if args.cmd == "submit" and unknown:
+        args.extra_args.extend(unknown)
+    elif unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     args.func(args)
 
 

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/ctmctl <command> [args...]
+
+Commands:
+  pool server [args...]          Start no-SSH pool server
+  pool worker [CONFIG] [args...] Start worker and auto-detect rank
+  pool submit [CONFIG] [args...] Submit task to pool
+  pool status [args...]          Show pool status JSON
+  train cluster --config CONFIG  Start cluster torchrun with auto rank
+  train env ENV_FILE [args...]   Start torchrun from env file
+  check [ENV_FILE]               Run cluster preflight checks
+
+Examples:
+  scripts/ctmctl pool server
+  scripts/ctmctl pool worker infra/clusters/h100_2nodes.env
+  scripts/ctmctl pool submit infra/clusters/h100_2nodes.env --iterations 5
+  scripts/ctmctl train cluster --config infra/clusters/h100_2nodes.env
+  scripts/ctmctl check infra/envs/smoke_8xh100.env
+EOF
+}
+
+if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+cmd="$1"
+shift
+
+case "$cmd" in
+  pool)
+    sub="${1:-}"
+    if [[ -z "$sub" ]]; then
+      usage >&2
+      exit 1
+    fi
+    shift
+    case "$sub" in
+      server)
+        exec python scripts/cluster_pool.py server "$@"
+        ;;
+      worker)
+        config="${1:-infra/clusters/h100_2nodes.env}"
+        if [[ $# -gt 0 ]]; then
+          shift
+        fi
+        exec python scripts/cluster_pool.py worker --config "$config" "$@"
+        ;;
+      submit)
+        config="${1:-infra/clusters/h100_2nodes.env}"
+        if [[ $# -gt 0 ]]; then
+          shift
+        fi
+        control_args=()
+        train_args=()
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --master_addr|--port|--wait)
+              control_args+=("$1" "${2:-}")
+              shift 2
+              ;;
+            --)
+              shift
+              train_args+=("$@")
+              break
+              ;;
+            *)
+              train_args+=("$1")
+              shift
+              ;;
+          esac
+        done
+        exec python scripts/cluster_pool.py submit --config "$config" "${control_args[@]}" -- "${train_args[@]}"
+        ;;
+      status)
+        exec python scripts/cluster_pool.py status "$@"
+        ;;
+      *)
+        echo "Unknown pool command: $sub" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  train)
+    sub="${1:-}"
+    if [[ -z "$sub" ]]; then
+      usage >&2
+      exit 1
+    fi
+    shift
+    case "$sub" in
+      cluster)
+        exec bash scripts/train_cluster.sh "$@"
+        ;;
+      env)
+        env_file="${1:-infra/envs/smoke_8xh100.env}"
+        if [[ $# -gt 0 ]]; then
+          shift
+        fi
+        exec bash scripts/run_train.sh "$env_file" "$@"
+        ;;
+      *)
+        echo "Unknown train command: $sub" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  check)
+    env_file="${1:-infra/envs/smoke_8xh100.env}"
+    exec bash scripts/check_cluster.sh "$env_file"
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
