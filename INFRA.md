@@ -5,7 +5,10 @@ This repo uses `torchrun` for both single-node and multi-node training.
 ## Files
 
 - `scripts/run_train.sh`: launches `trainer/train.py` with an env template.
+- `scripts/train_cluster.sh`: launches from a cluster node list and auto-detects node rank.
+- `scripts/dispatch_cluster.sh`: SSH dispatch from one node to every node in a node list.
 - `scripts/check_cluster.sh`: checks GPUs, symlinks, Python packages, and master address.
+- `infra/clusters/h100_2nodes.env`: current 2-node cluster table.
 - `infra/envs/smoke_8xh100.env`: single-node 8xH100 smoke test.
 - `infra/envs/smoke_multinode.env`: multi-node template.
 - `infra/envs/ablation_8xh100.env`: single-node ablation template.
@@ -39,7 +42,75 @@ Enable SwanLab only when it is installed and wanted:
 bash scripts/run_train.sh infra/envs/smoke_8xh100.env --use_swanlab
 ```
 
-## Multi Node
+## Multi Node With Node List
+
+The preferred workflow is to maintain one cluster table:
+
+```bash
+infra/clusters/h100_2nodes.env
+```
+
+Current nodes:
+
+```text
+rank 0 / master: 11.131.210.78
+rank 1         : 11.131.210.3
+```
+
+Run the same command on every node. The script auto-detects `NODE_RANK` from
+the machine's IPv4 address:
+
+```bash
+cd /home/jovyan/h800fast/wangzekai/ctm_llm
+git pull
+
+bash scripts/train_cluster.sh --config infra/clusters/h100_2nodes.env
+```
+
+If auto-detection fails because the visible network address differs, force the
+matching address once:
+
+```bash
+CTM_NODE_ADDR=11.131.210.3 \
+  bash scripts/train_cluster.sh --config infra/clusters/h100_2nodes.env
+```
+
+Dry run before launching:
+
+```bash
+DRY_RUN=1 bash scripts/train_cluster.sh --config infra/clusters/h100_2nodes.env
+```
+
+## Dispatch From Master
+
+From the master node, start all nodes via SSH:
+
+```bash
+cd /home/jovyan/h800fast/wangzekai/ctm_llm
+git pull
+
+DRY_RUN=1 bash scripts/dispatch_cluster.sh --config infra/clusters/h100_2nodes.env
+bash scripts/dispatch_cluster.sh --config infra/clusters/h100_2nodes.env
+```
+
+The dispatch script runs this remotely on each node:
+
+```bash
+cd /home/jovyan/h800fast/wangzekai/ctm_llm
+git pull
+nohup bash scripts/train_cluster.sh --config infra/clusters/h100_2nodes.env ... &
+```
+
+Remote logs are written under `logs/`.
+
+You can pass trainer overrides through dispatch:
+
+```bash
+bash scripts/dispatch_cluster.sh --config infra/clusters/h100_2nodes.env \
+  --cross_layer_state 0 --iterations 5 --swanlab_name cross0-iter5
+```
+
+## Manual Multi Node Fallback
 
 Pick one node as the rendezvous/master node. Use its IPv4 address as `MASTER_ADDR`.
 
