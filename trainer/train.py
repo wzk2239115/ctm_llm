@@ -43,7 +43,7 @@ def cleanup_ddp():
 
 
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
-                swanlab, start_step=0, rank=0):
+                tb_writer, swanlab, start_step=0, rank=0):
     model.train()
     epoch_start = time.time()
     total_loss = 0.0
@@ -98,15 +98,19 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 f'total:{format_time(elapsed + global_eta)}({pct:.1f}%)'
             )
 
+            metrics = {
+                'loss': avg_loss, 'lr': lr,
+                'best_tick': best_tick_mean,
+                'conf_tick': conf_tick_mean,
+                'epoch': epoch + step / iters,
+                'global_step': global_step,
+                'progress_pct': pct,
+            }
+            if tb_writer:
+                for key, value in metrics.items():
+                    tb_writer.add_scalar(key, value, global_step)
             if swanlab:
-                swanlab.log({
-                    'loss': avg_loss, 'lr': lr,
-                    'best_tick': best_tick_mean,
-                    'conf_tick': conf_tick_mean,
-                    'epoch': epoch + step / iters,
-                    'global_step': global_step,
-                    'progress_pct': pct,
-                }, step=global_step)
+                swanlab.log(metrics, step=global_step)
 
             total_loss = 0.0
             total_steps = 0
@@ -158,6 +162,8 @@ if __name__ == '__main__':
                         default='model_tokenizer')
     parser.add_argument('--from_weight', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--no_tensorboard', action='store_true')
+    parser.add_argument('--tensorboard_log_dir', type=str, default='runs')
     parser.add_argument('--use_swanlab', action='store_true')
     parser.add_argument('--swanlab_project', type=str, default='CTM-LLM')
     parser.add_argument('--swanlab_name', type=str, default=None)
@@ -214,11 +220,25 @@ if __name__ == '__main__':
     use_fp16 = args.dtype == 'float16'
     scaler = torch.amp.GradScaler(device_type, enabled=use_fp16)
 
+    run_name = args.swanlab_name or f'CTM-LLM-{args.hidden_size}d-{args.d_model}m-{args.iterations}iter'
+
+    tb_writer = None
+    if not args.no_tensorboard and rank == 0:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_log_dir = os.path.join(args.tensorboard_log_dir, run_name)
+            tb_writer = SummaryWriter(log_dir=tb_log_dir)
+            Logger(f'TensorBoard logging: {tb_log_dir}')
+        except ImportError:
+            Logger('TensorBoard not installed, continue without TensorBoard logging.')
+
     swanlab = None
     if args.use_swanlab and rank == 0:
-        import swanlab
-        run_name = args.swanlab_name or f'CTM-LLM-{args.hidden_size}d-{args.d_model}m-{args.iterations}iter'
-        swanlab = swanlab.init(project=args.swanlab_project, name=run_name, config=vars(args))
+        try:
+            import swanlab
+            swanlab = swanlab.init(project=args.swanlab_project, name=run_name, config=vars(args))
+        except ImportError:
+            Logger('SwanLab not installed, continue without SwanLab logging.')
 
     start_epoch, start_step = 0, 0
     if args.from_weight:
@@ -259,7 +279,8 @@ if __name__ == '__main__':
         if skip > 0 and rank == 0:
             Logger(f'Epoch[{epoch + 1}]: skip first {skip} steps')
         last_step = train_epoch(
-            epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args, swanlab,
+            epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
+            tb_writer, swanlab,
             start_step=skip, rank=rank)
         start_step = 0
 
@@ -268,6 +289,8 @@ if __name__ == '__main__':
         Logger(f'Training complete! Total: {format_time(total_time)}')
         if swanlab:
             swanlab.finish()
+        if tb_writer:
+            tb_writer.close()
 
     if ddp:
         cleanup_ddp()

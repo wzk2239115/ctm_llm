@@ -3,3 +3,4 @@ transformers>=4.30
 pandas
 pyarrow
 numpy
+tensorboard
