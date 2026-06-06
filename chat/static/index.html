@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTM-LLM Chat</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+          <circle cx="14" cy="14" r="12" stroke="currentColor" stroke-width="1.5" fill="none"/>
+          <circle cx="14" cy="14" r="6" stroke="currentColor" stroke-width="1.2" fill="none" opacity="0.6"/>
+          <circle cx="14" cy="14" r="2" fill="currentColor"/>
+          <line x1="14" y1="2" x2="14" y2="6" stroke="currentColor" stroke-width="1" opacity="0.4"/>
+          <line x1="14" y1="22" x2="14" y2="26" stroke="currentColor" stroke-width="1" opacity="0.4"/>
+          <line x1="2" y1="14" x2="6" y2="14" stroke="currentColor" stroke-width="1" opacity="0.4"/>
+          <line x1="22" y1="14" x2="26" y2="14" stroke="currentColor" stroke-width="1" opacity="0.4"/>
+        </svg>
+        <span>CTM-LLM</span>
+      </div>
+    </div>
+    <button id="new-chat-btn" onclick="newChat()">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><line x1="8" y1="3" x2="8" y2="13" stroke="currentColor" stroke-width="1.5"/><line x1="3" y1="8" x2="13" y2="8" stroke="currentColor" stroke-width="1.5"/></svg>
+      New Chat
+    </button>
+    <div id="model-status" class="model-status loading">Loading model...</div>
+    <div id="model-info" class="model-info"></div>
+    <div class="sidebar-footer">
+      <div class="param-row"><span class="param-label">Architecture</span><span class="param-value">CTM + ELF</span></div>
+      <div class="param-row"><span class="param-label">Ticks</span><span id="param-ticks" class="param-value">-</span></div>
+      <div class="param-row"><span class="param-label">Layers</span><span id="param-layers" class="param-value">-</span></div>
+      <div class="param-row"><span class="param-label">Neurons</span><span id="param-neurons" class="param-value">-</span></div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <button id="sidebar-toggle" onclick="toggleSidebar()">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><line x1="3" y1="5" x2="17" y2="5" stroke="currentColor" stroke-width="1.5"/><line x1="3" y1="10" x2="17" y2="10" stroke="currentColor" stroke-width="1.5"/><line x1="3" y1="15" x2="17" y2="15" stroke="currentColor" stroke-width="1.5"/></svg>
+      </button>
+      <h1>CTM-LLM <span class="subtitle">Continuous Thought Machine</span></h1>
+      <button id="viz-toggle" class="viz-btn" onclick="toggleVizPanel()">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+          <rect x="1" y="1" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/>
+          <rect x="11" y="1" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/>
+          <rect x="1" y="11" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/>
+          <rect x="11" y="11" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+        Inspect
+      </button>
+    </header>
+
+    <div id="content-wrapper">
+      <div id="messages" class="messages">
+        <div id="welcome" class="welcome">
+          <div class="welcome-icon">
+            <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+              <circle cx="24" cy="24" r="20" stroke="currentColor" stroke-width="1.5" fill="none" opacity="0.3"/>
+              <circle cx="24" cy="24" r="12" stroke="currentColor" stroke-width="1.2" fill="none" opacity="0.5"/>
+              <circle cx="24" cy="24" r="5" fill="currentColor" opacity="0.7"/>
+            </svg>
+          </div>
+          <h2>CTM-LLM Chat</h2>
+          <p>Continuous Thought Machine with ELF training</p>
+          <div class="welcome-hints">
+            <div class="hint" onclick="setPrompt('Explain what a neural network is in simple words.')">Explain neural networks</div>
+            <div class="hint" onclick="setPrompt('What is the meaning of life?')">Philosophical question</div>
+            <div class="hint" onclick="setPrompt('Write a short poem about the ocean.')">Write a poem</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="viz-panel" class="viz-panel hidden">
+        <div class="viz-tabs">
+          <button class="viz-tab active" data-tab="clock" onclick="switchVizTab('clock')">CTM Clock</button>
+          <button class="viz-tab" data-tab="elf" onclick="switchVizTab('elf')">ELF Signals</button>
+          <button class="viz-tab" data-tab="neurons" onclick="switchVizTab('neurons')">Heatmap</button>
+          <button class="viz-tab" data-tab="attention" onclick="switchVizTab('attention')">Attention</button>
+        </div>
+        <div class="viz-content">
+          <div id="viz-clock" class="viz-section active">
+            <div class="viz-title">Internal Clock <span class="viz-desc">Tick-by-tick state evolution across layers</span></div>
+            <canvas id="clock-canvas" width="440" height="260"></canvas>
+            <div id="clock-legend" class="viz-legend"></div>
+          </div>
+          <div id="viz-elf" class="viz-section">
+            <div class="viz-title">ELF Tick Supervision <span class="viz-desc">Per-tick loss, entropy &amp; confidence</span></div>
+            <canvas id="elf-canvas" width="440" height="260"></canvas>
+            <div id="elf-top-tokens" class="top-tokens-container"></div>
+          </div>
+          <div id="viz-neurons" class="viz-section">
+            <div class="viz-title">Neuron Firing Grid <span class="viz-desc">Top-32 neuron activations across ticks</span></div>
+            <canvas id="neuron-canvas" width="440" height="260"></canvas>
+          </div>
+          <div id="viz-attention" class="viz-section">
+            <div class="viz-title">Activation Dynamics <span class="viz-desc">Variance &amp; sync norm across layers</span></div>
+            <canvas id="attention-canvas" width="440" height="260"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="input-area">
+      <div class="input-wrapper">
+        <textarea id="user-input" placeholder="Message CTM-LLM..." rows="1" onkeydown="handleKey(event)"></textarea>
+        <button id="send-btn" onclick="sendMessage()" disabled>
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M3 9L15 3L9 15L8 10L3 9Z" fill="currentColor"/></svg>
+        </button>
+      </div>
+      <div class="input-controls">
+        <div class="confidence-control">
+          <label for="confidence-slider">Confidence Threshold</label>
+          <input type="range" id="confidence-slider" min="0" max="1" step="0.05" value="0.8"
+                 oninput="updateConfLabel(this.value)">
+          <span id="confidence-label" class="conf-value">0.80</span>
+        </div>
+        <div class="input-footer">CTM-LLM research demo</div>
+      </div>
+    </div>
+  </main>
+
+  <aside id="sync-panel">
+    <div class="sync-header">
+      <span class="sync-title">Neural Sync</span>
+      <span id="sync-tick-label" class="sync-tick-label">idle</span>
+    </div>
+    <canvas id="sync-canvas" width="380" height="380"></canvas>
+    <div class="sync-footer">
+      <div class="sync-legend-row">
+        <span class="legend-dot" style="background:#444"></span><span>Idle</span>
+        <span class="legend-dot" style="background:#ef4444"></span><span>+</span>
+        <span class="legend-dot" style="background:#3b82f6"></span><span>-</span>
+      </div>
+      <div class="sync-stats-row">
+        <span id="sync-active-count">0</span> active / <span id="sync-total-count">512</span> neurons
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div id="thinking-indicator" class="thinking-indicator hidden">
+  <div class="thinking-ring"></div>
+  <span>Thinking across <strong id="tick-count">0</strong> ticks...</span>
+</div>
+
+<div id="tick-stats" class="tick-stats hidden">
+  <div class="tick-stats-bar" id="tick-stats-bar"></div>
+  <div class="tick-stats-label">
+    Tick selection: <span id="tick-stats-summary"></span>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
