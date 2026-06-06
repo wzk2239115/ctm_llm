@@ -23,7 +23,8 @@ def clean_response(text):
 
 
 def chat(model, tokenizer, prompt, device, max_new_tokens=256,
-         temperature=0.85, top_p=0.85, top_k=50, num_iters=None):
+         temperature=0.85, top_p=0.85, top_k=50, repetition_penalty=1.0,
+         num_iters=None):
     messages = [{'role': 'user', 'content': prompt}]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     ids = tokenizer.encode(text)
@@ -33,7 +34,8 @@ def chat(model, tokenizer, prompt, device, max_new_tokens=256,
         output = model.generate(
             input_ids, max_new_tokens=max_new_tokens,
             temperature=temperature, top_p=top_p, top_k=top_k,
-            eos_token_id=tokenizer.eos_token_id, num_iters=num_iters)
+            eos_token_id=tokenizer.eos_token_id,
+            repetition_penalty=repetition_penalty, num_iters=num_iters)
 
     new_ids = output[0].tolist()[len(ids):]
     response = tokenizer.decode(new_ids, skip_special_tokens=True)
@@ -60,6 +62,10 @@ if __name__ == '__main__':
     parser.add_argument('--block_size', type=int, default=4)
     parser.add_argument('--prompt', type=str, default='Hello! How are you today?')
     parser.add_argument('--max_new_tokens', type=int, default=256)
+    parser.add_argument('--temperature', type=float, default=0.85)
+    parser.add_argument('--top_p', type=float, default=0.85)
+    parser.add_argument('--top_k', type=int, default=50)
+    parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--num_iters', type=int, default=None)
     args = parser.parse_args()
 
@@ -89,7 +95,10 @@ if __name__ == '__main__':
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
-    response = chat(model, tokenizer, args.prompt, args.device, args.max_new_tokens, num_iters=args.num_iters)
+    response = chat(
+        model, tokenizer, args.prompt, args.device, args.max_new_tokens,
+        temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty, num_iters=args.num_iters)
     print(f'\nUser: {args.prompt}')
     print(f'Assistant: {response}')
 
@@ -98,7 +107,10 @@ if __name__ == '__main__':
             prompt = input('\nYou: ')
             if prompt.strip() in ('quit', 'exit', 'q'):
                 break
-            response = chat(model, tokenizer, prompt, args.device, args.max_new_tokens, num_iters=args.num_iters)
+            response = chat(
+                model, tokenizer, prompt, args.device, args.max_new_tokens,
+                temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
+                repetition_penalty=args.repetition_penalty, num_iters=args.num_iters)
             print(f'Assistant: {response}')
         except (EOFError, KeyboardInterrupt):
             break
