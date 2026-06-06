@@ -454,3 +454,77 @@ just lowering prefix loss?
 That requires per-tick CTM clock probes, held-out loss sweeps, generation
 comparison, and ablations over `--ttt_layer`, `--ttt_steps`, `--ttt_target`,
 and `--num_iters`.
+
+## Implemented Prototype: Code-Stream TTT Layer Training
+
+The second runnable prototype is:
+
+```bash
+train_ttt_stream.py
+```
+
+This script uses a streaming text/code corpus to continue-train only CTM TTT
+Layer parameters. The base CTM+ELF checkpoint stays frozen. This is not pure
+single-sample inference-time TTT; it is TTT-layer domain adaptation / continued
+pretraining. It is useful for testing whether the TTT Layer can absorb a new
+domain such as code while preserving the base model.
+
+Default OpenCoder setup:
+
+```text
+dataset: OpenCoder-LLM/opc-annealing-corpus
+subset : algorithmic_corpus
+field  : text
+mode   : streaming=True
+target : .ttt_layer.* parameters only
+```
+
+Run through the no-SSH pool:
+
+```bash
+./scripts/ctmctl pool submit infra/clusters/h100_2nodes_ttt_code.env \
+  --max_steps 1000 \
+  --save_weight ctm_ttt_opc_code_1024_smoke \
+  --run_name ctm-ttt-opc-code-1024-smoke
+```
+
+Longer run:
+
+```bash
+./scripts/ctmctl pool submit infra/clusters/h100_2nodes_ttt_code.env \
+  --max_steps 20000 \
+  --save_interval 2000 \
+  --learning_rate 1e-5 \
+  --save_weight ctm_ttt_opc_code_1024_20k \
+  --run_name ctm-ttt-opc-code-1024-20k
+```
+
+Single node or manual torchrun:
+
+```bash
+torchrun --nproc_per_node=8 train_ttt_stream.py \
+  --from_weight out/ctm_2node_1024_16l_bs16_44ep_1024_resume.pth \
+  --dataset_name OpenCoder-LLM/opc-annealing-corpus \
+  --dataset_config algorithmic_corpus \
+  --hidden_size 1024 \
+  --num_hidden_layers 16 \
+  --d_model 512 \
+  --d_input 256 \
+  --heads 8 \
+  --n_synch_out 512 \
+  --n_synch_action 512 \
+  --iterations 4 \
+  --memory_length 5 \
+  --synapse_depth 2 \
+  --max_steps 1000
+```
+
+Important interpretation:
+
+```text
+If code loss decreases, the TTT Layer can learn the code distribution.
+If code generation improves without hurting SFT eval too much, the TTT Layer is
+acting as a useful fast domain learner.
+If SFT eval collapses or KL/generation drift is large, update only
+last_ttt_layer or reduce LR/steps.
+```

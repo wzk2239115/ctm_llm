@@ -35,7 +35,7 @@ ENV_KEYS=(
   NNODES NODE_RANK NPROC_PER_NODE MASTER_ADDR MASTER_PORT
   OMP_NUM_THREADS TOKENIZERS_PARALLELISM
   NCCL_DEBUG NCCL_IB_DISABLE NCCL_ASYNC_ERROR_HANDLING NCCL_SOCKET_IFNAME
-  TORCH_DISTRIBUTED_DEBUG TRAIN_ARGS DRY_RUN
+  TORCH_DISTRIBUTED_DEBUG TRAIN_ENTRY TRAIN_ARGS DRY_RUN
 )
 
 ENV_OVERRIDE_KEYS=()
@@ -69,6 +69,7 @@ done
 : "${NCCL_IB_DISABLE:=0}"
 : "${NCCL_ASYNC_ERROR_HANDLING:=1}"
 : "${TORCH_DISTRIBUTED_DEBUG:=OFF}"
+: "${TRAIN_ENTRY:=trainer/train.py}"
 : "${TRAIN_ARGS:=}"
 : "${DRY_RUN:=0}"
 
@@ -85,12 +86,13 @@ echo "  nnodes         : $NNODES"
 echo "  node_rank      : $NODE_RANK"
 echo "  nproc_per_node : $NPROC_PER_NODE"
 echo "  master         : $MASTER_ADDR:$MASTER_PORT"
+echo "  train_entry    : $TRAIN_ENTRY"
 echo "  train_args     : $TRAIN_ARGS $*"
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo
   echo "DRY_RUN=1, command not executed:"
-  echo "torchrun --nnodes=$NNODES --node_rank=$NODE_RANK --nproc_per_node=$NPROC_PER_NODE --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT trainer/train.py $TRAIN_ARGS $*"
+  echo "torchrun --nnodes=$NNODES --node_rank=$NODE_RANK --nproc_per_node=$NPROC_PER_NODE --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT $TRAIN_ENTRY $TRAIN_ARGS $*"
   exit 0
 fi
 
@@ -100,6 +102,6 @@ exec torchrun \
   --nproc_per_node="$NPROC_PER_NODE" \
   --master_addr="$MASTER_ADDR" \
   --master_port="$MASTER_PORT" \
-  trainer/train.py \
+  "$TRAIN_ENTRY" \
   $TRAIN_ARGS \
   "$@"
