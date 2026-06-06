@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -11,6 +12,31 @@ class Squeeze(nn.Module):
 
     def forward(self, x):
         return x.squeeze(self.dim)
+
+
+class TTTMLP(nn.Module):
+    """
+    Test-time learner used inside CTM ticks.
+
+    This module is a small real-parameter model that transforms the CTM
+    activated state. During normal training it behaves like a zero-init residual
+    adapter; during test-time training its parameters can be updated with a
+    self-supervised prefix loss, making the CTM hidden computation adaptive.
+    """
+
+    def __init__(self, d_model, hidden_mult=2, gate_init=-2.0, dropout=0.0):
+        super().__init__()
+        hidden = max(d_model, int(d_model * hidden_mult))
+        self.norm = nn.LayerNorm(d_model)
+        self.down = nn.Linear(d_model, hidden, bias=False)
+        self.up = nn.Linear(hidden, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, activated):
+        delta = self.up(self.dropout(F.silu(self.down(self.norm(activated)))))
+        return torch.sigmoid(self.gate) * delta
 
 
 class SuperLinear(nn.Module):

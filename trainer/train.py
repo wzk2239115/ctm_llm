@@ -162,6 +162,9 @@ if __name__ == '__main__':
     parser.add_argument('--self_cond', type=int, default=1, choices=[0, 1])
     parser.add_argument('--cross_layer_state', type=int, default=1, choices=[0, 1])
     parser.add_argument('--block_size', type=int, default=4)
+    parser.add_argument('--ttt_layer', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--ttt_hidden_mult', type=int, default=2)
+    parser.add_argument('--ttt_gate_init', type=float, default=-2.0)
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--data_path', type=str,
                         default='dataset_data/sft_t2a_mini.parquet')
@@ -203,6 +206,9 @@ if __name__ == '__main__':
         self_cond=bool(args.self_cond),
         cross_layer_state=bool(args.cross_layer_state),
         block_size=args.block_size,
+        ttt_layer=bool(args.ttt_layer),
+        ttt_hidden_mult=args.ttt_hidden_mult,
+        ttt_gate_init=args.ttt_gate_init,
     )
     if rank == 0:
         Logger(f'Config: {config}')

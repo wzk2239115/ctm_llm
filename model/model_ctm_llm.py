@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from model.config import CTMLLMConfig
-from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze
+from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze, TTTMLP
 
 
 class RMSNorm(nn.Module):
@@ -73,6 +73,14 @@ class CTMBlock(nn.Module):
                 synapse_in, config.d_model, config.synapse_depth, dropout=config.dropout)
 
         self.trace_processor = self._build_nlms(config)
+        self.ttt_layer = None
+        if config.ttt_layer:
+            self.ttt_layer = TTTMLP(
+                config.d_model,
+                hidden_mult=config.ttt_hidden_mult,
+                gate_init=config.ttt_gate_init,
+                dropout=config.dropout,
+            )
 
         self.start_activated_state = nn.Parameter(
             torch.zeros(config.d_model).uniform_(
@@ -243,6 +251,8 @@ class CTMBlock(nn.Module):
                 [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
 
             activated = self.trace_processor(state_trace)
+            if self.ttt_layer is not None:
+                activated = activated + self.ttt_layer(activated)
 
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
