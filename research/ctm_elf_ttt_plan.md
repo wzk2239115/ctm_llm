@@ -528,3 +528,29 @@ acting as a useful fast domain learner.
 If SFT eval collapses or KL/generation drift is large, update only
 last_ttt_layer or reduce LR/steps.
 ```
+
+Raw code-domain adaptation should first be evaluated as prefix completion, not
+chat instruction following. Use:
+
+```bash
+python eval_completion.py \
+  --weight out/ctm_ttt_opc_code_1024_bs16_seq1024_1h_1024.pth \
+  --hidden_size 1024 \
+  --num_hidden_layers 16 \
+  --d_model 512 \
+  --d_input 256 \
+  --heads 8 \
+  --n_synch_out 512 \
+  --n_synch_action 512 \
+  --iterations 4 \
+  --memory_length 5 \
+  --synapse_depth 2 \
+  --ttt_layer 1 \
+  --prompt $'def is_palindrome(s):\n    ' \
+  --max_new_tokens 160
+```
+
+Instruction prompts such as "Write a Python function..." require either
+instruction-code SFT data or synthetic instruction construction from code
+snippets. A raw code corpus teaches code continuation, not necessarily
+user-request-to-code mapping.
