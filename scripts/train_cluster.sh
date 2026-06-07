@@ -42,6 +42,11 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG"
 
+if [[ -n "${CTM_POOL_NODE_ADDRS:-}" ]]; then
+  IFS=',' read -r -a NODE_ADDRS <<< "$CTM_POOL_NODE_ADDRS"
+  MASTER_ADDR="${NODE_ADDRS[0]}"
+fi
+
 if [[ "${#NODE_ADDRS[@]}" -eq 0 ]]; then
   echo "NODE_ADDRS is empty in $CONFIG" >&2
   exit 1

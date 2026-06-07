@@ -52,6 +52,17 @@ python scripts/experiment_plan.py batch-commands --stage all \
   --output runs/experiment_plans/batch_tune_plan.csv
 ```
 
+Run batch-size probes as four single-node lanes in parallel:
+
+```bash
+python scripts/experiment_plan.py run-parallel --stage all --batch_tune \
+  --config infra/clusters/h100_4nodes.env \
+  --master_addr 11.131.210.78 \
+  --port 8765 \
+  --batch_sizes 2 4 6 8 10 12 \
+  --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9
+```
+
 After the probes finish, recommend one batch size per experiment:
 
 ```bash

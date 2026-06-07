@@ -247,6 +247,8 @@ def submit_command(exp, config, master_addr=None, port=None, wait=None):
         cmd.extend(["--port", str(port)])
     if wait is not None:
         cmd.extend(["--wait", str(wait)])
+    if exp.get("node_addrs"):
+        cmd.extend(["--nodes", ",".join(exp["node_addrs"])])
     cmd.extend(arg_items(exp["args"]))
     return " ".join(shlex.quote(x) for x in cmd)
 
@@ -254,7 +256,7 @@ def submit_command(exp, config, master_addr=None, port=None, wait=None):
 def write_manifest(plan, path, config, master_addr, port, wait):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        fields = ["index", "name", "base_name", "batch_size", "question", "command"]
+        fields = ["index", "name", "base_name", "batch_size", "nodes", "question", "command"]
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for i, exp in enumerate(plan):
@@ -263,6 +265,7 @@ def write_manifest(plan, path, config, master_addr, port, wait):
                 "name": exp["name"],
                 "base_name": exp.get("base_name", exp["name"]),
                 "batch_size": exp["args"].get("batch_size", ""),
+                "nodes": ",".join(exp.get("node_addrs") or []),
                 "question": exp["question"],
                 "command": submit_command(exp, config, master_addr, port, wait),
             })
@@ -282,6 +285,7 @@ def print_commands(args):
 def print_batch_commands(args):
     plan = build_batch_tune_plan(
         args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval)
+    plan = assign_node_groups(plan, parse_node_groups(args.node_groups))
     if args.output:
         write_manifest(plan, args.output, args.config, args.master_addr, args.port, args.wait)
         print(f"wrote {len(plan)} batch probes: {args.output}")
@@ -296,6 +300,38 @@ def pool_status(master_addr, port):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def post_json(url, payload, timeout=10):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def parse_node_groups(items):
+    groups = []
+    for item in items or []:
+        parts = [part.strip() for part in item.split(",") if part.strip()]
+        if parts:
+            groups.append(parts)
+    return groups
+
+
+def assign_node_groups(plan, node_groups):
+    if not node_groups:
+        return plan
+    assigned = []
+    for i, exp in enumerate(plan):
+        exp = dict(exp)
+        exp["node_addrs"] = node_groups[i % len(node_groups)]
+        assigned.append(exp)
+    return assigned
+
+
 def wait_until_idle(master_addr, port, task_id, poll_interval):
     while True:
         status = pool_status(master_addr, port)
@@ -307,6 +343,44 @@ def wait_until_idle(master_addr, port, task_id, poll_interval):
         if not running:
             return
         time.sleep(poll_interval)
+
+
+def node_group_idle(master_addr, port, node_group):
+    status = pool_status(master_addr, port)
+    nodes = status.get("nodes", {})
+    for addr in node_group:
+        node = nodes.get(addr, {})
+        if str(node.get("status", "")).startswith("running:"):
+            return False
+    return True
+
+
+def submit_exp(args, exp, wait=30.0):
+    extra_args = " ".join(shlex.quote(item) for item in arg_items(exp["args"]))
+    payload = {
+        "config": args.config,
+        "extra_args": extra_args,
+        "node_addrs": exp.get("node_addrs") or [],
+    }
+    resp = post_json(f"http://{args.master_addr}:{args.port}/submit", payload)
+    task = resp["task"]
+    print(f"submitted task {task['task_id']}: {exp['name']} nodes={payload['node_addrs'] or 'all'}")
+    if wait > 0:
+        expected = set(payload["node_addrs"])
+        if expected:
+            deadline = time.time() + wait
+            seen = set()
+            while time.time() < deadline:
+                status = pool_status(args.master_addr, args.port)
+                acks = status.get("acks", {}).get(task["task_id"], {})
+                for addr, ack in sorted(acks.items()):
+                    if addr not in seen:
+                        seen.add(addr)
+                        print(f"ack {addr}: {ack.get('status')} {ack.get('message', '')}")
+                if expected.issubset(seen):
+                    break
+                time.sleep(1)
+    return task
 
 
 def run_plan(args):
@@ -328,6 +402,52 @@ def run_plan(args):
         if task_id:
             time.sleep(args.startup_grace)
             wait_until_idle(args.master_addr, args.port, task_id, args.poll_interval)
+
+
+def run_parallel(args):
+    if getattr(args, "batch_tune", False):
+        plan = build_batch_tune_plan(
+            args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval)
+    else:
+        plan = apply_batch_profile(build_plan(args.stage), load_batch_profile(args.batch_profile))
+
+    node_groups = parse_node_groups(args.node_groups)
+    if not node_groups:
+        raise SystemExit("--node_groups is required for run-parallel")
+
+    queue = list(plan)
+    running = {}
+    completed = 0
+    while queue or running:
+        for idx, group in enumerate(node_groups):
+            if idx in running or not queue:
+                continue
+            if not node_group_idle(args.master_addr, args.port, group):
+                continue
+            exp = dict(queue.pop(0))
+            exp["node_addrs"] = group
+            print(f"\n[{completed + len(running) + 1}/{len(plan)}] lane={idx} {exp['name']}")
+            task = submit_exp(args, exp, wait=args.wait)
+            running[idx] = {
+                "task_id": task["task_id"],
+                "nodes": group,
+                "name": exp["name"],
+                "submitted_at": time.time(),
+            }
+
+        done = []
+        for idx, item in running.items():
+            if time.time() - item["submitted_at"] < args.startup_grace:
+                continue
+            if node_group_idle(args.master_addr, args.port, item["nodes"]):
+                done.append(idx)
+        for idx in done:
+            item = running.pop(idx)
+            completed += 1
+            print(f"[done {completed}/{len(plan)}] lane={idx} {item['name']} task={item['task_id']}")
+
+        if queue or running:
+            time.sleep(args.poll_interval)
 
 
 def latest_rows(metrics_dir):
@@ -471,6 +591,8 @@ def parse_args():
     p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
     p.add_argument("--tune_steps", type=int, default=80)
     p.add_argument("--tune_log_interval", type=int, default=20)
+    p.add_argument("--node_groups", nargs="*", default=None,
+                   help="Optional node groups assigned round-robin, e.g. ip1 ip2 or ip1,ip2.")
     p.add_argument("--output", default="runs/experiment_plans/batch_tune_plan.csv")
     p.set_defaults(func=print_batch_commands)
 
@@ -483,6 +605,18 @@ def parse_args():
     p.add_argument("--tune_steps", type=int, default=80)
     p.add_argument("--tune_log_interval", type=int, default=20)
     p.set_defaults(func=run_plan)
+
+    p = sub.add_parser("run-parallel", parents=[common])
+    p.add_argument("--startup_grace", type=float, default=20.0)
+    p.add_argument("--poll_interval", type=float, default=30.0)
+    p.add_argument("--batch_profile", default=None)
+    p.add_argument("--batch_tune", action="store_true")
+    p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
+    p.add_argument("--tune_steps", type=int, default=80)
+    p.add_argument("--tune_log_interval", type=int, default=20)
+    p.add_argument("--node_groups", nargs="+", required=True,
+                   help="Node groups for parallel lanes, e.g. ip1 ip2 ip3 ip4 or ip1,ip2 ip3,ip4.")
+    p.set_defaults(func=run_parallel)
 
     p = sub.add_parser("summarize")
     p.add_argument("--metrics_dir", default="runs/metrics")
@@ -497,7 +631,7 @@ def parse_args():
     p.set_defaults(func=recommend_batches)
 
     args = parser.parse_args()
-    if args.cmd == "run":
+    if args.cmd in ("run", "run-parallel"):
         if args.master_addr is None:
             args.master_addr = "11.131.210.78"
         if args.port is None:

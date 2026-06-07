@@ -20,6 +20,7 @@ URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 STATE = {
     "nodes": {},
     "task": None,
+    "tasks": [],
     "acks": {},
 }
 LOCK = threading.Lock()
@@ -121,6 +122,7 @@ def print_pool():
     with LOCK:
         nodes = dict(STATE["nodes"])
         task = STATE["task"]
+        tasks = list(STATE.get("tasks", []))
         acks = dict(STATE["acks"])
 
     print("\n=== CTM Pool ===", flush=True)
@@ -133,9 +135,20 @@ def print_pool():
             f"gpus={gpu_summary} seen={age:.1f}s",
             flush=True,
         )
-    if task:
+    if tasks:
+        for task in tasks:
+            assigned = ",".join(task.get("node_addrs") or [])
+            print(
+                f"  task={task['task_id']} nodes={assigned or 'all'} "
+                f"args={task.get('extra_args', '')}",
+                flush=True,
+            )
+            for addr, ack in sorted(acks.get(task["task_id"], {}).items()):
+                print(f"    ack {addr}: {ack.get('status')} {ack.get('message', '')}", flush=True)
+    elif task:
         print(f"  task={task['task_id']} args={task.get('extra_args', '')}", flush=True)
-        for addr, ack in sorted(acks.items()):
+        legacy_acks = acks.get(task["task_id"], acks)
+        for addr, ack in sorted(legacy_acks.items()):
             print(f"    ack {addr}: {ack.get('status')} {ack.get('message', '')}", flush=True)
     print("================\n", flush=True)
 
@@ -164,6 +177,7 @@ class PoolHandler(BaseHTTPRequestHandler):
                 payload = {
                     "nodes": STATE["nodes"],
                     "task": STATE["task"],
+                    "tasks": STATE.get("tasks", []),
                     "acks": STATE["acks"],
                 }
             self._write_json(payload)
@@ -172,8 +186,23 @@ class PoolHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             addr = query.get("node_addr", [""])[0]
             with LOCK:
-                task = STATE["task"]
-                acked = task is not None and STATE["acks"].get(addr, {}).get("task_id") == task["task_id"]
+                task = None
+                acked = False
+                for candidate in STATE.get("tasks", []):
+                    node_addrs = candidate.get("node_addrs") or []
+                    if node_addrs and addr not in node_addrs:
+                        continue
+                    if STATE["acks"].get(candidate["task_id"], {}).get(addr):
+                        continue
+                    task = candidate
+                    break
+                if task is None:
+                    legacy = STATE.get("task")
+                    acked = (
+                        legacy is not None
+                        and STATE["acks"].get(legacy["task_id"], {}).get(addr)
+                    )
+                    task = None if acked else legacy
             self._write_json({"task": None if acked else task})
             return
         self.send_error(404)
@@ -196,17 +225,20 @@ class PoolHandler(BaseHTTPRequestHandler):
 
         if self.path == "/submit":
             payload = self._read_json()
-            task_id = time.strftime("%Y%m%d_%H%M%S")
+            task_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
             task = {
                 "task_id": task_id,
                 "config": payload["config"],
                 "extra_args": payload.get("extra_args", ""),
+                "node_addrs": payload.get("node_addrs") or [],
                 "created_at": time.time(),
             }
             with LOCK:
                 STATE["task"] = task
-                STATE["acks"] = {}
-            print(f"[pool] new task: {task_id} {task['extra_args']}", flush=True)
+                STATE.setdefault("tasks", []).append(task)
+                STATE["acks"].setdefault(task_id, {})
+            nodes = ",".join(task["node_addrs"]) if task["node_addrs"] else "all"
+            print(f"[pool] new task: {task_id} nodes={nodes} {task['extra_args']}", flush=True)
             print_pool()
             self._write_json({"ok": True, "task": task})
             return
@@ -215,7 +247,8 @@ class PoolHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             addr = payload["node_addr"]
             with LOCK:
-                STATE["acks"][addr] = payload
+                task_id = payload["task_id"]
+                STATE["acks"].setdefault(task_id, {})[addr] = payload
             print(f"[pool] ack from {addr}: {payload.get('status')} {payload.get('message', '')}", flush=True)
             print_pool()
             self._write_json({"ok": True})
@@ -409,6 +442,9 @@ def run_worker(args):
         }
         try:
             post_json(f"{base}/heartbeat", heartbeat, timeout=5)
+            if proc is not None and proc.poll() is None:
+                time.sleep(args.interval)
+                continue
             task_resp = get_json(
                 f"{base}/task?node_addr={urllib.parse.quote(node_addr)}", timeout=5
             )
@@ -455,6 +491,8 @@ def run_worker(args):
                 cmd = ["bash", "scripts/train_cluster.sh", "--config", task["config"], *extra]
                 env = os.environ.copy()
                 env["CTM_NODE_ADDR"] = node_addr
+                if task.get("node_addrs"):
+                    env["CTM_POOL_NODE_ADDRS"] = ",".join(task["node_addrs"])
                 print(f"[worker] received task {task['task_id']}: {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
                 proc = subprocess.Popen(cmd, env=env)
                 status = f"running:{task['task_id']}"
@@ -474,7 +512,13 @@ def run_submit(args):
     if extra_items and extra_items[0] == "--":
         extra_items = extra_items[1:]
     extra_args = " ".join(shlex.quote(item) for item in extra_items)
-    payload = {"config": args.config, "extra_args": extra_args}
+    node_addrs = []
+    if args.nodes:
+        raw_nodes = []
+        for item in args.nodes:
+            raw_nodes.extend(part for part in item.split(",") if part)
+        node_addrs = [node.strip() for node in raw_nodes if node.strip()]
+    payload = {"config": args.config, "extra_args": extra_args, "node_addrs": node_addrs}
     resp = post_json(f"http://{args.master_addr}:{args.port}/submit", payload)
     task = resp["task"]
     print(f"submitted task {task['task_id']}: {task.get('extra_args', '')}")
@@ -483,12 +527,12 @@ def run_submit(args):
         return
 
     config = load_cluster_config(args.config)
-    expected = set(config.get("NODE_ADDRS", []))
+    expected = set(node_addrs or config.get("NODE_ADDRS", []))
     deadline = time.time() + args.wait
     seen = set()
     while time.time() < deadline:
         status = get_json(f"http://{args.master_addr}:{args.port}/status")
-        acks = status.get("acks", {})
+        acks = status.get("acks", {}).get(task["task_id"], {})
         for addr, ack in sorted(acks.items()):
             if ack.get("task_id") == task["task_id"] and addr not in seen:
                 seen.add(addr)
@@ -532,6 +576,8 @@ def main():
     p.add_argument("--master_addr", default="11.131.210.78")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--wait", type=float, default=30.0)
+    p.add_argument("--nodes", nargs="+", default=None,
+                   help="Restrict this task to a comma/space separated node subset.")
     p.add_argument("extra_args", nargs=argparse.REMAINDER)
     p.set_defaults(func=run_submit)
 
