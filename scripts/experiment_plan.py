@@ -813,6 +813,53 @@ def apply_oom_backoff(base, batch_size, ratio):
     base["batches"] = [bs for bs in base["batches"] if bs <= cutoff]
 
 
+def maybe_refine_quick_probe(base, ok_batch_size, peak_memory_mb, limit_mb, args):
+    if not args.refine_bracket_after_ok:
+        return None
+    failed_batches = [
+        item["batch_size"] for item in base.get("attempts", [])
+        if item["status"] in {"oom", "over_memory"} and item["batch_size"] > ok_batch_size
+    ]
+    if not failed_batches:
+        return None
+    upper_failed = min(failed_batches)
+    skipped = [
+        batch_size for batch_size in sorted(set(args.batch_sizes), reverse=True)
+        if ok_batch_size < batch_size < upper_failed
+    ]
+    if not skipped:
+        return None
+    candidate = skipped[-1]
+    if peak_memory_mb is not None:
+        predicted_mb = peak_memory_mb * (candidate / ok_batch_size)
+        if predicted_mb > limit_mb * args.refine_memory_margin:
+            return None
+    return candidate
+
+
+def maybe_retry_skipped_after_missing(base, args):
+    attempted = {item["batch_size"] for item in base.get("attempts", [])}
+    failed = [
+        item["batch_size"] for item in base.get("attempts", [])
+        if item["status"] in {"oom", "over_memory"}
+    ]
+    uncertain = [
+        item["batch_size"] for item in base.get("attempts", [])
+        if item["status"] == "missing_metrics"
+    ]
+    if not failed or not uncertain:
+        return None
+    upper_failed = min(failed)
+    lower_uncertain = max((bs for bs in uncertain if bs < upper_failed), default=None)
+    if lower_uncertain is None:
+        return None
+    skipped = [
+        batch_size for batch_size in sorted(set(args.batch_sizes), reverse=True)
+        if lower_uncertain < batch_size < upper_failed and batch_size not in attempted
+    ]
+    return skipped[-1] if skipped else None
+
+
 def write_quick_outputs(args, selected, attempts):
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     profile_fields = [
@@ -883,6 +930,7 @@ def run_quick_probe(args):
             "exp": exp,
             "batches": list(batch_sizes),
             "done": False,
+            "attempts": [],
         }
         for exp in base_plan
     }
@@ -967,15 +1015,30 @@ def run_quick_probe(args):
             }
             attempts.append(attempt)
             base = pending[item["base_name"]]
+            base["attempts"].append({
+                "batch_size": item["batch_size"],
+                "status": status,
+                "peak_memory_mb": peak_memory_mb,
+            })
             if status == "ok":
-                base["done"] = True
-                selected[item["base_name"]] = {
+                selected_item = {
                     "batch_size": item["batch_size"],
                     "probe_name": item["name"],
                     "peak_memory_mb": result.get("peak_memory_mb", ""),
                     "tokens_per_sec": result.get("tokens_per_sec", ""),
                     "metrics_file": result.get("metrics_file", ""),
                 }
+                refine_batch = maybe_refine_quick_probe(
+                    base, item["batch_size"], peak_memory_mb, limit_mb, args)
+                if refine_batch is not None:
+                    selected_item["refine_fallback"] = True
+                    selected[item["base_name"]] = selected_item
+                    base["done"] = False
+                    base["batches"] = [refine_batch]
+                    queue.append(item["base_name"])
+                else:
+                    base["done"] = True
+                    selected[item["base_name"]] = selected_item
                 print(
                     f"[selected {len(selected)}/{total}] {item['base_name']} "
                     f"bs={item['batch_size']} mem={result.get('peak_memory_mb', '')}",
@@ -987,7 +1050,12 @@ def run_quick_probe(args):
                 if base["batches"]:
                     queue.append(item["base_name"])
                 else:
-                    base["done"] = True
+                    retry_batch = maybe_retry_skipped_after_missing(base, args)
+                    if retry_batch is not None and item["base_name"] not in selected:
+                        base["batches"] = [retry_batch]
+                        queue.append(item["base_name"])
+                    else:
+                        base["done"] = True
                 print(
                     f"[probe {result['status']}] {item['base_name']} "
                     f"bs={item['batch_size']} next={base['batches'][:1] or '-'}",
@@ -1297,6 +1365,10 @@ def parse_args():
                    help="Wait this long for metrics/failure files after a lane becomes idle.")
     p.add_argument("--oom_backoff_ratio", type=float, default=0.67,
                    help="After OOM/over_memory, only try remaining batches <= current_batch * ratio; set 1.0 to disable.")
+    p.add_argument("--refine_bracket_after_ok", action=argparse.BooleanOptionalAction, default=True,
+                   help="After a lower batch succeeds below an OOM/over_memory batch, try one skipped middle batch when memory looks safe.")
+    p.add_argument("--refine_memory_margin", type=float, default=0.97,
+                   help="Only run bracket refinement when linear memory estimate is below limit * margin.")
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--output", default="runs/metrics/batch_profile_quick.csv")
     p.add_argument("--report_output", default="runs/metrics/quick_probe_report.csv")

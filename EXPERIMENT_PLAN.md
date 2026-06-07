@@ -113,6 +113,7 @@ python scripts/experiment_plan.py quick-probe --stage all \
   --time_limit_min 15 \
   --metrics_settle_seconds 8 \
   --oom_backoff_ratio 0.67 \
+  --refine_bracket_after_ok \
   --fallback_batch_size 2 \
   --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9 \
   --gpus_per_lane 2 \
@@ -127,6 +128,12 @@ barely survived a short probe.
 After `oom` or `over_memory`, it also skips nearby larger batches according to
 `--oom_backoff_ratio`; the default `0.67` changes a failing `bs12` probe into a
 next attempt around `bs8` instead of `bs10`.
+When a lower batch succeeds under a failed larger batch, `quick-probe` runs one
+middle refinement probe when the memory estimate looks safe, for example
+`bs8 oom -> bs4 ok -> try bs6`.
+If low batches only produce `missing_metrics` and no usable batch has been
+selected yet, it can also retry a skipped middle batch to recover from transient
+metrics gaps.
 
 Then generate a first-pass final plan from it:
 
