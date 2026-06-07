@@ -12,6 +12,8 @@ import urllib.request
 import json
 
 
+URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 BASE_ARGS = {
     "epochs": 1,
     "batch_size": 4,
@@ -474,7 +476,7 @@ def print_batch_commands(args):
 
 
 def pool_status(master_addr, port):
-    with urllib.request.urlopen(f"http://{master_addr}:{port}/status", timeout=10) as resp:
+    with URL_OPENER.open(f"http://{master_addr}:{port}/status", timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -486,7 +488,7 @@ def post_json(url, payload, timeout=10):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with URL_OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
