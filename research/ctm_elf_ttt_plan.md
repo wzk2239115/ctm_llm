@@ -554,3 +554,123 @@ Instruction prompts such as "Write a Python function..." require either
 instruction-code SFT data or synthetic instruction construction from code
 snippets. A raw code corpus teaches code continuation, not necessarily
 user-request-to-code mapping.
+
+## Experiment Result: Mixed Raw Code TTT Adaptation
+
+Date: 2026-06-07
+
+Setup:
+
+```text
+base checkpoint : out/ctm_2node_1024_16l_bs16_44ep_1024_resume.pth
+TTT target      : .ttt_layer.* only
+dataset         : dataset/opc-annealing-corpus
+subset/config   : algorithmic_corpus
+hardware        : 2 nodes, 16 GPUs
+batch/seq       : batch_size=16, max_seq_len=1024
+```
+
+Observed training runs:
+
+```text
+smoke 1000 steps:
+  loss around 5.45 -> 5.10 in 11.2min for the smaller smoke settings.
+
+1h run:
+  checkpoint: out/ctm_ttt_opc_code_1024_bs16_seq1024_1h_1024.pth
+  duration  : 47.7min
+  result    : loss reached about 5.10, ppl about 164.
+
+long run:
+  checkpoint: out/ctm_ttt_opc_code_1024_bs16_seq1024_20h_1024.pth
+  duration  : interrupted around 8h due to NCCL timeout
+  progress  : about 15.6k / 38k steps
+  result    : loss reached about 4.16, ppl about 64.
+```
+
+Raw prefix completion probe:
+
+```text
+prompt:
+def is_palindrome(s):
+    
+```
+
+Qualitative outputs:
+
+```text
+base CTM+ELF:
+  Not code. Output stays close to chat/English fragments and repetition.
+
+1h TTT-code:
+  Clearly shifts toward code-like tokens, braces, returns, loops, and symbols.
+  However, syntax is unstable and mixes C-like fragments with Python prefix.
+
+8h TTT-code:
+  Stronger code/comment/symbol distribution, but more fragmented and mixed
+  across languages. Lower loss did not translate into cleaner Python
+  completion.
+```
+
+Conclusion:
+
+```text
+The CTM TTT Layer successfully changes the model distribution using raw code.
+This validates the mechanism: with the base CTM+ELF frozen, updating only
+.ttt_layer.* can absorb a new domain signal.
+
+This does not yet validate code instruction following or stable Python
+generation. Raw mixed-code continuation is not the same task as "write a Python
+function". The 8h checkpoint shows over-adaptation to mixed raw-code fragments:
+loss improves, but generation drifts toward cross-language syntax and comment
+noise.
+```
+
+Interpretation:
+
+```text
+Positive signal:
+  TTT Layer is learnable and has enough capacity to move generation from
+  chat-like text toward code-like text.
+
+Negative signal:
+  Mixed raw corpus + chunk-level next-token training does not produce clean
+  function-level Python behavior by itself.
+
+Most useful checkpoint so far:
+  1h checkpoint is a better qualitative balance than the 8h checkpoint.
+  8h checkpoint is useful as evidence of raw-code over-adaptation.
+```
+
+Next experiment:
+
+```text
+Use language-filtered and boundary-aware raw completion, still not SFT.
+
+Recommended data direction:
+  - Python-only rows if the dataset has a reliable lang field.
+  - Function-level chunks instead of arbitrary 1024-token chunks.
+  - Prefix/body completion objectives.
+  - Optional docstring/code self-supervised pairs, without user instruction
+    formatting at first.
+
+Recommended training direction:
+  - Start from the base CTM+ELF checkpoint again.
+  - Train .ttt_layer.* on Python-only raw completion.
+  - Use lower LR, for example 3e-6.
+  - Compare base, 1h mixed-code, 8h mixed-code, and Python-only checkpoints.
+```
+
+Current research claim supported by this experiment:
+
+```text
+CTM+ELF+TTT can perform parameter-efficient domain adaptation through internal
+TTT Layers while keeping the base model frozen.
+```
+
+Current research claim not yet supported:
+
+```text
+CTM+ELF+TTT can reliably solve code instructions or generate correct Python
+functions from natural-language requests.
+```
