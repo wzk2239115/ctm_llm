@@ -94,6 +94,30 @@ def ctm_name(prefix, **items):
     return "_".join(parts)
 
 
+def validate_plan(plan):
+    for exp in plan:
+        args = exp["args"]
+        name = exp["name"]
+        heads = int(args.get("heads", 1))
+        hidden = int(args.get("hidden_size", 1))
+        d_input = int(args.get("d_input", 1))
+        d_model = int(args.get("d_model", 1))
+        n_synch_out = int(args.get("n_synch_out", 1))
+        n_synch_action = int(args.get("n_synch_action", 1))
+        if args.get("model_type") == "transformer" and hidden % heads != 0:
+            raise ValueError(
+                f"{name}: hidden_size({hidden}) must be divisible by heads({heads})")
+        if args.get("model_type") == "ctm":
+            if d_input % heads != 0:
+                raise ValueError(
+                    f"{name}: d_input({d_input}) must be divisible by heads({heads})")
+            if d_model < max(n_synch_out, n_synch_action):
+                raise ValueError(
+                    f"{name}: d_model({d_model}) must be >= n_synch_out({n_synch_out}) "
+                    f"and n_synch_action({n_synch_action})")
+    return plan
+
+
 def build_plan(stage, plan_size="full"):
     plan = []
     if stage in ("smoke", "all"):
@@ -112,7 +136,7 @@ def build_plan(stage, plan_size="full"):
 
     if stage in ("compass", "all"):
         scales = [
-            ("12l_h640", 12, 640, 384, 192, 6),
+            ("12l_h640", 12, 640, 384, 192, 8),
             ("16l_h768", 16, 768, 512, 256, 8),
         ]
         if include_plan_size(plan_size, "full"):
@@ -355,7 +379,7 @@ def build_plan(stage, plan_size="full"):
                     "Wide ablation for sparse/simple CTM variants.",
                     merge_args(model_type="ctm", **overrides)))
 
-    return plan
+    return validate_plan(plan)
 
 
 def build_batch_tune_plan(stage, batch_sizes, max_steps, log_interval, plan_size="full"):
@@ -527,6 +551,10 @@ def wait_until_idle(master_addr, port, task_id, poll_interval):
 
 def node_group_idle(master_addr, port, node_group):
     status = pool_status(master_addr, port)
+    return node_group_idle_from_status(status, node_group)
+
+
+def node_group_idle_from_status(status, node_group):
     nodes = status.get("nodes", {})
     for addr in node_group:
         node = nodes.get(addr, {})
@@ -607,15 +635,16 @@ def run_parallel(args):
     running = {}
     completed = 0
     while queue or running:
+        status = pool_status(args.master_addr, args.port)
         for idx, group in enumerate(node_groups):
             if idx in running or not queue:
                 continue
-            if not node_group_idle(args.master_addr, args.port, group):
+            if not node_group_idle_from_status(status, group):
                 continue
             exp = dict(queue.pop(0))
             exp["node_addrs"] = group
             print(f"\n[{completed + len(running) + 1}/{len(plan)}] lane={idx} {exp['name']}")
-            task = submit_exp(args, exp, wait=args.wait)
+            task = submit_exp(args, exp, wait=0)
             running[idx] = {
                 "task_id": task["task_id"],
                 "nodes": group,
@@ -624,10 +653,11 @@ def run_parallel(args):
             }
 
         done = []
+        status = pool_status(args.master_addr, args.port)
         for idx, item in running.items():
             if time.time() - item["submitted_at"] < args.startup_grace:
                 continue
-            if node_group_idle(args.master_addr, args.port, item["nodes"]):
+            if node_group_idle_from_status(status, item["nodes"]):
                 done.append(idx)
         for idx in done:
             item = running.pop(idx)
@@ -741,6 +771,33 @@ def latest_row_by_experiment(metrics_dir):
     return by_name
 
 
+def failure_reports_by_experiment(metrics_dir):
+    def priority(report):
+        status_score = 0 if report.get("status") == "oom" else 1
+        rank = report.get("rank")
+        try:
+            rank_score = int(rank)
+        except (TypeError, ValueError):
+            rank_score = 0
+        return (status_score, rank_score, report.get("failure_file", ""))
+
+    grouped = {}
+    for path in sorted(glob.glob(os.path.join(metrics_dir, "*.fail.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        name = data.get("experiment_name")
+        if name:
+            data["failure_file"] = path
+            grouped.setdefault(name, []).append(data)
+    return {
+        name: sorted(items, key=priority)[0]
+        for name, items in grouped.items()
+    }
+
+
 def batch_report(args):
     planned = build_batch_tune_plan(
         args.stage,
@@ -750,30 +807,43 @@ def batch_report(args):
         args.plan_size,
     )
     metrics = latest_row_by_experiment(args.metrics_dir)
+    failures = failure_reports_by_experiment(args.metrics_dir)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     fields = [
         "base_experiment", "probe_experiment", "batch_size", "status",
         "peak_memory_mb", "tokens_per_sec", "steps_per_sec", "loss",
-        "global_step", "world_size", "metrics_file", "question",
+        "global_step", "world_size", "metrics_file", "failure_file",
+        "failure_rank", "error_type", "error", "question",
     ]
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         for exp in planned:
             row = metrics.get(exp["name"])
-            status = "ok" if row else "missing_metrics"
+            failure = failures.get(exp["name"])
+            status = failure.get("status", "failed") if failure else ("ok" if row else "missing_metrics")
             writer.writerow({
                 "base_experiment": exp.get("base_name", exp["name"]),
                 "probe_experiment": exp["name"],
                 "batch_size": exp["args"].get("batch_size", ""),
                 "status": status,
-                "peak_memory_mb": row.get("peak_memory_mb", "") if row else "",
+                "peak_memory_mb": (
+                    failure.get("peak_memory_mb", "")
+                    if failure else row.get("peak_memory_mb", "") if row else ""
+                ),
                 "tokens_per_sec": row.get("tokens_per_sec", "") if row else "",
                 "steps_per_sec": row.get("steps_per_sec", "") if row else "",
                 "loss": row.get("loss", "") if row else "",
                 "global_step": row.get("global_step", "") if row else "",
-                "world_size": row.get("world_size", "") if row else "",
+                "world_size": (
+                    failure.get("world_size", "")
+                    if failure else row.get("world_size", "") if row else ""
+                ),
                 "metrics_file": row.get("metrics_file", "") if row else "",
+                "failure_file": failure.get("failure_file", "") if failure else "",
+                "failure_rank": failure.get("rank", "") if failure else "",
+                "error_type": failure.get("error_type", "") if failure else "",
+                "error": failure.get("error", "")[:500] if failure else "",
                 "question": exp["question"],
             })
     print(f"wrote batch probe report: {args.output}")

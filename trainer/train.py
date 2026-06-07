@@ -5,6 +5,7 @@ import csv
 import json
 import subprocess
 import time
+import traceback
 import warnings
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -63,6 +64,62 @@ def append_metrics_csv(path, row):
         if not exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def failure_path_from_metrics(path, rank=None):
+    stem = os.path.splitext(path)[0]
+    if rank is None:
+        return stem + '.fail.json'
+    return f'{stem}.rank{rank}.fail.json'
+
+
+def write_failure_report(args, exc, rank=0):
+    if not getattr(args, 'metrics_path', None):
+        return
+    err_text = str(exc)
+    status = 'oom' if isinstance(exc, torch.OutOfMemoryError) or 'out of memory' in err_text.lower() else 'failed'
+    payload = {
+        'experiment_name': args.experiment_name,
+        'status': status,
+        'rank': rank,
+        'error_type': type(exc).__name__,
+        'error': err_text[-4000:],
+        'traceback': traceback.format_exc()[-12000:],
+        'model_type': args.model_type,
+        'batch_size': args.batch_size,
+        'world_size': getattr(args, 'world_size', 1),
+        'hidden_size': args.hidden_size,
+        'num_hidden_layers': args.num_hidden_layers,
+        'd_model': args.d_model,
+        'd_input': args.d_input,
+        'iterations': args.iterations,
+        'memory_length': args.memory_length,
+        'memory_hidden_dims': args.memory_hidden_dims,
+        'synapse_depth': args.synapse_depth,
+        'peak_memory_mb': cuda_memory_mb(args.device),
+        'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'git_commit': getattr(args, 'git_commit', 'unknown'),
+    }
+    path = failure_path_from_metrics(args.metrics_path, rank=rank)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    Logger(f'Failure report: {path}')
+    if rank == 0:
+        legacy_path = failure_path_from_metrics(args.metrics_path)
+        with open(legacy_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def install_failure_hook(args, rank=0):
+    default_hook = sys.excepthook
+
+    def hook(exc_type, exc, tb):
+        if not issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            write_failure_report(args, exc, rank=rank)
+        default_hook(exc_type, exc, tb)
+
+    sys.excepthook = hook
 
 
 def effective_tick_from_certainties(certainties, args):
@@ -358,6 +415,7 @@ if __name__ == '__main__':
         safe_name = ''.join(
             c if c.isalnum() or c in '-_.' else '_' for c in args.experiment_name)
         args.metrics_path = os.path.join(args.metrics_dir, f'{safe_name}.csv')
+    install_failure_hook(args, rank=rank)
 
     config = CTMLLMConfig(
         model_type=args.model_type,
@@ -464,38 +522,43 @@ if __name__ == '__main__':
         Logger(f'Dataset: {len(dataset)} samples')
 
     train_start = time.time()
-    for epoch in range(start_epoch, args.epochs):
-        setup_seed(args.seed + epoch)
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            setup_seed(args.seed + epoch)
+            if ddp:
+                sampler = DistributedSampler(dataset, shuffle=True, num_replicas=world_size, rank=rank)
+                sampler.set_epoch(epoch)
+                loader = DataLoader(
+                    dataset, batch_size=args.batch_size, sampler=sampler,
+                    num_workers=args.num_workers, pin_memory=True, drop_last=True)
+            else:
+                loader = DataLoader(
+                    dataset, batch_size=args.batch_size, shuffle=True,
+                    num_workers=args.num_workers, pin_memory=True, drop_last=True)
+
+            iters = len(loader)
+            skip = start_step if epoch == start_epoch and start_step > 0 else 0
+            if skip > 0 and rank == 0:
+                Logger(f'Epoch[{epoch + 1}]: skip first {skip} steps')
+            last_step = train_epoch(
+                epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
+                tb_writer, swanlab,
+                start_step=skip, rank=rank)
+            if args.max_steps > 0 and epoch * iters + last_step >= args.max_steps:
+                break
+            start_step = 0
+
+        if rank == 0:
+            total_time = time.time() - train_start
+            Logger(f'Training complete! Total: {format_time(total_time)}')
+    except Exception as exc:
+        write_failure_report(args, exc, rank=rank)
+        raise
+    finally:
+        if rank == 0:
+            if swanlab:
+                swanlab.finish()
+            if tb_writer:
+                tb_writer.close()
         if ddp:
-            sampler = DistributedSampler(dataset, shuffle=True, num_replicas=world_size, rank=rank)
-            sampler.set_epoch(epoch)
-            loader = DataLoader(
-                dataset, batch_size=args.batch_size, sampler=sampler,
-                num_workers=args.num_workers, pin_memory=True, drop_last=True)
-        else:
-            loader = DataLoader(
-                dataset, batch_size=args.batch_size, shuffle=True,
-                num_workers=args.num_workers, pin_memory=True, drop_last=True)
-
-        iters = len(loader)
-        skip = start_step if epoch == start_epoch and start_step > 0 else 0
-        if skip > 0 and rank == 0:
-            Logger(f'Epoch[{epoch + 1}]: skip first {skip} steps')
-        last_step = train_epoch(
-            epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
-            tb_writer, swanlab,
-            start_step=skip, rank=rank)
-        if args.max_steps > 0 and epoch * iters + last_step >= args.max_steps:
-            break
-        start_step = 0
-
-    if rank == 0:
-        total_time = time.time() - train_start
-        Logger(f'Training complete! Total: {format_time(total_time)}')
-        if swanlab:
-            swanlab.finish()
-        if tb_writer:
-            tb_writer.close()
-
-    if ddp:
-        cleanup_ddp()
+            cleanup_ddp()
