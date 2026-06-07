@@ -35,6 +35,50 @@ Submit with trainer overrides:
   --iterations 5 --cross_layer_state 0 --swanlab_name cross0-iter5
 ```
 
+Generate a sequential experiment command list:
+
+```bash
+python scripts/experiment_plan.py commands --stage compass \
+  --config infra/clusters/h100_2nodes.env \
+  --output runs/experiment_plans/compass_plan.csv
+```
+
+Generate short batch-size probes before the full run:
+
+```bash
+python scripts/experiment_plan.py batch-commands --stage all \
+  --config infra/clusters/h100_4nodes.env \
+  --batch_sizes 2 4 6 8 10 12 \
+  --output runs/experiment_plans/batch_tune_plan.csv
+```
+
+After the probes finish, recommend one batch size per experiment:
+
+```bash
+python scripts/experiment_plan.py recommend-batches \
+  --metrics_dir runs/metrics \
+  --target_memory_gb 80 \
+  --memory_util 0.90 \
+  --output runs/metrics/batch_profile.csv
+```
+
+Generate the full serial plan using the recommended batch profile:
+
+```bash
+python scripts/experiment_plan.py commands --stage all \
+  --config infra/clusters/h100_4nodes.env \
+  --batch_profile runs/metrics/batch_profile.csv \
+  --output runs/experiment_plans/full_plan.csv
+```
+
+Summarize completed training metrics:
+
+```bash
+python scripts/experiment_plan.py summarize \
+  --metrics_dir runs/metrics \
+  --output runs/metrics/summary.csv
+```
+
 Check pool state:
 
 ```bash
@@ -167,6 +211,15 @@ Current two-node config:
 ```bash
 infra/clusters/h100_2nodes.env
 ```
+
+Four-node template:
+
+```bash
+cp infra/clusters/h100_4nodes.env.example infra/clusters/h100_4nodes.env
+```
+
+Edit `infra/clusters/h100_4nodes.env`, replace the two `TODO_NODE_*_IP`
+entries, then start workers with that config on all four nodes.
 
 Important fields:
 

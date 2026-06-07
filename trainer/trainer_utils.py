@@ -7,6 +7,7 @@ import torch
 from transformers import AutoTokenizer
 from model.config import CTMLLMConfig
 from model.model_ctm_llm import CTMForCausalLM
+from model.model_transformer import TransformerForCausalLM
 
 
 def Logger(content):
@@ -33,7 +34,13 @@ def log_model_params(model):
 
 
 def create_model(config: CTMLLMConfig, device='cpu'):
-    model = CTMForCausalLM(config).to(device)
+    model_type = getattr(config, "model_type", "ctm")
+    if model_type == "ctm":
+        model = CTMForCausalLM(config).to(device)
+    elif model_type == "transformer":
+        model = TransformerForCausalLM(config).to(device)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
     log_model_params(model)
     return model
 

@@ -13,10 +13,12 @@ from transformers import AutoTokenizer
 from dataset.text_dataset import TextDataset
 from model.config import CTMLLMConfig
 from model.model_ctm_llm import CTMForCausalLM
+from model.model_transformer import TransformerForCausalLM
 
 
 def build_config(args):
     return CTMLLMConfig(
+        model_type=args.model_type,
         vocab_size=args.vocab_size,
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -24,6 +26,8 @@ def build_config(args):
         d_input=args.d_input,
         iterations=args.iterations,
         memory_length=args.memory_length,
+        memory_hidden_dims=args.memory_hidden_dims,
+        deep_nlms=bool(args.deep_nlms),
         heads=args.heads,
         n_synch_out=args.n_synch_out,
         n_synch_action=args.n_synch_action,
@@ -31,6 +35,18 @@ def build_config(args):
         self_cond=bool(args.self_cond),
         cross_layer_state=bool(args.cross_layer_state),
         block_size=args.block_size,
+        tick_loss_mode=args.tick_loss_mode,
+        elf_horizon_mode=args.elf_horizon_mode,
+        elf_max_horizon=args.elf_max_horizon,
+        tick_improve_weight=args.tick_improve_weight,
+        tick_improve_margin=args.tick_improve_margin,
+        tick_halt_mode=args.tick_halt_mode,
+        tick_halt_threshold=args.tick_halt_threshold,
+        tick_halt_temperature=args.tick_halt_temperature,
+        tick_compute_weight=args.tick_compute_weight,
+        cell_sparsity_mode=args.cell_sparsity_mode,
+        cell_topk=args.cell_topk,
+        cell_sparsity_rescale=bool(args.cell_sparsity_rescale),
         ttt_layer=bool(args.ttt_layer),
         ttt_hidden_mult=args.ttt_hidden_mult,
         ttt_gate_init=args.ttt_gate_init,
@@ -38,7 +54,13 @@ def build_config(args):
 
 
 def load_model(args):
-    model = CTMForCausalLM(build_config(args)).to(args.device)
+    config = build_config(args)
+    if args.model_type == "ctm":
+        model = CTMForCausalLM(config).to(args.device)
+    elif args.model_type == "transformer":
+        model = TransformerForCausalLM(config).to(args.device)
+    else:
+        raise ValueError(f"Unknown model_type: {args.model_type}")
     ckpt = torch.load(args.weight, map_location=args.device, weights_only=False)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -145,6 +167,8 @@ def parse_args():
     parser.add_argument("--d_input", type=int, default=256)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--memory_length", type=int, default=10)
+    parser.add_argument("--memory_hidden_dims", type=int, default=4)
+    parser.add_argument("--deep_nlms", type=int, default=1, choices=[0, 1])
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--n_synch_out", type=int, default=512)
     parser.add_argument("--n_synch_action", type=int, default=512)
@@ -152,11 +176,29 @@ def parse_args():
     parser.add_argument("--self_cond", type=int, default=1, choices=[0, 1])
     parser.add_argument("--cross_layer_state", type=int, default=1, choices=[0, 1])
     parser.add_argument("--block_size", type=int, default=4)
+    parser.add_argument("--tick_loss_mode", type=str, default="min_conf",
+                        choices=["min_conf", "mean", "last"])
+    parser.add_argument("--elf_horizon_mode", type=str, default="none",
+                        choices=["none", "linear", "pow2"])
+    parser.add_argument("--elf_max_horizon", type=int, default=4)
+    parser.add_argument("--tick_improve_weight", type=float, default=0.0)
+    parser.add_argument("--tick_improve_margin", type=float, default=0.0)
+    parser.add_argument("--tick_halt_mode", type=str, default="none",
+                        choices=["none", "confidence", "threshold"])
+    parser.add_argument("--tick_halt_threshold", type=float, default=0.65)
+    parser.add_argument("--tick_halt_temperature", type=float, default=0.25)
+    parser.add_argument("--tick_compute_weight", type=float, default=0.0)
+    parser.add_argument("--cell_sparsity_mode", type=str, default="none",
+                        choices=["none", "topk"])
+    parser.add_argument("--cell_topk", type=int, default=512)
+    parser.add_argument("--cell_sparsity_rescale", type=int, default=1, choices=[0, 1])
     parser.add_argument("--ttt_layer", type=int, default=0, choices=[0, 1])
     parser.add_argument("--ttt_hidden_mult", type=int, default=2)
     parser.add_argument("--ttt_gate_init", type=float, default=-2.0)
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--num_iters", type=int, default=None)
+    parser.add_argument("--model_type", type=str, default="ctm",
+                        choices=["ctm", "transformer"])
     return parser.parse_args()
 
 

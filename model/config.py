@@ -1,5 +1,6 @@
 class CTMLLMConfig:
     def __init__(self, **kwargs):
+        self.model_type = kwargs.get('model_type', 'ctm')
         self.vocab_size = kwargs.get('vocab_size', 6400)
         self.hidden_size = kwargs.get('hidden_size', 768)
         self.max_position_embeddings = kwargs.get('max_position_embeddings', 2048)
@@ -25,6 +26,18 @@ class CTMLLMConfig:
         self.self_cond = kwargs.get('self_cond', True)
         self.cross_layer_state = kwargs.get('cross_layer_state', True)
         self.block_size = kwargs.get('block_size', 4)
+        self.tick_loss_mode = kwargs.get('tick_loss_mode', 'min_conf')
+        self.elf_horizon_mode = kwargs.get('elf_horizon_mode', 'none')
+        self.elf_max_horizon = kwargs.get('elf_max_horizon', 4)
+        self.tick_improve_weight = kwargs.get('tick_improve_weight', 0.0)
+        self.tick_improve_margin = kwargs.get('tick_improve_margin', 0.0)
+        self.tick_halt_mode = kwargs.get('tick_halt_mode', 'none')
+        self.tick_halt_threshold = kwargs.get('tick_halt_threshold', 0.65)
+        self.tick_halt_temperature = kwargs.get('tick_halt_temperature', 0.25)
+        self.tick_compute_weight = kwargs.get('tick_compute_weight', 0.0)
+        self.cell_sparsity_mode = kwargs.get('cell_sparsity_mode', 'none')
+        self.cell_topk = kwargs.get('cell_topk', self.d_model)
+        self.cell_sparsity_rescale = kwargs.get('cell_sparsity_rescale', True)
 
         self.ttt_layer = kwargs.get('ttt_layer', False)
         self.ttt_hidden_mult = kwargs.get('ttt_hidden_mult', 2)

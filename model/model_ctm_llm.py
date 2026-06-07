@@ -44,6 +44,9 @@ class CTMBlock(nn.Module):
         self.head_dim = config.d_input // config.heads
         self.neuron_select_type = config.neuron_select_type
         self.self_cond = config.self_cond
+        self.cell_sparsity_mode = config.cell_sparsity_mode
+        self.cell_topk = min(max(1, int(config.cell_topk)), config.d_model)
+        self.cell_sparsity_rescale = bool(config.cell_sparsity_rescale)
 
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -164,6 +167,19 @@ class CTMBlock(nn.Module):
             beta = r * beta + 1
         return alpha / torch.sqrt(beta), alpha, beta
 
+    def _apply_cell_sparsity(self, activated):
+        if self.cell_sparsity_mode == 'none' or self.cell_topk >= self.d_model:
+            return activated
+        if self.cell_sparsity_mode != 'topk':
+            raise ValueError(f"Unknown cell_sparsity_mode: {self.cell_sparsity_mode}")
+
+        scores = activated.detach().abs()
+        idx = torch.topk(scores, self.cell_topk, dim=-1).indices
+        mask = torch.zeros_like(activated).scatter_(-1, idx, 1.0)
+        if self.cell_sparsity_rescale:
+            mask = mask * (self.d_model / self.cell_topk)
+        return activated * mask
+
     def forward(self, x, pos_emb=None, past_kv=None, use_cache=False, track=False,
                 num_iters=None, return_all_ticks=False,
                 prev_activated=None, prev_trace=None):
@@ -253,6 +269,7 @@ class CTMBlock(nn.Module):
             activated = self.trace_processor(state_trace)
             if self.ttt_layer is not None:
                 activated = activated + self.ttt_layer(activated)
+            activated = self._apply_cell_sparsity(activated)
 
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
@@ -370,6 +387,87 @@ class CTMForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
+    def _tick_horizon(self, tick, num_ticks):
+        mode = self.config.elf_horizon_mode
+        max_horizon = max(1, int(self.config.elf_max_horizon))
+        if mode == 'none':
+            return 1
+        if mode == 'linear':
+            return min(tick + 1, max_horizon)
+        if mode == 'pow2':
+            return min(2 ** tick, max_horizon)
+        raise ValueError(f"Unknown elf_horizon_mode: {mode}")
+
+    @staticmethod
+    def _per_sample_lm_loss(logits, labels, horizon):
+        B = labels.size(0)
+        if labels.size(1) <= horizon:
+            return logits.new_zeros(B), logits.new_zeros(B, 0, dtype=torch.bool)
+        shift_logits = logits[..., :-horizon, :].contiguous()
+        shift_labels = labels[..., horizon:].contiguous()
+        label_mask = shift_labels != -100
+        per_token_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1), ignore_index=-100, reduction='none')
+        per_token_loss = per_token_loss.view(B, -1)
+        per_sample_loss = (
+            per_token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
+        return per_sample_loss, label_mask
+
+    @staticmethod
+    def _per_sample_entropy(logits, label_mask, horizon):
+        if label_mask.numel() == 0:
+            return logits.new_zeros(logits.size(0))
+        valid_logits = logits[..., :-horizon, :]
+        probs = F.softmax(valid_logits, dim=-1)
+        entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
+        norm_ent = entropy / math.log(logits.size(-1))
+        return (norm_ent * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
+
+    def _combine_tick_losses(self, losses, certainties):
+        mode = self.config.tick_loss_mode
+        if self.config.tick_halt_mode != 'none':
+            tick_loss, _ = self._halt_weighted_tick_loss(losses, certainties)
+            return tick_loss
+        if mode == 'min_conf':
+            confidence = 1 - certainties
+            loss_min = losses.min(dim=1).values.mean()
+            best_conf_tick = confidence.argmax(dim=1)
+            batch_idx = torch.arange(losses.size(0), device=losses.device)
+            loss_conf = losses[batch_idx, best_conf_tick].mean()
+            return (loss_min + loss_conf) / 2.0
+        if mode == 'mean':
+            return losses.mean()
+        if mode == 'last':
+            return losses[:, -1].mean()
+        raise ValueError(f"Unknown tick_loss_mode: {mode}")
+
+    def _halt_weighted_tick_loss(self, losses, certainties):
+        mode = self.config.tick_halt_mode
+        confidence = 1 - certainties
+        if mode == 'confidence':
+            temp = max(float(self.config.tick_halt_temperature), 1e-4)
+            weights = torch.softmax(confidence / temp, dim=1)
+        elif mode == 'threshold':
+            threshold = float(self.config.tick_halt_threshold)
+            hit = confidence >= threshold
+            any_hit = hit.any(dim=1)
+            first_hit = hit.float().argmax(dim=1)
+            last_tick = torch.full_like(first_hit, losses.size(1) - 1)
+            selected = torch.where(any_hit, first_hit, last_tick)
+            weights = F.one_hot(selected, num_classes=losses.size(1)).type_as(losses)
+        else:
+            raise ValueError(f"Unknown tick_halt_mode: {mode}")
+
+        tick_loss = (losses * weights).sum(dim=1).mean()
+        if self.config.tick_compute_weight > 0:
+            tick_ids = torch.arange(1, losses.size(1) + 1, device=losses.device,
+                                    dtype=losses.dtype)
+            expected_tick = (weights * tick_ids.view(1, -1)).sum(dim=1)
+            compute_penalty = expected_tick.mean() / losses.size(1)
+            tick_loss = tick_loss + self.config.tick_compute_weight * compute_penalty
+        return tick_loss, weights
+
     def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
                 num_iters=None):
         h, past_key_values = self.model(
@@ -391,43 +489,37 @@ class CTMForCausalLM(nn.Module):
             input_ids, track=False, num_iters=num_iters, return_all_ticks=True)
         num_ticks = tick_outs.size(-1)
 
-        shift_labels = labels[..., 1:].contiguous()
-        label_mask = (shift_labels != -100)
-
         final_logits = self.lm_head(h)
-        final_shift_logits = final_logits[..., :-1, :].contiguous()
+        shift_logits = final_logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
         final_loss = F.cross_entropy(
-            final_shift_logits.view(-1, final_shift_logits.size(-1)),
+            shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1), ignore_index=-100)
 
         losses = []
+        next_losses = []
         certainties = []
         for t in range(num_ticks):
             logits_t = self.lm_head(tick_outs[..., t])
-            shift_logits = logits_t[..., :-1, :].contiguous()
-            per_token_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1), ignore_index=-100, reduction='none')
-            per_token_loss = per_token_loss.view(B, -1)
-            per_sample_loss = (per_token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
+            horizon = self._tick_horizon(t, num_ticks)
+            per_sample_loss, label_mask = self._per_sample_lm_loss(
+                logits_t, labels, horizon=horizon)
             losses.append(per_sample_loss)
 
-            probs = F.softmax(logits_t, dim=-1)
-            entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-            norm_ent = entropy / math.log(logits_t.size(-1))
-            norm_ent_valid = (norm_ent[..., :-1] * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
-            certainties.append(norm_ent_valid)
+            next_loss, next_mask = self._per_sample_lm_loss(
+                logits_t, labels, horizon=1)
+            next_losses.append(next_loss)
+            certainties.append(self._per_sample_entropy(logits_t, next_mask, horizon=1))
 
         losses = torch.stack(losses, dim=1)
+        next_losses = torch.stack(next_losses, dim=1)
         certainties = torch.stack(certainties, dim=1)
-        confidence = 1 - certainties
 
-        loss_min = losses.min(dim=1).values.mean()
-        best_conf_tick = confidence.argmax(dim=1)
-        batch_idx = torch.arange(B, device=losses.device)
-        loss_conf = losses[batch_idx, best_conf_tick].mean()
-
-        tick_loss = (loss_min + loss_conf) / 2.0
+        tick_loss = self._combine_tick_losses(losses, certainties)
+        if self.config.tick_improve_weight > 0 and num_ticks > 1:
+            margin = float(self.config.tick_improve_margin)
+            improve_loss = F.relu(next_losses[:, 1:] - next_losses[:, :-1] + margin).mean()
+            tick_loss = tick_loss + self.config.tick_improve_weight * improve_loss
         loss = 0.5 * final_loss + 0.5 * tick_loss
 
         return loss, losses, certainties

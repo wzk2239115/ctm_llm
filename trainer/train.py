@@ -1,6 +1,9 @@
 import os
 import sys
 import argparse
+import csv
+import json
+import subprocess
 import time
 import warnings
 
@@ -42,16 +45,66 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
+def count_valid_tokens(labels):
+    return int((labels[..., 1:] != -100).sum().item())
+
+
+def cuda_memory_mb(device):
+    if not torch.cuda.is_available() or 'cuda' not in str(device):
+        return 0.0
+    return torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+
+def append_metrics_csv(path, row):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = os.path.exists(path)
+    with open(path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def effective_tick_from_certainties(certainties, args):
+    if certainties is None:
+        return -1.0
+    if args.tick_halt_mode == 'confidence':
+        confidence = 1 - certainties
+        temp = max(float(args.tick_halt_temperature), 1e-4)
+        weights = torch.softmax(confidence / temp, dim=1)
+        tick_ids = torch.arange(
+            1, certainties.size(1) + 1, device=certainties.device,
+            dtype=certainties.dtype)
+        return (weights * tick_ids.view(1, -1)).sum(dim=1).mean().item()
+    if args.tick_halt_mode == 'threshold':
+        confidence = 1 - certainties
+        hit = confidence >= args.tick_halt_threshold
+        any_hit = hit.any(dim=1)
+        first_hit = hit.float().argmax(dim=1) + 1
+        last_tick = torch.full_like(first_hit, certainties.size(1))
+        return torch.where(any_hit, first_hit, last_tick).float().mean().item()
+    return -1.0
+
+
+def active_cell_fraction(args):
+    if args.model_type != 'ctm' or args.cell_sparsity_mode == 'none':
+        return 1.0
+    return min(max(args.cell_topk, 1), args.d_model) / max(args.d_model, 1)
+
+
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
                 tb_writer, swanlab, start_step=0, rank=0):
     model.train()
     epoch_start = time.time()
     total_loss = 0.0
     total_steps = 0
+    total_tokens = 0
+    interval_start = time.time()
 
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        valid_tokens = count_valid_tokens(labels)
 
         global_step = epoch * iters + step
         total_global = args.epochs * iters
@@ -76,24 +129,45 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
 
         total_loss += loss.item() * args.accumulation_steps
         total_steps += 1
+        total_tokens += valid_tokens
 
         if rank == 0 and (step % args.log_interval == 0 or step == iters):
             avg_loss = total_loss / total_steps
-            best_tick_mean = losses_per_tick.argmin(dim=1).float().mean().item()
-            conf_tick_mean = (1 - certainties).argmax(dim=1).float().mean().item()
+            if losses_per_tick is not None and certainties is not None:
+                best_tick_mean = losses_per_tick.argmin(dim=1).float().mean().item()
+                conf_tick_mean = (1 - certainties).argmax(dim=1).float().mean().item()
+                tick_count = losses_per_tick.size(1)
+                losses_tick_mean = [
+                    round(x, 6) for x in losses_per_tick.mean(dim=0).detach().float().cpu().tolist()]
+                certainties_tick_mean = [
+                    round(x, 6) for x in certainties.mean(dim=0).detach().float().cpu().tolist()]
+                effective_tick_mean = effective_tick_from_certainties(certainties, args)
+            else:
+                best_tick_mean = -1.0
+                conf_tick_mean = -1.0
+                tick_count = 1
+                losses_tick_mean = []
+                certainties_tick_mean = []
+                effective_tick_mean = -1.0
             elapsed = time.time() - epoch_start
+            interval_elapsed = time.time() - interval_start
             steps_done = step - start_step
             steps_left = iters - step
             speed = elapsed / max(steps_done, 1)
+            steps_per_sec = total_steps / max(interval_elapsed, 1e-9)
+            tokens_per_sec = total_tokens / max(interval_elapsed, 1e-9)
             epoch_eta = speed * steps_left
             global_done = global_step
             global_eta = speed * (total_global - global_done)
             pct = global_done / total_global * 100
+            peak_mem_mb = cuda_memory_mb(args.device)
 
             Logger(
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
                 f'loss:{avg_loss:.4f} lr:{lr:.2e} | '
                 f'best_tick:{best_tick_mean:.1f} conf_tick:{conf_tick_mean:.1f} | '
+                f'eff_tick:{effective_tick_mean:.1f} | '
+                f'tok/s:{tokens_per_sec:.0f} mem:{peak_mem_mb:.0f}MB | '
                 f'elapsed:{format_time(elapsed)} epoch_eta:{format_time(epoch_eta)} | '
                 f'total:{format_time(elapsed + global_eta)}({pct:.1f}%)'
             )
@@ -102,6 +176,12 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'loss': avg_loss, 'lr': lr,
                 'best_tick': best_tick_mean,
                 'conf_tick': conf_tick_mean,
+                'tick_count': tick_count,
+                'effective_tick': effective_tick_mean,
+                'active_cell_fraction': active_cell_fraction(args),
+                'tokens_per_sec': tokens_per_sec,
+                'steps_per_sec': steps_per_sec,
+                'peak_memory_mb': peak_mem_mb,
                 'epoch': epoch + step / iters,
                 'global_step': global_step,
                 'progress_pct': pct,
@@ -111,9 +191,61 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     tb_writer.add_scalar(key, value, global_step)
             if swanlab:
                 swanlab.log(metrics, step=global_step)
+            if args.metrics_path:
+                append_metrics_csv(args.metrics_path, {
+                    'experiment_name': args.experiment_name,
+                    'model_type': args.model_type,
+                    'global_step': global_step,
+                    'epoch': epoch + 1,
+                    'step': step,
+                    'loss': avg_loss,
+                    'lr': lr,
+                    'best_tick': best_tick_mean,
+                    'conf_tick': conf_tick_mean,
+                    'tick_count': tick_count,
+                    'effective_tick': effective_tick_mean,
+                    'active_cell_fraction': active_cell_fraction(args),
+                    'losses_per_tick': json.dumps(losses_tick_mean),
+                    'certainties_per_tick': json.dumps(certainties_tick_mean),
+                    'tokens': total_tokens,
+                    'tokens_per_sec': tokens_per_sec,
+                    'steps_per_sec': steps_per_sec,
+                    'peak_memory_mb': peak_mem_mb,
+                    'world_size': args.world_size,
+                    'hidden_size': args.hidden_size,
+                    'num_hidden_layers': args.num_hidden_layers,
+                    'd_model': args.d_model,
+                    'd_input': args.d_input,
+                    'iterations': args.iterations,
+                    'memory_length': args.memory_length,
+                    'memory_hidden_dims': args.memory_hidden_dims,
+                    'deep_nlms': args.deep_nlms,
+                    'synapse_depth': args.synapse_depth,
+                    'tick_loss_mode': args.tick_loss_mode,
+                    'elf_horizon_mode': args.elf_horizon_mode,
+                    'elf_max_horizon': args.elf_max_horizon,
+                    'tick_improve_weight': args.tick_improve_weight,
+                    'tick_improve_margin': args.tick_improve_margin,
+                    'tick_halt_mode': args.tick_halt_mode,
+                    'tick_halt_threshold': args.tick_halt_threshold,
+                    'tick_halt_temperature': args.tick_halt_temperature,
+                    'tick_compute_weight': args.tick_compute_weight,
+                    'cell_sparsity_mode': args.cell_sparsity_mode,
+                    'cell_topk': args.cell_topk,
+                    'cell_sparsity_rescale': int(args.cell_sparsity_rescale),
+                    'self_cond': args.self_cond,
+                    'cross_layer_state': args.cross_layer_state,
+                    'max_seq_len': args.max_seq_len,
+                    'batch_size': args.batch_size,
+                    'accumulation_steps': args.accumulation_steps,
+                    'elapsed_sec': elapsed,
+                    'git_commit': args.git_commit,
+                })
 
             total_loss = 0.0
             total_steps = 0
+            total_tokens = 0
+            interval_start = time.time()
 
         if rank == 0 and (step % args.save_interval == 0 or step == iters):
             save_path = os.path.join(args.save_dir, f'{args.save_weight}_{args.hidden_size}.pth')
@@ -138,6 +270,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='CTM-LLM Training')
     parser.add_argument('--save_dir', type=str, default='out')
     parser.add_argument('--save_weight', type=str, default='ctm_llm')
+    parser.add_argument('--experiment_name', type=str, default=None)
+    parser.add_argument('--metrics_dir', type=str, default='runs/metrics')
+    parser.add_argument('--metrics_path', type=str, default=None)
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=5e-4)
@@ -155,6 +290,8 @@ if __name__ == '__main__':
     parser.add_argument('--d_input', type=int, default=256)
     parser.add_argument('--iterations', type=int, default=30)
     parser.add_argument('--memory_length', type=int, default=10)
+    parser.add_argument('--memory_hidden_dims', type=int, default=4)
+    parser.add_argument('--deep_nlms', type=int, default=1, choices=[0, 1])
     parser.add_argument('--heads', type=int, default=8)
     parser.add_argument('--n_synch_out', type=int, default=512)
     parser.add_argument('--n_synch_action', type=int, default=512)
@@ -162,6 +299,22 @@ if __name__ == '__main__':
     parser.add_argument('--self_cond', type=int, default=1, choices=[0, 1])
     parser.add_argument('--cross_layer_state', type=int, default=1, choices=[0, 1])
     parser.add_argument('--block_size', type=int, default=4)
+    parser.add_argument('--tick_loss_mode', type=str, default='min_conf',
+                        choices=['min_conf', 'mean', 'last'])
+    parser.add_argument('--elf_horizon_mode', type=str, default='none',
+                        choices=['none', 'linear', 'pow2'])
+    parser.add_argument('--elf_max_horizon', type=int, default=4)
+    parser.add_argument('--tick_improve_weight', type=float, default=0.0)
+    parser.add_argument('--tick_improve_margin', type=float, default=0.0)
+    parser.add_argument('--tick_halt_mode', type=str, default='none',
+                        choices=['none', 'confidence', 'threshold'])
+    parser.add_argument('--tick_halt_threshold', type=float, default=0.65)
+    parser.add_argument('--tick_halt_temperature', type=float, default=0.25)
+    parser.add_argument('--tick_compute_weight', type=float, default=0.0)
+    parser.add_argument('--cell_sparsity_mode', type=str, default='none',
+                        choices=['none', 'topk'])
+    parser.add_argument('--cell_topk', type=int, default=512)
+    parser.add_argument('--cell_sparsity_rescale', type=int, default=1, choices=[0, 1])
     parser.add_argument('--ttt_layer', type=int, default=0, choices=[0, 1])
     parser.add_argument('--ttt_hidden_mult', type=int, default=2)
     parser.add_argument('--ttt_gate_init', type=float, default=-2.0)
@@ -178,6 +331,8 @@ if __name__ == '__main__':
     parser.add_argument('--swanlab_project', type=str, default='CTM-LLM')
     parser.add_argument('--swanlab_name', type=str, default=None)
     parser.add_argument('--use_compile', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--model_type', type=str, default='ctm',
+                        choices=['ctm', 'transformer'])
     args = parser.parse_args()
 
     ddp = int(os.environ.get('WORLD_SIZE', 1)) > 1
@@ -187,11 +342,25 @@ if __name__ == '__main__':
     else:
         local_rank, rank, world_size = 0, 0, 1
         args.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    args.world_size = world_size
 
     os.makedirs(args.save_dir, exist_ok=True)
     setup_seed(args.seed)
+    try:
+        args.git_commit = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        args.git_commit = 'unknown'
+    if args.experiment_name is None:
+        args.experiment_name = args.swanlab_name or args.save_weight
+    if args.metrics_path is None:
+        safe_name = ''.join(
+            c if c.isalnum() or c in '-_.' else '_' for c in args.experiment_name)
+        args.metrics_path = os.path.join(args.metrics_dir, f'{safe_name}.csv')
 
     config = CTMLLMConfig(
+        model_type=args.model_type,
         vocab_size=6400,
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -199,6 +368,8 @@ if __name__ == '__main__':
         d_input=args.d_input,
         iterations=args.iterations,
         memory_length=args.memory_length,
+        memory_hidden_dims=args.memory_hidden_dims,
+        deep_nlms=bool(args.deep_nlms),
         heads=args.heads,
         n_synch_out=args.n_synch_out,
         n_synch_action=args.n_synch_action,
@@ -206,12 +377,30 @@ if __name__ == '__main__':
         self_cond=bool(args.self_cond),
         cross_layer_state=bool(args.cross_layer_state),
         block_size=args.block_size,
+        tick_loss_mode=args.tick_loss_mode,
+        elf_horizon_mode=args.elf_horizon_mode,
+        elf_max_horizon=args.elf_max_horizon,
+        tick_improve_weight=args.tick_improve_weight,
+        tick_improve_margin=args.tick_improve_margin,
+        tick_halt_mode=args.tick_halt_mode,
+        tick_halt_threshold=args.tick_halt_threshold,
+        tick_halt_temperature=args.tick_halt_temperature,
+        tick_compute_weight=args.tick_compute_weight,
+        cell_sparsity_mode=args.cell_sparsity_mode,
+        cell_topk=args.cell_topk,
+        cell_sparsity_rescale=bool(args.cell_sparsity_rescale),
         ttt_layer=bool(args.ttt_layer),
         ttt_hidden_mult=args.ttt_hidden_mult,
         ttt_gate_init=args.ttt_gate_init,
     )
     if rank == 0:
         Logger(f'Config: {config}')
+        Logger(f'Experiment: {args.experiment_name}')
+        Logger(f'Metrics CSV: {args.metrics_path}')
+        manifest_path = os.path.splitext(args.metrics_path)[0] + '.json'
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(vars(args), f, ensure_ascii=False, indent=2)
 
     device_type = 'cuda' if 'cuda' in args.device else 'cpu'
     dtype = torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16
@@ -233,7 +422,8 @@ if __name__ == '__main__':
     use_fp16 = args.dtype == 'float16'
     scaler = torch.amp.GradScaler(device_type, enabled=use_fp16)
 
-    run_name = args.swanlab_name or f'CTM-LLM-{args.hidden_size}d-{args.d_model}m-{args.iterations}iter'
+    run_name = args.swanlab_name or args.experiment_name or \
+        f'CTM-LLM-{args.hidden_size}d-{args.d_model}m-{args.iterations}iter'
 
     tb_writer = None
     if not args.no_tensorboard and rank == 0:

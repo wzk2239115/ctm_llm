@@ -4,6 +4,7 @@ __pycache__/
 
 # Generated outputs (weights, checkpoints, visualizations)
 out/
+runs/
 .ctm_pool/
 
 # SwanLab experiment logs
