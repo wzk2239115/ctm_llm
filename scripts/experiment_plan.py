@@ -49,7 +49,6 @@ BASE_ARGS = {
     "save_interval": 1000,
     "max_steps": 1000,
     "dtype": "bfloat16",
-    "use_swanlab": None,
 }
 
 PLAN_SIZES = ("core", "full", "wide")
