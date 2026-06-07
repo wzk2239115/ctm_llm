@@ -71,7 +71,9 @@ python scripts/experiment_plan.py run --stage all --batch_tune \
   --batch_sizes 2 4 6 8 10 12
 ```
 
-For faster probing, run four single-node lanes in parallel:
+For faster probing, split each node into GPU lanes. `--gpus_per_lane 2` turns
+four 8-GPU nodes into 16 parallel 2-GPU lanes; use `--gpus_per_lane 1` for tiny
+quick probes when startup overhead dominates:
 
 ```bash
 python scripts/experiment_plan.py run-parallel --stage all --batch_tune \
@@ -80,7 +82,8 @@ python scripts/experiment_plan.py run-parallel --stage all --batch_tune \
   --master_addr 11.131.210.78 \
   --port 8765 \
   --batch_sizes 2 4 6 8 10 12 \
-  --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9
+  --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9 \
+  --gpus_per_lane 2
 ```
 
 For medium experiments, you can use two 2-node lanes:
@@ -110,6 +113,7 @@ python scripts/experiment_plan.py quick-probe --stage all \
   --time_limit_min 15 \
   --fallback_batch_size 2 \
   --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9 \
+  --gpus_per_lane 2 \
   --output runs/metrics/batch_profile_quick.csv \
   --report_output runs/metrics/quick_probe_report.csv
 ```
@@ -185,8 +189,9 @@ python scripts/experiment_plan.py run --stage all \
   --batch_profile runs/metrics/batch_profile.csv
 ```
 
-If the single-node smoke probes show plenty of headroom, you can also run the
-formal plan in parallel lanes. Keep node groups non-overlapping:
+If the lane probes show plenty of headroom, you can also run the formal plan in
+parallel lanes. Keep `--gpus_per_lane 8`/bare nodes for heavier formal runs, and
+use 2-GPU lanes only for configs that proved small enough:
 
 ```bash
 python scripts/experiment_plan.py run-parallel --stage all \
@@ -195,7 +200,8 @@ python scripts/experiment_plan.py run-parallel --stage all \
   --master_addr 11.131.210.78 \
   --port 8765 \
   --batch_profile runs/metrics/batch_profile.csv \
-  --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9
+  --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9 \
+  --gpus_per_lane 2
 ```
 
 ## Phase 0: Smoke

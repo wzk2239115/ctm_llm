@@ -22,8 +22,68 @@ STATE = {
     "task": None,
     "tasks": [],
     "acks": {},
+    "next_master_port": 20000,
 }
 LOCK = threading.Lock()
+
+
+def parse_gpu_spec(spec):
+    if not spec:
+        return None
+    gpus = []
+    for part in str(spec).replace("+", " ").replace("|", " ").split():
+        if "-" in part:
+            start, end = part.split("-", 1)
+            if start.isdigit() and end.isdigit():
+                gpus.extend(range(int(start), int(end) + 1))
+        elif part.isdigit():
+            gpus.append(int(part))
+    return sorted(set(gpus))
+
+
+def parse_node_spec(spec):
+    if ":" not in spec:
+        return spec, None
+    addr, gpu_spec = spec.split(":", 1)
+    return addr, parse_gpu_spec(gpu_spec)
+
+
+def task_specs_for_addr(task, addr):
+    specs = task.get("node_addrs") or []
+    if not specs:
+        return [(addr, None)]
+    matches = []
+    for spec in specs:
+        node_addr, gpus = parse_node_spec(spec)
+        if node_addr == addr:
+            matches.append((node_addr, gpus))
+    return matches
+
+
+def task_matches_addr(task, addr):
+    return bool(task_specs_for_addr(task, addr))
+
+
+def task_gpus_for_addr(task, addr):
+    matches = task_specs_for_addr(task, addr)
+    if not matches:
+        return None
+    _, gpus = matches[0]
+    return gpus
+
+
+def gpu_sets_overlap(left, right):
+    if left is None or right is None:
+        return True
+    return bool(set(left) & set(right))
+
+
+def node_can_accept_task(node, task, addr):
+    requested = task_gpus_for_addr(task, addr)
+    busy = node.get("busy_gpus") or []
+    if requested is None:
+        return not busy and not node.get("running_tasks")
+    return not set(requested) & set(busy)
 
 
 def load_cluster_config(path):
@@ -132,7 +192,7 @@ def print_pool():
         print(
             f"  {addr:15s} rank={node.get('rank', '?')} "
             f"host={node.get('hostname', '?')} status={node.get('status', '?')} "
-            f"gpus={gpu_summary} seen={age:.1f}s",
+            f"gpus={gpu_summary} busy={node.get('busy_gpus', [])} seen={age:.1f}s",
             flush=True,
         )
     if tasks:
@@ -189,8 +249,10 @@ class PoolHandler(BaseHTTPRequestHandler):
                 task = None
                 acked = False
                 for candidate in STATE.get("tasks", []):
-                    node_addrs = candidate.get("node_addrs") or []
-                    if node_addrs and addr not in node_addrs:
+                    if not task_matches_addr(candidate, addr):
+                        continue
+                    node = STATE["nodes"].get(addr, {})
+                    if not node_can_accept_task(node, candidate, addr):
                         continue
                     if STATE["acks"].get(candidate["task_id"], {}).get(addr):
                         continue
@@ -226,11 +288,15 @@ class PoolHandler(BaseHTTPRequestHandler):
         if self.path == "/submit":
             payload = self._read_json()
             task_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+            with LOCK:
+                master_port = int(payload.get("master_port") or STATE.get("next_master_port", 20000))
+                STATE["next_master_port"] = 20000 + ((master_port - 19999) % 30000)
             task = {
                 "task_id": task_id,
                 "config": payload["config"],
                 "extra_args": payload.get("extra_args", ""),
                 "node_addrs": payload.get("node_addrs") or [],
+                "master_port": master_port,
                 "created_at": time.time(),
             }
             with LOCK:
@@ -416,8 +482,7 @@ def run_worker(args):
     gpus = gpu_inventory()
     gpu_summary = summarize_gpus(gpus)
     status = "idle"
-    proc = None
-    last_task_id = None
+    procs = {}
     process_head = git_head()
 
     print(f"CTM worker online: addr={node_addr} rank={rank} host={hostname}", flush=True)
@@ -426,9 +491,25 @@ def run_worker(args):
     print(f"Polling pool server: {base}", flush=True)
 
     while True:
-        if proc is not None and proc.poll() is not None:
-            status = f"exited:{proc.returncode}"
-            proc = None
+        finished = []
+        for task_id, item in list(procs.items()):
+            if item["proc"].poll() is not None:
+                finished.append(task_id)
+        for task_id in finished:
+            item = procs.pop(task_id)
+            print(
+                f"[worker] task {task_id} exited rc={item['proc'].returncode} "
+                f"gpus={item.get('gpus') or 'all'}",
+                flush=True,
+            )
+
+        busy_gpus = sorted({
+            gpu
+            for item in procs.values()
+            for gpu in (item.get("gpus") or [])
+        })
+        running_tasks = sorted(procs)
+        status = "idle" if not procs else "running:" + ",".join(running_tasks)
 
         heartbeat = {
             "node_addr": node_addr,
@@ -438,13 +519,12 @@ def run_worker(args):
             "gpus": len(gpus),
             "gpu_summary": gpu_summary,
             "gpu_devices": gpus,
-            "pid": proc.pid if proc else None,
+            "busy_gpus": busy_gpus,
+            "running_tasks": running_tasks,
+            "pid": next(iter(procs.values()))["proc"].pid if procs else None,
         }
         try:
             post_json(f"{base}/heartbeat", heartbeat, timeout=5)
-            if proc is not None and proc.poll() is None:
-                time.sleep(args.interval)
-                continue
             task_resp = get_json(
                 f"{base}/task?node_addr={urllib.parse.quote(node_addr)}", timeout=5
             )
@@ -454,9 +534,10 @@ def run_worker(args):
             time.sleep(args.interval)
             continue
 
-        if task and task["task_id"] != last_task_id:
-            if proc is not None and proc.poll() is None:
-                msg = f"busy pid={proc.pid}, ignore task"
+        if task and task["task_id"] not in procs:
+            requested_gpus = task_gpus_for_addr(task, node_addr)
+            if any(gpu_sets_overlap(requested_gpus, item.get("gpus")) for item in procs.values()):
+                msg = f"busy gpus={busy_gpus}, requested={requested_gpus or 'all'}"
                 print(f"[worker] task {task['task_id']} ignored: {msg}", flush=True)
                 post_json(f"{base}/ack", {
                     "node_addr": node_addr,
@@ -483,7 +564,6 @@ def run_worker(args):
                             "status": "pull_failed",
                             "message": msg,
                         })
-                        last_task_id = task["task_id"]
                         time.sleep(args.interval)
                         continue
 
@@ -491,17 +571,23 @@ def run_worker(args):
                 cmd = ["bash", "scripts/train_cluster.sh", "--config", task["config"], *extra]
                 env = os.environ.copy()
                 env["CTM_NODE_ADDR"] = node_addr
+                env["CTM_POOL_MASTER_PORT"] = str(task.get("master_port") or 29500)
                 if task.get("node_addrs"):
                     env["CTM_POOL_NODE_ADDRS"] = ",".join(task["node_addrs"])
+                if requested_gpus is not None:
+                    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in requested_gpus)
+                    env["NPROC_PER_NODE"] = str(len(requested_gpus))
                 print(f"[worker] received task {task['task_id']}: {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
                 proc = subprocess.Popen(cmd, env=env)
-                status = f"running:{task['task_id']}"
-                last_task_id = task["task_id"]
+                procs[task["task_id"]] = {
+                    "proc": proc,
+                    "gpus": requested_gpus,
+                }
                 post_json(f"{base}/ack", {
                     "node_addr": node_addr,
                     "task_id": task["task_id"],
                     "status": "started",
-                    "message": f"pid={proc.pid}",
+                    "message": f"pid={proc.pid} gpus={requested_gpus or 'all'} port={env['CTM_POOL_MASTER_PORT']}",
                 })
 
         time.sleep(args.interval)
@@ -527,7 +613,7 @@ def run_submit(args):
         return
 
     config = load_cluster_config(args.config)
-    expected = set(node_addrs or config.get("NODE_ADDRS", []))
+    expected = {parse_node_spec(spec)[0] for spec in (node_addrs or config.get("NODE_ADDRS", []))}
     deadline = time.time() + args.wait
     seen = set()
     while time.time() < deadline:

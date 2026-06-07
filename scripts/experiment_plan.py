@@ -504,7 +504,14 @@ def print_batch_commands(args):
     plan = build_batch_tune_plan(
         args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval,
         args.plan_size)
-    plan = assign_node_groups(plan, parse_node_groups(args.node_groups))
+    plan = assign_node_groups(
+        plan,
+        parse_node_groups(
+            args.node_groups,
+            getattr(args, "gpus_per_lane", None),
+            getattr(args, "gpus_per_node", 8),
+        ),
+    )
     if args.output:
         write_manifest(plan, args.output, args.config, args.master_addr, args.port, args.wait)
         print(f"wrote {len(plan)} batch probes: {args.output}")
@@ -531,13 +538,69 @@ def post_json(url, payload, timeout=10):
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
-def parse_node_groups(items):
+def parse_gpu_spec(spec):
+    if not spec:
+        return None
+    gpus = []
+    for part in str(spec).replace("+", " ").replace("|", " ").split():
+        if "-" in part:
+            start, end = part.split("-", 1)
+            if start.isdigit() and end.isdigit():
+                gpus.extend(range(int(start), int(end) + 1))
+        elif part.isdigit():
+            gpus.append(int(part))
+    return sorted(set(gpus))
+
+
+def parse_node_spec(spec):
+    if ":" not in spec:
+        return spec, None
+    addr, gpu_spec = spec.split(":", 1)
+    return addr, parse_gpu_spec(gpu_spec)
+
+
+def format_gpu_spec(gpus):
+    gpus = list(gpus)
+    if not gpus:
+        return ""
+    ranges = []
+    start = prev = gpus[0]
+    for gpu in gpus[1:]:
+        if gpu == prev + 1:
+            prev = gpu
+            continue
+        ranges.append(f"{start}-{prev}" if start != prev else str(start))
+        start = prev = gpu
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return "+".join(ranges)
+
+
+def expand_node_groups_to_gpu_lanes(groups, gpus_per_lane=None, gpus_per_node=8):
+    if not gpus_per_lane:
+        return groups
+    lanes = []
+    for group in groups:
+        if len(group) != 1:
+            lanes.append(group)
+            continue
+        addr, gpus = parse_node_spec(group[0])
+        if gpus is not None:
+            lanes.append(group)
+            continue
+        for start in range(0, gpus_per_node, gpus_per_lane):
+            lane_gpus = list(range(start, min(start + gpus_per_lane, gpus_per_node)))
+            if len(lane_gpus) == gpus_per_lane:
+                lanes.append([f"{addr}:{format_gpu_spec(lane_gpus)}"])
+    return lanes
+
+
+def parse_node_groups(items, gpus_per_lane=None, gpus_per_node=8):
     groups = []
     for item in items or []:
         parts = [part.strip() for part in item.split(",") if part.strip()]
         if parts:
             groups.append(parts)
-    return groups
+    return expand_node_groups_to_gpu_lanes(groups, gpus_per_lane, gpus_per_node)
 
 
 def assign_node_groups(plan, node_groups):
@@ -557,7 +620,8 @@ def wait_until_idle(master_addr, port, task_id, poll_interval):
         nodes = status.get("nodes", {})
         running = [
             addr for addr, node in nodes.items()
-            if str(node.get("status", "")).startswith(f"running:{task_id}")
+            if task_id in (node.get("running_tasks") or [])
+            or str(node.get("status", "")).startswith(f"running:{task_id}")
         ]
         if not running:
             return
@@ -571,9 +635,13 @@ def node_group_idle(master_addr, port, node_group):
 
 def node_group_idle_from_status(status, node_group):
     nodes = status.get("nodes", {})
-    for addr in node_group:
+    for spec in node_group:
+        addr, requested_gpus = parse_node_spec(spec)
         node = nodes.get(addr, {})
-        if str(node.get("status", "")).startswith("running:"):
+        if requested_gpus is None:
+            if node.get("running_tasks") or str(node.get("status", "")).startswith("running:"):
+                return False
+        elif set(requested_gpus) & set(node.get("busy_gpus") or []):
             return False
     return True
 
@@ -589,7 +657,7 @@ def submit_exp(args, exp, wait=30.0):
     task = resp["task"]
     print(f"submitted task {task['task_id']}: {exp['name']} nodes={payload['node_addrs'] or 'all'}")
     if wait > 0:
-        expected = set(payload["node_addrs"])
+        expected = {parse_node_spec(spec)[0] for spec in payload["node_addrs"]}
         if expected:
             deadline = time.time() + wait
             seen = set()
@@ -642,7 +710,11 @@ def run_parallel(args):
             load_batch_profile(args.batch_profile),
         )
 
-    node_groups = parse_node_groups(args.node_groups)
+    node_groups = parse_node_groups(
+        args.node_groups,
+        getattr(args, "gpus_per_lane", None),
+        getattr(args, "gpus_per_node", 8),
+    )
     if not node_groups:
         raise SystemExit("--node_groups is required for run-parallel")
 
@@ -774,7 +846,11 @@ def run_quick_probe(args):
     if args.fallback_batch_size is None:
         args.fallback_batch_size = min(batch_sizes)
     args._quick_base_names = [exp["name"] for exp in base_plan]
-    node_groups = parse_node_groups(args.node_groups)
+    node_groups = parse_node_groups(
+        args.node_groups,
+        getattr(args, "gpus_per_lane", None),
+        getattr(args, "gpus_per_node", 8),
+    )
     if not node_groups:
         raise SystemExit("--node_groups is required for quick-probe")
 
@@ -1140,6 +1216,9 @@ def parse_args():
     p.add_argument("--tune_log_interval", type=int, default=20)
     p.add_argument("--node_groups", nargs="*", default=None,
                    help="Optional node groups assigned round-robin, e.g. ip1 ip2 or ip1,ip2.")
+    p.add_argument("--gpus_per_lane", type=int, default=None,
+                   help="Split bare single-node groups into GPU lanes, e.g. 2 -> ip:0-1 ip:2-3 ...")
+    p.add_argument("--gpus_per_node", type=int, default=8)
     p.add_argument("--output", default="runs/experiment_plans/batch_tune_plan.csv")
     p.set_defaults(func=print_batch_commands)
 
@@ -1163,6 +1242,9 @@ def parse_args():
     p.add_argument("--tune_log_interval", type=int, default=20)
     p.add_argument("--node_groups", nargs="+", required=True,
                    help="Node groups for parallel lanes, e.g. ip1 ip2 ip3 ip4 or ip1,ip2 ip3,ip4.")
+    p.add_argument("--gpus_per_lane", type=int, default=None,
+                   help="Split bare single-node groups into GPU lanes, e.g. 2 -> ip:0-1 ip:2-3 ...")
+    p.add_argument("--gpus_per_node", type=int, default=8)
     p.set_defaults(func=run_parallel)
 
     p = sub.add_parser("quick-probe", parents=[common])
@@ -1181,6 +1263,9 @@ def parse_args():
                    help="Batch size used for experiments not resolved before the time limit; default=min(batch_sizes).")
     p.add_argument("--node_groups", nargs="+", required=True,
                    help="Node groups for quick probe lanes, e.g. ip1 ip2 ip3 ip4.")
+    p.add_argument("--gpus_per_lane", type=int, default=None,
+                   help="Split bare single-node groups into GPU lanes, e.g. 2 -> ip:0-1 ip:2-3 ...")
+    p.add_argument("--gpus_per_node", type=int, default=8)
     p.set_defaults(func=run_quick_probe)
 
     p = sub.add_parser("summarize")
