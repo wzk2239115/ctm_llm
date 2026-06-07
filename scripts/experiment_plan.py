@@ -806,6 +806,13 @@ def result_peak_memory_mb(result):
         return None
 
 
+def apply_oom_backoff(base, batch_size, ratio):
+    if ratio <= 0 or ratio >= 1:
+        return
+    cutoff = max(1, int(math.floor(batch_size * ratio)))
+    base["batches"] = [bs for bs in base["batches"] if bs <= cutoff]
+
+
 def write_quick_outputs(args, selected, attempts):
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     profile_fields = [
@@ -975,6 +982,8 @@ def run_quick_probe(args):
                     flush=True,
                 )
             else:
+                if status in {"oom", "over_memory"}:
+                    apply_oom_backoff(base, item["batch_size"], args.oom_backoff_ratio)
                 if base["batches"]:
                     queue.append(item["base_name"])
                 else:
@@ -1286,6 +1295,8 @@ def parse_args():
     p.add_argument("--time_limit_min", type=float, default=15.0)
     p.add_argument("--metrics_settle_seconds", type=float, default=8.0,
                    help="Wait this long for metrics/failure files after a lane becomes idle.")
+    p.add_argument("--oom_backoff_ratio", type=float, default=0.67,
+                   help="After OOM/over_memory, only try remaining batches <= current_batch * ratio; set 1.0 to disable.")
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--output", default="runs/metrics/batch_profile_quick.csv")
     p.add_argument("--report_output", default="runs/metrics/quick_probe_report.csv")

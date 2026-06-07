@@ -112,6 +112,7 @@ python scripts/experiment_plan.py quick-probe --stage all \
   --batch_sizes 2 4 6 8 10 12 \
   --time_limit_min 15 \
   --metrics_settle_seconds 8 \
+  --oom_backoff_ratio 0.67 \
   --fallback_batch_size 2 \
   --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9 \
   --gpus_per_lane 2 \
@@ -123,6 +124,9 @@ python scripts/experiment_plan.py quick-probe --stage all \
 as `over_memory` and continues trying smaller batches. This keeps the generated
 profile conservative enough for formal runs instead of picking a batch that only
 barely survived a short probe.
+After `oom` or `over_memory`, it also skips nearby larger batches according to
+`--oom_backoff_ratio`; the default `0.67` changes a failing `bs12` probe into a
+next attempt around `bs8` instead of `bs10`.
 
 Then generate a first-pass final plan from it:
 
