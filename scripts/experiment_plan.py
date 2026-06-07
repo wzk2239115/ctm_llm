@@ -50,6 +50,8 @@ BASE_ARGS = {
     "use_swanlab": None,
 }
 
+PLAN_SIZES = ("core", "full", "wide")
+
 
 def merge_args(**overrides):
     data = dict(BASE_ARGS)
@@ -79,7 +81,18 @@ def clone_experiment(exp, name, args_overrides, question=None):
     }
 
 
-def build_plan(stage):
+def include_plan_size(plan_size, min_size):
+    return PLAN_SIZES.index(plan_size) >= PLAN_SIZES.index(min_size)
+
+
+def ctm_name(prefix, **items):
+    parts = [prefix]
+    for key, value in items.items():
+        parts.append(f"{key}{str(value).replace('.', 'p')}")
+    return "_".join(parts)
+
+
+def build_plan(stage, plan_size="full"):
     plan = []
     if stage in ("smoke", "all"):
         smoke = dict(BASE_ARGS, max_steps=100, num_hidden_layers=4,
@@ -96,21 +109,54 @@ def build_plan(stage):
             merge_args(**smoke, model_type="ctm")))
 
     if stage in ("compass", "all"):
+        scales = [
+            ("12l_h640", 12, 640, 384, 192, 6),
+            ("16l_h768", 16, 768, 512, 256, 8),
+        ]
+        if include_plan_size(plan_size, "full"):
+            scales.append(("24l_h896", 24, 896, 640, 320, 8))
+        if include_plan_size(plan_size, "wide"):
+            scales.append(("32l_h1024", 32, 1024, 768, 384, 8))
+        for tag, layers, hidden, d_model, d_input, heads in scales:
+            common = {
+                "num_hidden_layers": layers,
+                "hidden_size": hidden,
+                "d_model": d_model,
+                "d_input": d_input,
+                "heads": heads,
+                "n_synch_out": d_model,
+                "n_synch_action": d_model,
+            }
+            plan.append(experiment(
+                f"s01_transformer_{tag}",
+                "Transformer scale baseline for CTM cost/loss comparison.",
+                merge_args(model_type="transformer", iterations=1, **common)))
+            plan.append(experiment(
+                f"s01_ctm_{tag}_tick4",
+                "CTM at matched outer layer/hidden scale with 4 ticks.",
+                merge_args(model_type="ctm", iterations=4, **common)))
         plan.append(experiment(
-            "s01_transformer_16l",
-            "Baseline: standard Transformer with same hidden size/layer count.",
-            merge_args(model_type="transformer", iterations=1)))
-        plan.append(experiment(
-            "s01_ctm_16l_tick4",
-            "Baseline: current CTM with 4 ticks.",
-            merge_args(model_type="ctm", iterations=4)))
+            "s01_ctm_16l_tick1",
+            "CTM with one tick to isolate cell-block overhead from iterative thinking.",
+            merge_args(model_type="ctm", iterations=1)))
 
     if stage in ("ticks", "all"):
-        for ticks in [1, 2, 4, 8, 16]:
+        tick_values = [1, 2, 4, 8, 16]
+        if include_plan_size(plan_size, "full"):
+            tick_values = [1, 2, 3, 4, 6, 8, 12, 16]
+        if include_plan_size(plan_size, "wide"):
+            tick_values += [24, 32]
+        for ticks in tick_values:
             plan.append(experiment(
                 f"s02_ctm_tick{ticks}",
                 "Measure loss/cost curve as maximum CTM ticks increase.",
                 merge_args(model_type="ctm", iterations=ticks)))
+        if include_plan_size(plan_size, "full"):
+            for mode in ["mean", "last", "min_conf"]:
+                plan.append(experiment(
+                    f"s02_ctm_tick8_loss_{mode}",
+                    "Compare per-tick loss aggregation to see whether later ticks specialize.",
+                    merge_args(model_type="ctm", iterations=8, tick_loss_mode=mode)))
         for key, overrides in [
             ("halt_conf_t8_c0", {"iterations": 8, "tick_halt_mode": "confidence",
                                  "tick_compute_weight": 0.0}),
@@ -125,6 +171,28 @@ def build_plan(stage):
                 f"s02_ctm_{key}",
                 "Train CTM with adaptive tick halting signals and optional compute penalty.",
                 merge_args(model_type="ctm", **overrides)))
+        if include_plan_size(plan_size, "full"):
+            for temp in [0.15, 0.35, 0.60]:
+                plan.append(experiment(
+                    ctm_name("s02_ctm_halt_conf_t16", temp=temp),
+                    "Sweep confidence-halting temperature for natural early/late tick separation.",
+                    merge_args(
+                        model_type="ctm",
+                        iterations=16,
+                        tick_halt_mode="confidence",
+                        tick_halt_temperature=temp,
+                        tick_compute_weight=0.01,
+                    )))
+            for threshold in [0.55, 0.70, 0.85]:
+                plan.append(experiment(
+                    ctm_name("s02_ctm_halt_thresh_t16", th=threshold),
+                    "Sweep hard confidence threshold used to estimate effective thinking depth.",
+                    merge_args(
+                        model_type="ctm",
+                        iterations=16,
+                        tick_halt_mode="threshold",
+                        tick_halt_threshold=threshold,
+                    )))
 
     if stage in ("elf", "all"):
         for key, overrides in [
@@ -141,9 +209,43 @@ def build_plan(stage):
                 f"s03_elf_{key}",
                 "Give different ticks different prediction horizons and measure whether tick roles separate.",
                 merge_args(model_type="ctm", **overrides)))
+        if include_plan_size(plan_size, "full"):
+            for ticks in [8, 12, 16]:
+                for horizon in [4, 8]:
+                    plan.append(experiment(
+                        f"s03_elf_linear_t{ticks}_h{horizon}",
+                        "Cross ELF horizon with more internal ticks to test multi-token prediction utility.",
+                        merge_args(
+                            model_type="ctm",
+                            iterations=ticks,
+                            elf_horizon_mode="linear",
+                            elf_max_horizon=horizon,
+                        )))
+            for weight in [0.03, 0.1, 0.3]:
+                plan.append(experiment(
+                    ctm_name("s03_elf_linear_h8_improve", w=weight),
+                    "Sweep improvement regularization so later ticks earn their extra compute.",
+                    merge_args(
+                        model_type="ctm",
+                        iterations=8,
+                        elf_horizon_mode="linear",
+                        elf_max_horizon=8,
+                        tick_improve_weight=weight,
+                    )))
+        if include_plan_size(plan_size, "wide"):
+            for mode in ["pow2", "linear"]:
+                plan.append(experiment(
+                    f"s03_elf_{mode}_t16_h16",
+                    "Wide ELF run with long horizon and 16 ticks.",
+                    merge_args(
+                        model_type="ctm",
+                        iterations=16,
+                        elf_horizon_mode=mode,
+                        elf_max_horizon=16,
+                    )))
 
     if stage in ("cells", "all"):
-        for d_model, mem_h, mem_len, depth, sparsity, topk in [
+        cell_grid = [
             (256, 4, 10, 3, "none", 256),
             (512, 4, 10, 3, "none", 512),
             (1024, 2, 8, 2, "none", 1024),
@@ -151,7 +253,24 @@ def build_plan(stage):
             (1536, 1, 6, 1, "none", 1536),
             (1536, 1, 6, 1, "topk", 512),
             (2048, 1, 6, 1, "topk", 512),
-        ]:
+        ]
+        if include_plan_size(plan_size, "full"):
+            cell_grid += [
+                (768, 3, 10, 2, "none", 768),
+                (768, 3, 10, 2, "topk", 384),
+                (1024, 1, 6, 1, "topk", 256),
+                (1024, 2, 8, 2, "topk", 256),
+                (1536, 1, 6, 1, "topk", 384),
+                (2048, 1, 6, 1, "topk", 256),
+                (2048, 1, 4, 1, "topk", 512),
+            ]
+        if include_plan_size(plan_size, "wide"):
+            cell_grid += [
+                (3072, 1, 4, 1, "topk", 256),
+                (3072, 1, 4, 1, "topk", 512),
+                (4096, 1, 4, 1, "topk", 512),
+            ]
+        for d_model, mem_h, mem_len, depth, sparsity, topk in cell_grid:
             sparse_tag = f"{sparsity}{topk}" if sparsity != "none" else "dense"
             plan.append(experiment(
                 f"s04_cells_d{d_model}_mh{mem_h}_m{mem_len}_sd{depth}_{sparse_tag}",
@@ -168,6 +287,23 @@ def build_plan(stage):
                     cell_topk=topk,
                     iterations=4,
                 )))
+        if include_plan_size(plan_size, "full"):
+            for rescale in [0, 1]:
+                plan.append(experiment(
+                    f"s04_cells_topk512_rescale{rescale}",
+                    "Check whether sparse activation rescaling stabilizes top-k cells.",
+                    merge_args(
+                        model_type="ctm",
+                        d_model=1536,
+                        n_synch_out=1536,
+                        n_synch_action=1536,
+                        memory_hidden_dims=1,
+                        memory_length=6,
+                        synapse_depth=1,
+                        cell_sparsity_mode="topk",
+                        cell_topk=512,
+                        cell_sparsity_rescale=rescale,
+                    )))
 
     if stage in ("ablations", "all"):
         for key, overrides in [
@@ -181,13 +317,48 @@ def build_plan(stage):
                 f"s05_{key}",
                 "Ablate CTM details to find elegant low-cost simplifications.",
                 merge_args(model_type="ctm", iterations=4, **overrides)))
+        if include_plan_size(plan_size, "full"):
+            for key, overrides in [
+                ("no_selfcond_no_cross", {"self_cond": 0, "cross_layer_state": 0}),
+                ("dinput128_heads4", {"d_input": 128, "heads": 4}),
+                ("dinput384_heads8", {"d_input": 384, "heads": 8}),
+                ("memlen14", {"memory_length": 14}),
+                ("synapse2_mh2", {"synapse_depth": 2, "memory_hidden_dims": 2}),
+                ("deep_nlms0", {"deep_nlms": 0}),
+            ]:
+                plan.append(experiment(
+                    f"s05_{key}",
+                    "Search for low-cost CTM simplifications and sensitivity points.",
+                    merge_args(model_type="ctm", iterations=4, **overrides)))
+        if include_plan_size(plan_size, "wide"):
+            for key, overrides in [
+                ("short_memory_sparse", {
+                    "memory_length": 4,
+                    "memory_hidden_dims": 1,
+                    "synapse_depth": 1,
+                    "d_model": 1536,
+                    "n_synch_out": 1536,
+                    "n_synch_action": 1536,
+                    "cell_sparsity_mode": "topk",
+                    "cell_topk": 384,
+                }),
+                ("tick8_simple_cell", {
+                    "iterations": 8,
+                    "memory_hidden_dims": 1,
+                    "synapse_depth": 1,
+                }),
+            ]:
+                plan.append(experiment(
+                    f"s05_{key}",
+                    "Wide ablation for sparse/simple CTM variants.",
+                    merge_args(model_type="ctm", **overrides)))
 
     return plan
 
 
-def build_batch_tune_plan(stage, batch_sizes, max_steps, log_interval):
+def build_batch_tune_plan(stage, batch_sizes, max_steps, log_interval, plan_size="full"):
     plan = []
-    for exp in build_plan(stage):
+    for exp in build_plan(stage, plan_size):
         for batch_size in batch_sizes:
             name = f"bt__{exp['name']}__bs{batch_size}"
             plan.append(clone_experiment(
@@ -207,6 +378,9 @@ def build_batch_tune_plan(stage, batch_sizes, max_steps, log_interval):
 
 def load_batch_profile(path):
     if not path:
+        return {}
+    if not os.path.exists(path):
+        print(f"warning: batch profile not found, using default batches: {path}", file=sys.stderr)
         return {}
     profile = {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -272,7 +446,10 @@ def write_manifest(plan, path, config, master_addr, port, wait):
 
 
 def print_commands(args):
-    plan = apply_batch_profile(build_plan(args.stage), load_batch_profile(args.batch_profile))
+    plan = apply_batch_profile(
+        build_plan(args.stage, args.plan_size),
+        load_batch_profile(args.batch_profile),
+    )
     if args.output:
         write_manifest(plan, args.output, args.config, args.master_addr, args.port, args.wait)
         print(f"wrote {len(plan)} experiments: {args.output}")
@@ -284,7 +461,8 @@ def print_commands(args):
 
 def print_batch_commands(args):
     plan = build_batch_tune_plan(
-        args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval)
+        args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval,
+        args.plan_size)
     plan = assign_node_groups(plan, parse_node_groups(args.node_groups))
     if args.output:
         write_manifest(plan, args.output, args.config, args.master_addr, args.port, args.wait)
@@ -386,9 +564,13 @@ def submit_exp(args, exp, wait=30.0):
 def run_plan(args):
     if getattr(args, "batch_tune", False):
         plan = build_batch_tune_plan(
-            args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval)
+            args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval,
+            args.plan_size)
     else:
-        plan = apply_batch_profile(build_plan(args.stage), load_batch_profile(args.batch_profile))
+        plan = apply_batch_profile(
+            build_plan(args.stage, args.plan_size),
+            load_batch_profile(args.batch_profile),
+        )
     for i, exp in enumerate(plan):
         cmd = submit_command(exp, args.config, args.master_addr, args.port, args.wait)
         print(f"\n[{i + 1}/{len(plan)}] {exp['name']}")
@@ -407,9 +589,13 @@ def run_plan(args):
 def run_parallel(args):
     if getattr(args, "batch_tune", False):
         plan = build_batch_tune_plan(
-            args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval)
+            args.stage, args.batch_sizes, args.tune_steps, args.tune_log_interval,
+            args.plan_size)
     else:
-        plan = apply_batch_profile(build_plan(args.stage), load_batch_profile(args.batch_profile))
+        plan = apply_batch_profile(
+            build_plan(args.stage, args.plan_size),
+            load_batch_profile(args.batch_profile),
+        )
 
     node_groups = parse_node_groups(args.node_groups)
     if not node_groups:
@@ -544,6 +730,60 @@ def recommend_batches(args):
     print(f"wrote batch recommendations: {args.output}")
 
 
+def latest_row_by_experiment(metrics_dir):
+    by_name = {}
+    for row in latest_rows(metrics_dir):
+        name = row.get("experiment_name", "")
+        if name:
+            by_name[name] = row
+    return by_name
+
+
+def batch_report(args):
+    planned = build_batch_tune_plan(
+        args.stage,
+        args.batch_sizes,
+        args.tune_steps,
+        args.tune_log_interval,
+        args.plan_size,
+    )
+    metrics = latest_row_by_experiment(args.metrics_dir)
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    fields = [
+        "base_experiment", "probe_experiment", "batch_size", "status",
+        "peak_memory_mb", "tokens_per_sec", "steps_per_sec", "loss",
+        "global_step", "world_size", "metrics_file", "question",
+    ]
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for exp in planned:
+            row = metrics.get(exp["name"])
+            status = "ok" if row else "missing_metrics"
+            writer.writerow({
+                "base_experiment": exp.get("base_name", exp["name"]),
+                "probe_experiment": exp["name"],
+                "batch_size": exp["args"].get("batch_size", ""),
+                "status": status,
+                "peak_memory_mb": row.get("peak_memory_mb", "") if row else "",
+                "tokens_per_sec": row.get("tokens_per_sec", "") if row else "",
+                "steps_per_sec": row.get("steps_per_sec", "") if row else "",
+                "loss": row.get("loss", "") if row else "",
+                "global_step": row.get("global_step", "") if row else "",
+                "world_size": row.get("world_size", "") if row else "",
+                "metrics_file": row.get("metrics_file", "") if row else "",
+                "question": exp["question"],
+            })
+    print(f"wrote batch probe report: {args.output}")
+
+
+def export_final_plan(args):
+    profile = load_batch_profile(args.batch_profile)
+    plan = apply_batch_profile(build_plan(args.stage, args.plan_size), profile)
+    write_manifest(plan, args.output, args.config, args.master_addr, args.port, args.wait)
+    print(f"wrote final execution plan: {args.output}")
+
+
 def summarize(args):
     rows = latest_rows(args.metrics_dir)
     rows.sort(key=lambda r: r.get("experiment_name", ""))
@@ -581,11 +821,18 @@ def parse_args():
     common.add_argument("--master_addr", default=None)
     common.add_argument("--port", type=int, default=None)
     common.add_argument("--wait", type=float, default=30.0)
+    common.add_argument("--plan_size", default="full", choices=PLAN_SIZES,
+                        help="core=current compact matrix, full=default sufficient sweep, wide=extra exploratory runs.")
 
     p = sub.add_parser("commands", parents=[common])
     p.add_argument("--output", default="runs/experiment_plans/ctm_plan.csv")
     p.add_argument("--batch_profile", default=None)
     p.set_defaults(func=print_commands)
+
+    p = sub.add_parser("final-plan", parents=[common])
+    p.add_argument("--output", default="runs/experiment_plans/final_plan.csv")
+    p.add_argument("--batch_profile", default="runs/metrics/batch_profile.csv")
+    p.set_defaults(func=export_final_plan)
 
     p = sub.add_parser("batch-commands", parents=[common])
     p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
@@ -629,6 +876,17 @@ def parse_args():
     p.add_argument("--target_memory_gb", type=float, default=80.0)
     p.add_argument("--memory_util", type=float, default=0.90)
     p.set_defaults(func=recommend_batches)
+
+    p = sub.add_parser("batch-report")
+    p.add_argument("--stage", default="all",
+                   choices=["smoke", "compass", "ticks", "elf", "cells", "ablations", "all"])
+    p.add_argument("--plan_size", default="full", choices=PLAN_SIZES)
+    p.add_argument("--metrics_dir", default="runs/metrics")
+    p.add_argument("--output", default="runs/metrics/batch_probe_report.csv")
+    p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
+    p.add_argument("--tune_steps", type=int, default=80)
+    p.add_argument("--tune_log_interval", type=int, default=20)
+    p.set_defaults(func=batch_report)
 
     args = parser.parse_args()
     if args.cmd in ("run", "run-parallel"):
