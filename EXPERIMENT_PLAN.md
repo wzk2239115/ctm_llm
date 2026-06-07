@@ -95,6 +95,37 @@ python scripts/experiment_plan.py run-parallel --stage all --batch_tune \
   --node_groups 11.131.210.78,11.131.210.3 11.131.209.154,11.131.211.9
 ```
 
+For a fast first-pass profile, use `quick-probe`. It tries larger batch sizes
+first and stops probing an experiment after the first successful batch. The
+profile is written incrementally, and experiments not resolved before the time
+limit get the fallback batch size:
+
+```bash
+python scripts/experiment_plan.py quick-probe --stage all \
+  --plan_size full \
+  --config infra/clusters/h100_4nodes.env \
+  --master_addr 11.131.210.78 \
+  --port 8765 \
+  --batch_sizes 2 4 6 8 10 12 \
+  --time_limit_min 15 \
+  --fallback_batch_size 2 \
+  --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9 \
+  --output runs/metrics/batch_profile_quick.csv \
+  --report_output runs/metrics/quick_probe_report.csv
+```
+
+Then generate a first-pass final plan from it:
+
+```bash
+python scripts/experiment_plan.py final-plan --stage all \
+  --plan_size full \
+  --config infra/clusters/h100_4nodes.env \
+  --master_addr 11.131.210.78 \
+  --port 8765 \
+  --batch_profile runs/metrics/batch_profile_quick.csv \
+  --output runs/experiment_plans/final_plan_quick.csv
+```
+
 ### 2. Export Probe Status CSV
 
 After probes finish, export every planned `(experiment, batch_size)` probe and

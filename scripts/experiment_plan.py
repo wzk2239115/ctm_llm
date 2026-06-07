@@ -401,6 +401,22 @@ def build_batch_tune_plan(stage, batch_sizes, max_steps, log_interval, plan_size
     return plan
 
 
+def quick_probe_experiment(exp, batch_size, max_steps, log_interval):
+    name = f"qp__{exp['name']}__bs{batch_size}"
+    return clone_experiment(
+        exp,
+        name,
+        {
+            "batch_size": batch_size,
+            "max_steps": max_steps,
+            "log_interval": log_interval,
+            "save_interval": max_steps + 1000000,
+            "no_tensorboard": None,
+        },
+        question=f"Quick batch probe for {exp['name']} at batch_size={batch_size}.",
+    )
+
+
 def load_batch_profile(path):
     if not path:
         return {}
@@ -667,6 +683,219 @@ def run_parallel(args):
             time.sleep(args.poll_interval)
 
 
+def probe_result(exp_name, metrics_dir):
+    metrics = latest_row_by_experiment(metrics_dir).get(exp_name)
+    failure = failure_reports_by_experiment(metrics_dir).get(exp_name)
+    if failure:
+        return {
+            "status": failure.get("status", "failed"),
+            "peak_memory_mb": failure.get("peak_memory_mb", ""),
+            "tokens_per_sec": "",
+            "metrics_file": "",
+            "failure_file": failure.get("failure_file", ""),
+            "error_type": failure.get("error_type", ""),
+            "error": failure.get("error", "")[:500],
+        }
+    if metrics:
+        return {
+            "status": "ok",
+            "peak_memory_mb": metrics.get("peak_memory_mb", ""),
+            "tokens_per_sec": metrics.get("tokens_per_sec", ""),
+            "metrics_file": metrics.get("metrics_file", ""),
+            "failure_file": "",
+            "error_type": "",
+            "error": "",
+        }
+    return {
+        "status": "missing_metrics",
+        "peak_memory_mb": "",
+        "tokens_per_sec": "",
+        "metrics_file": "",
+        "failure_file": "",
+        "error_type": "",
+        "error": "",
+    }
+
+
+def write_quick_outputs(args, selected, attempts):
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    profile_fields = [
+        "experiment_name", "recommended_batch_size", "peak_memory_mb",
+        "tokens_per_sec", "memory_limit_mb", "num_successful_probes",
+        "selected_probe", "metrics_file",
+    ]
+    limit_mb = args.target_memory_gb * 1024 * args.memory_util
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=profile_fields)
+        writer.writeheader()
+        all_names = getattr(args, "_quick_base_names", [])
+        names = sorted(set(all_names) | set(selected.keys()))
+        for base_name in names:
+            item = selected.get(base_name)
+            if item is None:
+                writer.writerow({
+                    "experiment_name": base_name,
+                    "recommended_batch_size": args.fallback_batch_size,
+                    "peak_memory_mb": "",
+                    "tokens_per_sec": "",
+                    "memory_limit_mb": round(limit_mb, 3),
+                    "num_successful_probes": 0,
+                    "selected_probe": "fallback_unprobed",
+                    "metrics_file": "",
+                })
+                continue
+            writer.writerow({
+                "experiment_name": base_name,
+                "recommended_batch_size": item["batch_size"],
+                "peak_memory_mb": item.get("peak_memory_mb", ""),
+                "tokens_per_sec": item.get("tokens_per_sec", ""),
+                "memory_limit_mb": round(limit_mb, 3),
+                "num_successful_probes": 1,
+                "selected_probe": item["probe_name"],
+                "metrics_file": item.get("metrics_file", ""),
+            })
+
+    if args.report_output:
+        os.makedirs(os.path.dirname(args.report_output), exist_ok=True)
+        fields = [
+            "base_experiment", "probe_experiment", "batch_size", "status",
+            "peak_memory_mb", "tokens_per_sec", "metrics_file", "failure_file",
+            "error_type", "error",
+        ]
+        with open(args.report_output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(attempts)
+
+
+def run_quick_probe(args):
+    base_plan = build_plan(args.stage, args.plan_size)
+    batch_sizes = sorted(set(args.batch_sizes), reverse=True)
+    if args.fallback_batch_size is None:
+        args.fallback_batch_size = min(batch_sizes)
+    args._quick_base_names = [exp["name"] for exp in base_plan]
+    node_groups = parse_node_groups(args.node_groups)
+    if not node_groups:
+        raise SystemExit("--node_groups is required for quick-probe")
+
+    pending = {
+        exp["name"]: {
+            "exp": exp,
+            "batches": list(batch_sizes),
+            "done": False,
+        }
+        for exp in base_plan
+    }
+    queue = list(pending.keys())
+    running = {}
+    selected = {}
+    attempts = []
+    started_at = time.time()
+    deadline = started_at + args.time_limit_min * 60 if args.time_limit_min > 0 else None
+
+    def next_probe():
+        while queue:
+            base_name = queue.pop(0)
+            item = pending[base_name]
+            if item["done"] or not item["batches"]:
+                continue
+            batch_size = item["batches"].pop(0)
+            return base_name, quick_probe_experiment(
+                item["exp"], batch_size, args.tune_steps, args.tune_log_interval)
+        return None, None
+
+    total = len(base_plan)
+    while queue or running:
+        now = time.time()
+        scheduling_open = deadline is None or now < deadline
+        status = pool_status(args.master_addr, args.port)
+        if scheduling_open:
+            for idx, group in enumerate(node_groups):
+                if idx in running:
+                    continue
+                if not node_group_idle_from_status(status, group):
+                    continue
+                base_name, exp = next_probe()
+                if exp is None:
+                    continue
+                exp["node_addrs"] = group
+                batch_size = exp["args"]["batch_size"]
+                print(
+                    f"\n[quick {len(selected)}/{total}] lane={idx} "
+                    f"{base_name} bs={batch_size}",
+                    flush=True,
+                )
+                task = submit_exp(args, exp, wait=0)
+                running[idx] = {
+                    "task_id": task["task_id"],
+                    "nodes": group,
+                    "name": exp["name"],
+                    "base_name": base_name,
+                    "batch_size": batch_size,
+                    "submitted_at": time.time(),
+                }
+
+        done = []
+        status = pool_status(args.master_addr, args.port)
+        for idx, item in running.items():
+            if time.time() - item["submitted_at"] < args.startup_grace:
+                continue
+            if node_group_idle_from_status(status, item["nodes"]):
+                done.append(idx)
+
+        for idx in done:
+            item = running.pop(idx)
+            result = probe_result(item["name"], args.metrics_dir)
+            attempt = {
+                "base_experiment": item["base_name"],
+                "probe_experiment": item["name"],
+                "batch_size": item["batch_size"],
+                **result,
+            }
+            attempts.append(attempt)
+            base = pending[item["base_name"]]
+            if result["status"] == "ok":
+                base["done"] = True
+                selected[item["base_name"]] = {
+                    "batch_size": item["batch_size"],
+                    "probe_name": item["name"],
+                    "peak_memory_mb": result.get("peak_memory_mb", ""),
+                    "tokens_per_sec": result.get("tokens_per_sec", ""),
+                    "metrics_file": result.get("metrics_file", ""),
+                }
+                print(
+                    f"[selected {len(selected)}/{total}] {item['base_name']} "
+                    f"bs={item['batch_size']} mem={result.get('peak_memory_mb', '')}",
+                    flush=True,
+                )
+            else:
+                if base["batches"]:
+                    queue.append(item["base_name"])
+                else:
+                    base["done"] = True
+                print(
+                    f"[probe {result['status']}] {item['base_name']} "
+                    f"bs={item['batch_size']} next={base['batches'][:1] or '-'}",
+                    flush=True,
+                )
+            write_quick_outputs(args, selected, attempts)
+
+        if deadline is not None and time.time() >= deadline and not running:
+            break
+        if deadline is not None and time.time() >= deadline and queue:
+            queue = []
+        if queue or running:
+            time.sleep(args.poll_interval)
+
+    write_quick_outputs(args, selected, attempts)
+    missing = total - len(selected)
+    print(
+        f"quick probe done: selected={len(selected)} missing={missing} "
+        f"profile={args.output} report={args.report_output}",
+        flush=True,
+    )
+
+
 def latest_rows(metrics_dir):
     rows = []
     for path in glob.glob(os.path.join(metrics_dir, "*.csv")):
@@ -691,9 +920,9 @@ def parse_float(row, key, default=math.nan):
 
 
 def batch_probe_base_name(experiment_name):
-    if not experiment_name.startswith("bt__"):
+    if not (experiment_name.startswith("bt__") or experiment_name.startswith("qp__")):
         return None
-    body = experiment_name[len("bt__"):]
+    body = experiment_name.split("__", 1)[1]
     if "__bs" not in body:
         return None
     return body.rsplit("__bs", 1)[0]
@@ -936,6 +1165,24 @@ def parse_args():
                    help="Node groups for parallel lanes, e.g. ip1 ip2 ip3 ip4 or ip1,ip2 ip3,ip4.")
     p.set_defaults(func=run_parallel)
 
+    p = sub.add_parser("quick-probe", parents=[common])
+    p.add_argument("--startup_grace", type=float, default=8.0)
+    p.add_argument("--poll_interval", type=float, default=5.0)
+    p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
+    p.add_argument("--tune_steps", type=int, default=3)
+    p.add_argument("--tune_log_interval", type=int, default=1)
+    p.add_argument("--time_limit_min", type=float, default=15.0)
+    p.add_argument("--metrics_dir", default="runs/metrics")
+    p.add_argument("--output", default="runs/metrics/batch_profile_quick.csv")
+    p.add_argument("--report_output", default="runs/metrics/quick_probe_report.csv")
+    p.add_argument("--target_memory_gb", type=float, default=80.0)
+    p.add_argument("--memory_util", type=float, default=0.90)
+    p.add_argument("--fallback_batch_size", type=int, default=None,
+                   help="Batch size used for experiments not resolved before the time limit; default=min(batch_sizes).")
+    p.add_argument("--node_groups", nargs="+", required=True,
+                   help="Node groups for quick probe lanes, e.g. ip1 ip2 ip3 ip4.")
+    p.set_defaults(func=run_quick_probe)
+
     p = sub.add_parser("summarize")
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--output", default="runs/metrics/summary.csv")
@@ -960,7 +1207,7 @@ def parse_args():
     p.set_defaults(func=batch_report)
 
     args = parser.parse_args()
-    if args.cmd in ("run", "run-parallel"):
+    if args.cmd in ("run", "run-parallel", "quick-probe"):
         if args.master_addr is None:
             args.master_addr = "11.131.210.78"
         if args.port is None:
