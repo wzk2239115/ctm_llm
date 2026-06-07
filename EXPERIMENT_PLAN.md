@@ -111,12 +111,18 @@ python scripts/experiment_plan.py quick-probe --stage all \
   --port 8765 \
   --batch_sizes 2 4 6 8 10 12 \
   --time_limit_min 15 \
+  --metrics_settle_seconds 8 \
   --fallback_batch_size 2 \
   --node_groups 11.131.210.78 11.131.210.3 11.131.209.154 11.131.211.9 \
   --gpus_per_lane 2 \
   --output runs/metrics/batch_profile_quick.csv \
   --report_output runs/metrics/quick_probe_report.csv
 ```
+
+`quick-probe` treats a successful probe above `target_memory_gb * memory_util`
+as `over_memory` and continues trying smaller batches. This keeps the generated
+profile conservative enough for formal runs instead of picking a batch that only
+barely survived a short probe.
 
 Then generate a first-pass final plan from it:
 

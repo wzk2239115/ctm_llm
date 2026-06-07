@@ -789,6 +789,23 @@ def probe_result(exp_name, metrics_dir):
     }
 
 
+def probe_result_after_settle(exp_name, metrics_dir, settle_seconds):
+    deadline = time.time() + max(0.0, settle_seconds)
+    result = probe_result(exp_name, metrics_dir)
+    while result["status"] == "missing_metrics" and time.time() < deadline:
+        time.sleep(min(1.0, max(0.0, deadline - time.time())))
+        result = probe_result(exp_name, metrics_dir)
+    return result
+
+
+def result_peak_memory_mb(result):
+    try:
+        value = result.get("peak_memory_mb", "")
+        return float(value) if value != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
 def write_quick_outputs(args, selected, attempts):
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     profile_fields = [
@@ -831,8 +848,8 @@ def write_quick_outputs(args, selected, attempts):
         os.makedirs(os.path.dirname(args.report_output), exist_ok=True)
         fields = [
             "base_experiment", "probe_experiment", "batch_size", "status",
-            "peak_memory_mb", "tokens_per_sec", "metrics_file", "failure_file",
-            "error_type", "error",
+            "peak_memory_mb", "memory_limit_mb", "tokens_per_sec", "metrics_file",
+            "failure_file", "error_type", "error",
         ]
         with open(args.report_output, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -868,6 +885,7 @@ def run_quick_probe(args):
     attempts = []
     started_at = time.time()
     deadline = started_at + args.time_limit_min * 60 if args.time_limit_min > 0 else None
+    limit_mb = args.target_memory_gb * 1024 * args.memory_util
 
     def next_probe():
         while queue:
@@ -921,16 +939,28 @@ def run_quick_probe(args):
 
         for idx in done:
             item = running.pop(idx)
-            result = probe_result(item["name"], args.metrics_dir)
+            result = probe_result_after_settle(
+                item["name"], args.metrics_dir, args.metrics_settle_seconds)
+            peak_memory_mb = result_peak_memory_mb(result)
+            status = result["status"]
+            if status == "ok" and peak_memory_mb is not None and peak_memory_mb > limit_mb:
+                status = "over_memory"
+                result = dict(result)
+                result["status"] = status
+                result["error"] = (
+                    f"peak_memory_mb={peak_memory_mb:.3f} exceeds "
+                    f"limit_mb={limit_mb:.3f}"
+                )
             attempt = {
                 "base_experiment": item["base_name"],
                 "probe_experiment": item["name"],
                 "batch_size": item["batch_size"],
+                "memory_limit_mb": round(limit_mb, 3),
                 **result,
             }
             attempts.append(attempt)
             base = pending[item["base_name"]]
-            if result["status"] == "ok":
+            if status == "ok":
                 base["done"] = True
                 selected[item["base_name"]] = {
                     "batch_size": item["batch_size"],
@@ -1254,6 +1284,8 @@ def parse_args():
     p.add_argument("--tune_steps", type=int, default=3)
     p.add_argument("--tune_log_interval", type=int, default=1)
     p.add_argument("--time_limit_min", type=float, default=15.0)
+    p.add_argument("--metrics_settle_seconds", type=float, default=8.0,
+                   help="Wait this long for metrics/failure files after a lane becomes idle.")
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--output", default="runs/metrics/batch_profile_quick.csv")
     p.add_argument("--report_output", default="runs/metrics/quick_probe_report.csv")
