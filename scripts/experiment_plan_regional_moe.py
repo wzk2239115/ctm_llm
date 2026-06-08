@@ -879,15 +879,21 @@ def assign_node_groups(plan, node_groups):
 def wait_until_idle(master_addr, port, task_id, poll_interval):
     while True:
         status = pool_status(master_addr, port)
-        nodes = status.get("nodes", {})
-        running = [
-            addr for addr, node in nodes.items()
-            if task_id in (node.get("running_tasks") or [])
-            or str(node.get("status", "")).startswith(f"running:{task_id}")
-        ]
-        if not running:
+        if not task_running_in_status(status, task_id):
             return
         time.sleep(poll_interval)
+
+
+def task_running_in_status(status, task_id):
+    task_id = str(task_id)
+    nodes = status.get("nodes", {})
+    for node in nodes.values():
+        running_tasks = {str(item) for item in (node.get("running_tasks") or [])}
+        if task_id in running_tasks:
+            return True
+        if str(node.get("status", "")).startswith(f"running:{task_id}"):
+            return True
+    return False
 
 
 def node_group_idle(master_addr, port, node_group):
@@ -1006,7 +1012,10 @@ def run_parallel(args):
         for idx, item in running.items():
             if time.time() - item["submitted_at"] < args.startup_grace:
                 continue
-            if node_group_idle_from_status(status, item["nodes"]):
+            if (
+                node_group_idle_from_status(status, item["nodes"])
+                and not task_running_in_status(status, item["task_id"])
+            ):
                 done.append(idx)
         for idx in done:
             item = running.pop(idx)
@@ -1251,7 +1260,10 @@ def run_quick_probe(args):
         for idx, item in running.items():
             if time.time() - item["submitted_at"] < args.startup_grace:
                 continue
-            if node_group_idle_from_status(status, item["nodes"]):
+            if (
+                node_group_idle_from_status(status, item["nodes"])
+                and not task_running_in_status(status, item["task_id"])
+            ):
                 done.append(idx)
 
         for idx in done:
@@ -1664,13 +1676,13 @@ def parse_args():
     p.set_defaults(func=run_parallel)
 
     p = sub.add_parser("quick-probe", parents=[common])
-    p.add_argument("--startup_grace", type=float, default=8.0)
-    p.add_argument("--poll_interval", type=float, default=5.0)
+    p.add_argument("--startup_grace", type=float, default=60.0)
+    p.add_argument("--poll_interval", type=float, default=10.0)
     p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
     p.add_argument("--tune_steps", type=int, default=3)
     p.add_argument("--tune_log_interval", type=int, default=1)
     p.add_argument("--time_limit_min", type=float, default=15.0)
-    p.add_argument("--metrics_settle_seconds", type=float, default=8.0,
+    p.add_argument("--metrics_settle_seconds", type=float, default=45.0,
                    help="Wait this long for metrics/failure files after a lane becomes idle.")
     p.add_argument("--oom_backoff_ratio", type=float, default=0.67,
                    help="After OOM/over_memory, only try remaining batches <= current_batch * ratio; set 1.0 to disable.")
