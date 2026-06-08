@@ -1,10 +1,11 @@
 # CTM-LLM Experiment Results Analysis
 
-This folder records the first full 71-experiment CTM-LLM sweep and the follow-up
-49-experiment sparsity sweep.
+This folder records the first full 71-experiment CTM-LLM sweep, the follow-up
+49-experiment sparsity sweep, and the 32-experiment MoE sparsity sweep.
 
 Source summary: `summary.csv` exported from `runs/metrics`.
 Sparsity source summary: `sparsity_summary.csv` exported from `runs/metrics`.
+MoE sparsity source summary: `moe_sparsity_summary.csv` exported from `runs/metrics`.
 
 Filtering rule:
 - Keep only formal experiment names matching `s00_` to `s05_`.
@@ -32,6 +33,19 @@ Sparsity experiment count:
 | sp03 | 12 | synapse/memory simplification under sparsity |
 | sp04 | 9 | tick count crossed with sparse cells |
 | sp05 | 4 | 2000-step sparse confirmation runs |
+
+MoE sparsity experiment count:
+
+| Stage | Count | Topic |
+| --- | ---: | --- |
+| moe00 | 2 | dense and routed smoke checks |
+| moe01 | 5 | router variants |
+| moe02 | 4 | shared experts plus routed experts |
+| moe03 | 3 | fine-grained expert sizes/counts |
+| moe04 | 5 | router regularization |
+| moe05 | 4 | dispatch mode labels |
+| moe06 | 5 | warmup and expert dropout |
+| moe07 | 4 | sparse routing crossed with ELF/MTP labels |
 
 ## High-Level Findings
 
@@ -62,6 +76,12 @@ Sparsity experiment count:
 9. Tick1 sparse variants are the best cost frontier, but need longer confirmation.
    `sp04_d512_topk256_tick1` reaches loss `5.2979`, throughput `7455 tok/s`, and peak memory `16.2 GB`.
 
+10. MoE-style routing validates lower active fraction, but not lower cost yet.
+   `moe04_router_balance1e2_e16_s64_k2` reaches loss `5.4439` with active fraction `0.125`, but throughput and memory remain close to dense CTM because the current path is masked rather than true sparse dispatch.
+
+11. The strongest MoE ideas are load balance, shared experts, and sparse warmup.
+   `moe02_shared2_routed4_e16_s64` reaches loss `5.4506`, and `moe06_warmup1000_drop0p05_e16_s64_k2` reaches loss `5.4509`.
+
 ## Recommended Next Direction
 
 Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted sweeps around:
@@ -70,6 +90,7 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - dynamic halt that actually saves compute;
 - ELF short horizon with a stronger multi-token loss;
 - true sparse cell execution that avoids inactive cell projections, trace storage, and repeated full-width state work;
+- MoE-style grouped sparse execution with load balance, shared experts, and warmup;
 - direct matched Transformer controls at equal wall-clock budget and equal memory budget.
 - 2000/4000-step confirmation of d512 and d768 tick1/tick2 sparse variants.
 
@@ -87,3 +108,4 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - `sp03_synapse_memory.md`
 - `sp04_tick_sparse.md`
 - `sp05_best_sparse_confirm.md`
+- `moe_sparsity.md`
