@@ -325,6 +325,19 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'moe_region_diversity_weight': args.moe_region_diversity_weight,
                     'moe_mtp_mode': args.moe_mtp_mode,
                     'moe_mtp_horizons': args.moe_mtp_horizons,
+                    'diff_cell_mode': args.diff_cell_mode,
+                    'diff_cell_widths': args.diff_cell_widths,
+                    'diff_cell_memory_lengths': args.diff_cell_memory_lengths,
+                    'diff_cell_temperature': args.diff_cell_temperature,
+                    'diff_cell_capacity_weight': args.diff_cell_capacity_weight,
+                    'diff_cell_memory_weight': args.diff_cell_memory_weight,
+                    'diff_cell_diversity_weight': args.diff_cell_diversity_weight,
+                    'fast_output_mode': args.fast_output_mode,
+                    'fast_output_weight': args.fast_output_weight,
+                    'habit_output_weight': args.habit_output_weight,
+                    'slow_output_weight': args.slow_output_weight,
+                    'fast_output_ticks': args.fast_output_ticks,
+                    'fast_output_distill_weight': args.fast_output_distill_weight,
                     'self_cond': args.self_cond,
                     'cross_layer_state': args.cross_layer_state,
                     'max_seq_len': args.max_seq_len,
@@ -431,6 +444,21 @@ if __name__ == '__main__':
     parser.add_argument('--moe_region_diversity_weight', type=float, default=0.0)
     parser.add_argument('--moe_mtp_mode', type=str, default='none')
     parser.add_argument('--moe_mtp_horizons', type=str, default='')
+    parser.add_argument('--diff_cell_mode', type=str, default='none',
+                        choices=['none', 'learned'])
+    parser.add_argument('--diff_cell_widths', type=str, default='')
+    parser.add_argument('--diff_cell_memory_lengths', type=str, default='')
+    parser.add_argument('--diff_cell_temperature', type=float, default=1.0)
+    parser.add_argument('--diff_cell_capacity_weight', type=float, default=0.0)
+    parser.add_argument('--diff_cell_memory_weight', type=float, default=0.0)
+    parser.add_argument('--diff_cell_diversity_weight', type=float, default=0.0)
+    parser.add_argument('--fast_output_mode', type=str, default='none',
+                        choices=['none', 'reflex', 'anytime'])
+    parser.add_argument('--fast_output_weight', type=float, default=0.0)
+    parser.add_argument('--habit_output_weight', type=float, default=0.0)
+    parser.add_argument('--slow_output_weight', type=float, default=0.0)
+    parser.add_argument('--fast_output_ticks', type=str, default='1,4')
+    parser.add_argument('--fast_output_distill_weight', type=float, default=0.0)
     parser.add_argument('--ttt_layer', type=int, default=0, choices=[0, 1])
     parser.add_argument('--ttt_hidden_mult', type=int, default=2)
     parser.add_argument('--ttt_gate_init', type=float, default=-2.0)
@@ -524,6 +552,19 @@ if __name__ == '__main__':
         moe_region_diversity_weight=args.moe_region_diversity_weight,
         moe_mtp_mode=args.moe_mtp_mode,
         moe_mtp_horizons=args.moe_mtp_horizons,
+        diff_cell_mode=args.diff_cell_mode,
+        diff_cell_widths=args.diff_cell_widths,
+        diff_cell_memory_lengths=args.diff_cell_memory_lengths,
+        diff_cell_temperature=args.diff_cell_temperature,
+        diff_cell_capacity_weight=args.diff_cell_capacity_weight,
+        diff_cell_memory_weight=args.diff_cell_memory_weight,
+        diff_cell_diversity_weight=args.diff_cell_diversity_weight,
+        fast_output_mode=args.fast_output_mode,
+        fast_output_weight=args.fast_output_weight,
+        habit_output_weight=args.habit_output_weight,
+        slow_output_weight=args.slow_output_weight,
+        fast_output_ticks=args.fast_output_ticks,
+        fast_output_distill_weight=args.fast_output_distill_weight,
         ttt_layer=bool(args.ttt_layer),
         ttt_hidden_mult=args.ttt_hidden_mult,
         ttt_gate_init=args.ttt_gate_init,

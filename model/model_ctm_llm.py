@@ -8,6 +8,25 @@ from model.config import CTMLLMConfig
 from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze, TTTMLP
 
 
+def _parse_int_list(raw, *, max_value=None):
+    values = []
+    for item in str(raw or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            continue
+        if value <= 0:
+            continue
+        if max_value is not None:
+            value = min(value, max_value)
+        if value not in values:
+            values.append(value)
+    return sorted(values)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -72,6 +91,25 @@ class CTMBlock(nn.Module):
             getattr(config, 'moe_aux_loss_free_bias', False))
         self.moe_aux_loss = None
         self.last_executed_ticks = 0
+        self.diff_cell_mode = getattr(config, 'diff_cell_mode', 'none')
+        self.diff_cell_temperature = float(
+            getattr(config, 'diff_cell_temperature', 1.0))
+        self.diff_cell_capacity_weight = float(
+            getattr(config, 'diff_cell_capacity_weight', 0.0))
+        self.diff_cell_memory_weight = float(
+            getattr(config, 'diff_cell_memory_weight', 0.0))
+        self.diff_cell_diversity_weight = float(
+            getattr(config, 'diff_cell_diversity_weight', 0.0))
+        self.diff_cell_widths = _parse_int_list(
+            getattr(config, 'diff_cell_widths', ''), max_value=self.moe_expert_size)
+        self.diff_cell_memory_lengths = _parse_int_list(
+            getattr(config, 'diff_cell_memory_lengths', ''), max_value=config.memory_length)
+        if self.moe_expert_size > 0 and self.moe_expert_size not in self.diff_cell_widths:
+            self.diff_cell_widths.append(self.moe_expert_size)
+            self.diff_cell_widths = sorted(set(self.diff_cell_widths))
+        if config.memory_length not in self.diff_cell_memory_lengths:
+            self.diff_cell_memory_lengths.append(config.memory_length)
+            self.diff_cell_memory_lengths = sorted(set(self.diff_cell_memory_lengths))
 
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -103,6 +141,10 @@ class CTMBlock(nn.Module):
         self.trace_processor = self._build_nlms(config)
         self.group_synapses = None
         self.group_trace_processors = None
+        self.diff_group_synapses = None
+        self.diff_group_trace_processors = None
+        self.diff_width_logits = None
+        self.diff_memory_logits = None
         if self._can_build_group_sparse_backend():
             self.group_synapses = nn.ModuleList([
                 self._build_group_synapse(config, self.moe_expert_size)
@@ -112,6 +154,8 @@ class CTMBlock(nn.Module):
                 self._build_nlms_for_size(config, self.moe_expert_size)
                 for _ in range(self.moe_num_experts)
             ])
+            if self._differentiated_cells_enabled():
+                self._init_differentiated_cells(config)
         self.ttt_layer = None
         if config.ttt_layer:
             self.ttt_layer = TTTMLP(
@@ -148,10 +192,11 @@ class CTMBlock(nn.Module):
     def _build_nlms(self, config):
         return self._build_nlms_for_size(config, config.d_model)
 
-    def _build_nlms_for_size(self, config, d_model):
+    def _build_nlms_for_size(self, config, d_model, memory_length=None):
+        memory_length = memory_length or config.memory_length
         if config.deep_nlms:
             return nn.Sequential(
-                SuperLinear(config.memory_length, 2 * config.memory_hidden_dims,
+                SuperLinear(memory_length, 2 * config.memory_hidden_dims,
                             d_model, dropout=config.dropout),
                 nn.GLU(),
                 SuperLinear(config.memory_hidden_dims, 2,
@@ -159,7 +204,7 @@ class CTMBlock(nn.Module):
                 nn.GLU(),
                 Squeeze(-1))
         return nn.Sequential(
-            SuperLinear(config.memory_length, 2, d_model, dropout=config.dropout),
+            SuperLinear(memory_length, 2, d_model, dropout=config.dropout),
             nn.GLU(),
             Squeeze(-1))
 
@@ -185,6 +230,86 @@ class CTMBlock(nn.Module):
             )
         return SynapseUNET(
             synapse_in, expert_size, config.synapse_depth, dropout=config.dropout)
+
+    def _differentiated_cells_enabled(self):
+        return (
+            self.diff_cell_mode == 'learned'
+            and self.moe_num_experts > 1
+            and self.moe_expert_size > 0
+            and len(self.diff_cell_widths) > 1
+            and len(self.diff_cell_memory_lengths) >= 1
+        )
+
+    def _init_differentiated_cells(self, config):
+        self.diff_width_logits = nn.Parameter(
+            torch.zeros(self.moe_num_experts, len(self.diff_cell_widths)))
+        self.diff_memory_logits = nn.Parameter(
+            torch.zeros(self.moe_num_experts, len(self.diff_cell_memory_lengths)))
+        if len(self.diff_cell_widths) > 1:
+            with torch.no_grad():
+                self.diff_width_logits[:, 0] = 0.5
+        if len(self.diff_cell_memory_lengths) > 1:
+            with torch.no_grad():
+                self.diff_memory_logits[:, 0] = 0.5
+
+        self.diff_group_synapses = nn.ModuleList()
+        self.diff_group_trace_processors = nn.ModuleList()
+        for _ in range(self.moe_num_experts):
+            synapses = nn.ModuleDict()
+            traces = nn.ModuleDict()
+            for width in self.diff_cell_widths:
+                synapses[str(width)] = self._build_group_synapse(config, width)
+                for mem_len in self.diff_cell_memory_lengths:
+                    traces[f"{width}x{mem_len}"] = self._build_nlms_for_size(
+                        config, width, memory_length=mem_len)
+            self.diff_group_synapses.append(synapses)
+            self.diff_group_trace_processors.append(traces)
+
+    def _select_diff_level(self, logits, values, expert):
+        tau = max(self.diff_cell_temperature, 1e-4)
+        if self.training:
+            gate = F.gumbel_softmax(logits[expert].float(), tau=tau, hard=True)
+        else:
+            idx = logits[expert].argmax(dim=-1)
+            gate = F.one_hot(idx, num_classes=len(values)).float()
+        idx = int(gate.argmax(dim=-1).item())
+        value = values[idx]
+        # Forward is 1.0; backward carries the straight-through gate gradient.
+        scale = gate[idx].type_as(logits) / gate[idx].detach().clamp(min=1e-6).type_as(logits)
+        return value, scale
+
+    def _update_diff_cell_aux_loss(self):
+        if not self._differentiated_cells_enabled():
+            return
+        if (
+            self.diff_cell_capacity_weight <= 0
+            and self.diff_cell_memory_weight <= 0
+            and self.diff_cell_diversity_weight <= 0
+        ):
+            return
+        aux = self.diff_width_logits.new_zeros(())
+        width_probs = F.softmax(self.diff_width_logits.float(), dim=-1)
+        mem_probs = F.softmax(self.diff_memory_logits.float(), dim=-1)
+        width_values = torch.tensor(
+            self.diff_cell_widths, device=width_probs.device, dtype=width_probs.dtype)
+        mem_values = torch.tensor(
+            self.diff_cell_memory_lengths, device=mem_probs.device, dtype=mem_probs.dtype)
+        if self.diff_cell_capacity_weight > 0:
+            expected_width = (width_probs * width_values.view(1, -1)).sum(dim=-1)
+            aux = aux + self.diff_cell_capacity_weight * (
+                expected_width / max(1, self.moe_expert_size)).mean()
+        if self.diff_cell_memory_weight > 0:
+            expected_mem = (mem_probs * mem_values.view(1, -1)).sum(dim=-1)
+            aux = aux + self.diff_cell_memory_weight * (
+                expected_mem / max(1, self.memory_length)).mean()
+        if self.diff_cell_diversity_weight > 0:
+            width_hist = width_probs.mean(dim=0)
+            mem_hist = mem_probs.mean(dim=0)
+            width_entropy = -(width_hist * torch.log(width_hist.clamp(min=1e-12))).sum()
+            mem_entropy = -(mem_hist * torch.log(mem_hist.clamp(min=1e-12))).sum()
+            norm = math.log(max(2, width_hist.numel())) + math.log(max(2, mem_hist.numel()))
+            aux = aux - self.diff_cell_diversity_weight * (width_entropy + mem_entropy) / norm
+        self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
 
     def _init_synch(self, config):
         d = config.d_model
@@ -471,7 +596,20 @@ class CTMBlock(nn.Module):
                 if token_idx.numel() == 0:
                     continue
                 start = expert * expert_size
-                end = start + expert_size
+                width = expert_size
+                mem_len = self.memory_length
+                gate_scale = flat_active.new_ones(())
+                synapse_module = self.group_synapses[expert]
+                trace_module = self.group_trace_processors[expert]
+                if self._differentiated_cells_enabled():
+                    width, width_scale = self._select_diff_level(
+                        self.diff_width_logits, self.diff_cell_widths, expert)
+                    mem_len, mem_scale = self._select_diff_level(
+                        self.diff_memory_logits, self.diff_cell_memory_lengths, expert)
+                    gate_scale = width_scale.to(flat_active.dtype) * mem_scale.to(flat_active.dtype)
+                    synapse_module = self.diff_group_synapses[expert][str(width)]
+                    trace_module = self.diff_group_trace_processors[expert][f"{width}x{mem_len}"]
+                end = start + width
                 parts = [
                     flat_attn[token_idx],
                     flat_active[token_idx, start:end],
@@ -479,17 +617,18 @@ class CTMBlock(nn.Module):
                 if self.self_cond:
                     parts.append(flat_self[token_idx, start:end])
                 pre_syn = torch.cat(parts, dim=-1)
-                state = self.group_synapses[expert](pre_syn)
-                prev_trace = flat_trace[token_idx, start:end, :]
+                state = synapse_module(pre_syn)
+                prev_trace = flat_trace[token_idx, start:end, -mem_len:]
                 new_trace = torch.cat(
                     [prev_trace[:, :, 1:], state.unsqueeze(-1)], dim=-1)
-                group_active = self.group_trace_processors[expert](
+                group_active = trace_module(
                     new_trace.unsqueeze(1)).squeeze(1)
-                flat_trace[token_idx, start:end, :] = new_trace
-                flat_active[token_idx, start:end] = group_active
+                flat_trace[token_idx, start:end, -mem_len:] = new_trace
+                flat_active[token_idx, start:end] = group_active * gate_scale
 
         self._update_moe_aux_loss(raw_scores[:, :, shared:])
         self._update_region_diversity_loss(pass_masks)
+        self._update_diff_cell_aux_loss()
         activated = flat_active.view(B, T, self.d_model)
         state_trace = flat_trace.view(B, T, self.d_model, self.memory_length)
         if self.cell_sparsity_rescale:
@@ -735,6 +874,12 @@ class CTMForCausalLM(nn.Module):
         self.config = config
         self.model = CTMModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.reflex_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.reflex_adapter = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2, bias=False),
+            nn.SiLU(),
+            nn.Linear(config.hidden_size // 2, config.hidden_size, bias=False),
+        )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
@@ -775,6 +920,67 @@ class CTMForCausalLM(nn.Module):
             if horizon > 0 and horizon not in horizons:
                 horizons.append(horizon)
         return horizons
+
+    def _fast_output_ticks(self):
+        ticks = _parse_int_list(getattr(self.config, 'fast_output_ticks', '1,4'))
+        return [tick for tick in ticks if tick > 0]
+
+    def _reflex_logits(self, input_ids):
+        h = self.model.embed_tokens(input_ids)
+        h = h + self.reflex_adapter(h)
+        return self.lm_head(self.reflex_norm(h))
+
+    @staticmethod
+    def _lm_loss_from_logits(logits, labels):
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        return F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1), ignore_index=-100)
+
+    @staticmethod
+    def _distill_loss(student_logits, teacher_logits, labels):
+        if labels.size(1) <= 1:
+            return student_logits.new_zeros(())
+        student = student_logits[..., :-1, :].float()
+        teacher = teacher_logits[..., :-1, :].detach().float()
+        mask = labels[..., 1:] != -100
+        if not mask.any():
+            return student_logits.new_zeros(())
+        log_p = F.log_softmax(student, dim=-1)
+        q = F.softmax(teacher, dim=-1)
+        kl = F.kl_div(log_p, q, reduction='none').sum(dim=-1)
+        return (kl * mask).sum() / mask.sum().clamp(min=1)
+
+    def _fast_slow_output_loss(self, input_ids, labels, tick_outs, final_logits):
+        mode = getattr(self.config, 'fast_output_mode', 'none')
+        if mode == 'none':
+            return final_logits.new_zeros(())
+        aux = final_logits.new_zeros(())
+        distill_weight = float(getattr(self.config, 'fast_output_distill_weight', 0.0))
+        fast_weight = float(getattr(self.config, 'fast_output_weight', 0.0))
+        habit_weight = float(getattr(self.config, 'habit_output_weight', 0.0))
+        if fast_weight > 0:
+            reflex_logits = self._reflex_logits(input_ids)
+            aux = aux + fast_weight * self._lm_loss_from_logits(reflex_logits, labels)
+            if distill_weight > 0:
+                aux = aux + fast_weight * distill_weight * self._distill_loss(
+                    reflex_logits, final_logits, labels)
+        if habit_weight > 0 and tick_outs is not None:
+            num_ticks = tick_outs.size(-1)
+            tick_losses = []
+            distill_losses = []
+            for tick in self._fast_output_ticks():
+                idx = min(max(tick - 1, 0), num_ticks - 1)
+                logits_t = self.lm_head(tick_outs[..., idx])
+                tick_losses.append(self._lm_loss_from_logits(logits_t, labels))
+                if distill_weight > 0:
+                    distill_losses.append(self._distill_loss(logits_t, final_logits, labels))
+            if tick_losses:
+                aux = aux + habit_weight * torch.stack(tick_losses).mean()
+            if distill_losses:
+                aux = aux + habit_weight * distill_weight * torch.stack(distill_losses).mean()
+        return aux
 
     @staticmethod
     def _per_sample_lm_loss(logits, labels, horizon):
@@ -874,11 +1080,7 @@ class CTMForCausalLM(nn.Module):
         num_ticks = tick_outs.size(-1)
 
         final_logits = self.lm_head(h)
-        shift_logits = final_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        final_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1), ignore_index=-100)
+        final_loss = self._lm_loss_from_logits(final_logits, labels)
 
         losses = []
         next_losses = []
@@ -916,7 +1118,11 @@ class CTMForCausalLM(nn.Module):
             margin = float(self.config.tick_improve_margin)
             improve_loss = F.relu(next_losses[:, 1:] - next_losses[:, :-1] + margin).mean()
             tick_loss = tick_loss + self.config.tick_improve_weight * improve_loss
-        loss = 0.5 * final_loss + 0.5 * tick_loss
+        slow_weight = float(getattr(self.config, 'slow_output_weight', 0.0))
+        loss = (0.5 + slow_weight) * final_loss + 0.5 * tick_loss
+        fast_slow_aux = self._fast_slow_output_loss(
+            input_ids, labels, tick_outs, final_logits)
+        loss = loss + fast_slow_aux
         moe_aux_loss = self._moe_aux_loss()
         if moe_aux_loss is not None:
             loss = loss + moe_aux_loss

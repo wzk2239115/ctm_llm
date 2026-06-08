@@ -23,6 +23,7 @@ OVERNIGHT_STAGES = (
     "og07",
     "og08",
     "og09",
+    "og10",
     "all",
 )
 OVERNIGHT_PREFIXES = tuple(f"{stage}_" for stage in OVERNIGHT_STAGES if stage != "all")
@@ -497,6 +498,122 @@ def build_plan(stage, plan_size="full"):
                 max_steps=3500,
                 batch_size=bs_for(num_experts * expert_size, halt=False),
             )
+
+    if stage in ("og10", "all"):
+        # Real implementation runs: learned differentiated expert width/memory
+        # and true fast/anytime output losses are enabled here.
+        diff_common = dict(
+            diff_cell_mode="learned",
+            diff_cell_temperature=0.7,
+            diff_cell_capacity_weight=2e-3,
+            diff_cell_memory_weight=1e-3,
+            diff_cell_diversity_weight=1e-3,
+        )
+        for dtag, num_experts, expert_size, widths, memories, memory_length, steps in [
+            ("d512", 16, 32, "8,16,32", "4,8", 8, 4000),
+            ("d1024", 16, 64, "16,32,64", "4,8,16", 16, 4000),
+            ("d1536", 24, 64, "16,32,64", "4,8,16", 16, 3500),
+        ]:
+            for passes, shared, topk in [(3, 1, 1), (4, 1, 1), (4, 1, 2)]:
+                regional(
+                    plan,
+                    f"og10_diffcell_{dtag}_p{passes}_sh{shared}_top{topk}",
+                    "Real differentiated cells: learned expert width and memory window with true sparse execution.",
+                    num_experts=num_experts,
+                    expert_size=expert_size,
+                    activation_passes=passes,
+                    shared_experts=shared,
+                    topk_experts=topk,
+                    memory_length=memory_length,
+                    diff_cell_widths=widths,
+                    diff_cell_memory_lengths=memories,
+                    max_steps=steps,
+                    batch_size=bs_for(num_experts * expert_size),
+                    **diff_common,
+                )
+
+        for tag, mode, fast_w, habit_w, slow_w, ticks, distill in [
+            ("reflex_only", "reflex", 0.20, 0.0, 0.0, "1", 0.05),
+            ("anytime_light", "anytime", 0.10, 0.10, 0.0, "1,4", 0.05),
+            ("anytime_balanced", "anytime", 0.15, 0.20, 0.10, "1,4,8", 0.10),
+            ("anytime_slow_compile", "anytime", 0.20, 0.25, 0.15, "1,4,8,12", 0.15),
+        ]:
+            regional(
+                plan,
+                f"og10_fastslow_d512_{tag}",
+                "Real fast/slow output: resident reflex head and anytime tick-head supervision.",
+                num_experts=16,
+                expert_size=32,
+                activation_passes=4,
+                shared_experts=1,
+                topk_experts=1,
+                iterations=12 if "slow" in tag else 8,
+                fast_output_mode=mode,
+                fast_output_weight=fast_w,
+                habit_output_weight=habit_w,
+                slow_output_weight=slow_w,
+                fast_output_ticks=ticks,
+                fast_output_distill_weight=distill,
+                mtp_mode="mtp_1_2_4",
+                mtp_horizons="1,2,4",
+                max_steps=4000,
+                batch_size=8,
+            )
+            regional(
+                plan,
+                f"og10_fastslow_d1024_{tag}",
+                "Real fast/slow output on larger sparse CTM.",
+                num_experts=16,
+                expert_size=64,
+                activation_passes=4,
+                shared_experts=1,
+                topk_experts=1,
+                iterations=12 if "slow" in tag else 8,
+                fast_output_mode=mode,
+                fast_output_weight=fast_w,
+                habit_output_weight=habit_w,
+                slow_output_weight=slow_w,
+                fast_output_ticks=ticks,
+                fast_output_distill_weight=distill,
+                mtp_mode="mtp_1_2_4",
+                mtp_horizons="1,2,4",
+                max_steps=4000,
+                batch_size=6,
+            )
+
+        for dtag, num_experts, expert_size, widths, memories, memory_length in [
+            ("d512", 16, 32, "8,16,32", "4,8", 8),
+            ("d1024", 16, 64, "16,32,64", "4,8,16", 16),
+        ]:
+            for tag, fast_w, habit_w, distill in [
+                ("compile_light", 0.10, 0.10, 0.05),
+                ("compile_strong", 0.20, 0.25, 0.15),
+            ]:
+                regional(
+                    plan,
+                    f"og10_diff_fastslow_{dtag}_{tag}",
+                    "Combined real differentiated cells plus fast-to-slow skill compilation loss.",
+                    num_experts=num_experts,
+                    expert_size=expert_size,
+                    activation_passes=4,
+                    shared_experts=1,
+                    topk_experts=1,
+                    iterations=12,
+                    memory_length=memory_length,
+                    diff_cell_widths=widths,
+                    diff_cell_memory_lengths=memories,
+                    fast_output_mode="anytime",
+                    fast_output_weight=fast_w,
+                    habit_output_weight=habit_w,
+                    slow_output_weight=0.10,
+                    fast_output_ticks="1,4,8,12",
+                    fast_output_distill_weight=distill,
+                    mtp_mode="mtp_1_2_4",
+                    mtp_horizons="1,2,4",
+                    max_steps=4500,
+                    batch_size=8 if dtag == "d512" else 6,
+                    **diff_common,
+                )
 
     return base.validate_plan(plan)
 
