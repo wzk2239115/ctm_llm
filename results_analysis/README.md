@@ -1,11 +1,13 @@
 # CTM-LLM Experiment Results Analysis
 
 This folder records the first full 71-experiment CTM-LLM sweep, the follow-up
-49-experiment sparsity sweep, and the 32-experiment MoE sparsity sweep.
+49-experiment sparsity sweep, the 32-experiment MoE sparsity sweep, and the
+82-experiment regional multi-pass MoE sweep.
 
 Source summary: `summary.csv` exported from `runs/metrics`.
 Sparsity source summary: `sparsity_summary.csv` exported from `runs/metrics`.
 MoE sparsity source summary: `moe_sparsity_summary.csv` exported from `runs/metrics`.
+Regional MoE source summary: `regional_moe_summary.csv` exported from `runs/metrics`.
 
 Filtering rule:
 - Keep only formal experiment names matching `s00_` to `s05_`.
@@ -47,6 +49,23 @@ MoE sparsity experiment count:
 | moe06 | 5 | warmup and expert dropout |
 | moe07 | 4 | sparse routing crossed with ELF/MTP labels |
 
+Regional multi-pass MoE experiment count:
+
+| Stage | Count | Topic |
+| --- | ---: | --- |
+| rg00 | 3 | dense, single-pass routed, and regional smoke checks |
+| rg01 | 10 | regional activation pass count and routed top-k |
+| rg02 | 8 | shared/core regions versus routed-only regions |
+| rg03 | 8 | load-balance and inter-pass diversity regularization |
+| rg04 | 10 | CTM tick count crossed with regional pass count |
+| rg05 | 4 | 2000-step first confirmation runs |
+| rg06 | 8 | expert granularity and region size |
+| rg07 | 7 | d_model/base-size sweep |
+| rg08 | 6 | routing warmup and expert dropout |
+| rg09 | 6 | tick loss and halt pressure |
+| rg10 | 5 | ELF/MTP crossed with regional routing |
+| rg11 | 7 | 2000-step broad confirmation runs |
+
 ## High-Level Findings
 
 1. Transformer is still the strongest baseline on loss and cost.
@@ -82,6 +101,9 @@ MoE sparsity experiment count:
 11. The strongest MoE ideas are load balance, shared experts, and sparse warmup.
    `moe02_shared2_routed4_e16_s64` reaches loss `5.4506`, and `moe06_warmup1000_drop0p05_e16_s64_k2` reaches loss `5.4509`.
 
+12. Regional multi-pass routing is the strongest CTM direction so far.
+   `rg11_confirm_d1024_p4_shared1_top1` reaches loss `4.8437` with active fraction `0.125`. `rg11_confirm_d512_p4_shared1_top1` reaches loss `4.9395` at `4418 tok/s` and `26.0 GB`, making it the best quality/cost regional candidate.
+
 ## Recommended Next Direction
 
 Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted sweeps around:
@@ -91,6 +113,7 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - ELF short horizon with a stronger multi-token loss;
 - true sparse cell execution that avoids inactive cell projections, trace storage, and repeated full-width state work;
 - MoE-style grouped sparse execution with load balance, shared experts, and warmup;
+- regional p4/shared1/top1 as the main CTM branch, especially d512 and d1024 confirmations;
 - direct matched Transformer controls at equal wall-clock budget and equal memory budget.
 - 2000/4000-step confirmation of d512 and d768 tick1/tick2 sparse variants.
 
@@ -109,3 +132,4 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - `sp04_tick_sparse.md`
 - `sp05_best_sparse_confirm.md`
 - `moe_sparsity.md`
+- `regional_moe.md`
