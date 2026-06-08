@@ -47,6 +47,21 @@ class CTMBlock(nn.Module):
         self.cell_sparsity_mode = config.cell_sparsity_mode
         self.cell_topk = min(max(1, int(config.cell_topk)), config.d_model)
         self.cell_sparsity_rescale = bool(config.cell_sparsity_rescale)
+        self.moe_routing_mode = getattr(config, 'moe_routing_mode', 'none')
+        self.moe_num_experts = max(1, int(getattr(config, 'moe_num_experts', 1)))
+        self.moe_topk_experts = max(1, int(getattr(config, 'moe_topk_experts', 1)))
+        self.moe_shared_experts = max(0, int(getattr(config, 'moe_shared_experts', 0)))
+        self.moe_expert_size = int(getattr(config, 'moe_expert_size', 0))
+        if self.moe_expert_size <= 0 and self.moe_num_experts > 0:
+            self.moe_expert_size = config.d_model // self.moe_num_experts
+        self.moe_expert_dropout = float(getattr(config, 'moe_expert_dropout', 0.0))
+        self.moe_load_balance_weight = float(
+            getattr(config, 'moe_load_balance_weight', 0.0))
+        self.moe_router_entropy_weight = float(
+            getattr(config, 'moe_router_entropy_weight', 0.0))
+        self.moe_router_z_loss_weight = float(
+            getattr(config, 'moe_router_z_loss_weight', 0.0))
+        self.moe_aux_loss = None
 
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -170,6 +185,10 @@ class CTMBlock(nn.Module):
     def _apply_cell_sparsity(self, activated):
         if self.cell_sparsity_mode == 'none' or self.cell_topk >= self.d_model:
             return activated
+        if self.moe_routing_mode != 'none' and self.moe_num_experts > 1:
+            routed = self._apply_moe_group_sparsity(activated)
+            if routed is not None:
+                return routed
         if self.cell_sparsity_mode != 'topk':
             raise ValueError(f"Unknown cell_sparsity_mode: {self.cell_sparsity_mode}")
 
@@ -180,11 +199,86 @@ class CTMBlock(nn.Module):
             mask = mask * (self.d_model / self.cell_topk)
         return activated * mask
 
+    def _apply_moe_group_sparsity(self, activated):
+        expert_size = self.moe_expert_size
+        num_experts = self.moe_num_experts
+        if expert_size <= 0 or num_experts <= 0:
+            return None
+        if expert_size * num_experts != self.d_model:
+            return None
+
+        B, T, _ = activated.shape
+        x = activated.view(B, T, num_experts, expert_size)
+        raw_scores = x.abs().mean(dim=-1)
+        scores = raw_scores.detach()
+
+        shared = min(self.moe_shared_experts, num_experts)
+        routed_count = max(num_experts - shared, 1)
+        topk = min(self.moe_topk_experts, routed_count)
+        routed_scores = scores[:, :, shared:]
+        routed_raw_scores = raw_scores[:, :, shared:]
+        mode = self.moe_routing_mode
+
+        if mode == 'hash':
+            pos = torch.arange(T, device=activated.device).view(1, T, 1)
+            offsets = torch.arange(topk, device=activated.device).view(1, 1, topk)
+            idx = (pos + offsets + self.layer_id) % routed_count
+            idx = idx.expand(B, -1, -1)
+        elif mode == 'expert_choice':
+            mean_scores = routed_scores.mean(dim=(0, 1), keepdim=True)
+            idx = torch.topk(mean_scores.expand(B, T, -1), topk, dim=-1).indices
+        else:
+            idx = torch.topk(routed_scores, topk, dim=-1).indices
+
+        expert_mask = torch.zeros_like(scores)
+        expert_mask[:, :, shared:].scatter_(-1, idx, 1.0)
+        if shared > 0:
+            expert_mask[:, :, :shared] = 1.0
+
+        if self.training and self.moe_expert_dropout > 0:
+            keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
+            if shared > 0:
+                keep[:, :, :shared] = True
+            expert_mask = expert_mask * keep.type_as(expert_mask)
+
+        active_cells = expert_mask.sum(dim=-1, keepdim=True).clamp(min=1) * expert_size
+        mask = expert_mask.unsqueeze(-1).expand_as(x).reshape_as(activated)
+        if self.cell_sparsity_rescale:
+            mask = mask * (self.d_model / active_cells)
+        self._update_moe_aux_loss(routed_raw_scores)
+        return activated * mask
+
+    def _update_moe_aux_loss(self, routed_scores):
+        if (
+            self.moe_load_balance_weight <= 0
+            and self.moe_router_entropy_weight <= 0
+            and self.moe_router_z_loss_weight <= 0
+        ):
+            return
+        if routed_scores.size(-1) <= 1:
+            return
+        probs = F.softmax(routed_scores.float(), dim=-1)
+        aux = routed_scores.new_zeros(())
+        if self.moe_load_balance_weight > 0:
+            load = probs.mean(dim=(0, 1))
+            target = torch.full_like(load, 1.0 / load.numel())
+            balance_loss = ((load - target) ** 2).mean() * load.numel()
+            aux = aux + self.moe_load_balance_weight * balance_loss
+        if self.moe_router_entropy_weight > 0:
+            entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(dim=-1).mean()
+            norm_entropy = entropy / math.log(probs.size(-1))
+            aux = aux - self.moe_router_entropy_weight * norm_entropy
+        if self.moe_router_z_loss_weight > 0:
+            z_loss = torch.logsumexp(routed_scores.float(), dim=-1).pow(2).mean()
+            aux = aux + self.moe_router_z_loss_weight * z_loss
+        self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
+
     def forward(self, x, pos_emb=None, past_kv=None, use_cache=False, track=False,
                 num_iters=None, return_all_ticks=False,
                 prev_activated=None, prev_trace=None):
         B, T, _ = x.shape
         device = x.device
+        self.moe_aux_loss = None
 
         normed = self.input_norm(x)
         kv = self.kv_proj(normed)
@@ -387,6 +481,15 @@ class CTMForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
+    def _moe_aux_loss(self):
+        aux = None
+        for layer in self.model.layers:
+            value = getattr(layer, 'moe_aux_loss', None)
+            if value is None:
+                continue
+            aux = value if aux is None else aux + value
+        return aux
+
     def _tick_horizon(self, tick, num_ticks):
         mode = self.config.elf_horizon_mode
         max_horizon = max(1, int(self.config.elf_max_horizon))
@@ -521,6 +624,9 @@ class CTMForCausalLM(nn.Module):
             improve_loss = F.relu(next_losses[:, 1:] - next_losses[:, :-1] + margin).mean()
             tick_loss = tick_loss + self.config.tick_improve_weight * improve_loss
         loss = 0.5 * final_loss + 0.5 * tick_loss
+        moe_aux_loss = self._moe_aux_loss()
+        if moe_aux_loss is not None:
+            loss = loss + moe_aux_loss
 
         return loss, losses, certainties
 

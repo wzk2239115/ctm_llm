@@ -149,6 +149,15 @@ def active_cell_fraction(args):
     return min(max(args.cell_topk, 1), args.d_model) / max(args.d_model, 1)
 
 
+def current_moe_aux_loss(model):
+    if not hasattr(model, '_moe_aux_loss'):
+        return 0.0
+    value = model._moe_aux_loss()
+    if value is None:
+        return 0.0
+    return float(value.detach().float().item())
+
+
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
                 tb_writer, swanlab, start_step=0, rank=0):
     model.train()
@@ -218,6 +227,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             global_eta = speed * (total_global - global_done)
             pct = global_done / total_global * 100
             peak_mem_mb = cuda_memory_mb(args.device)
+            moe_aux_loss = current_moe_aux_loss(raw_model)
 
             Logger(
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
@@ -236,6 +246,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'tick_count': tick_count,
                 'effective_tick': effective_tick_mean,
                 'active_cell_fraction': active_cell_fraction(args),
+                'moe_aux_loss': moe_aux_loss,
                 'tokens_per_sec': tokens_per_sec,
                 'steps_per_sec': steps_per_sec,
                 'peak_memory_mb': peak_mem_mb,
@@ -262,6 +273,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'tick_count': tick_count,
                     'effective_tick': effective_tick_mean,
                     'active_cell_fraction': active_cell_fraction(args),
+                    'moe_aux_loss': moe_aux_loss,
                     'losses_per_tick': json.dumps(losses_tick_mean),
                     'certainties_per_tick': json.dumps(certainties_tick_mean),
                     'tokens': total_tokens,
@@ -290,6 +302,22 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'cell_sparsity_mode': args.cell_sparsity_mode,
                     'cell_topk': args.cell_topk,
                     'cell_sparsity_rescale': int(args.cell_sparsity_rescale),
+                    'moe_routing_mode': args.moe_routing_mode,
+                    'moe_num_experts': args.moe_num_experts,
+                    'moe_topk_experts': args.moe_topk_experts,
+                    'moe_shared_experts': args.moe_shared_experts,
+                    'moe_expert_size': args.moe_expert_size,
+                    'moe_load_balance_weight': args.moe_load_balance_weight,
+                    'moe_router_entropy_weight': args.moe_router_entropy_weight,
+                    'moe_router_z_loss_weight': args.moe_router_z_loss_weight,
+                    'moe_capacity_factor': args.moe_capacity_factor,
+                    'moe_drop_tokens': args.moe_drop_tokens,
+                    'moe_dispatch_mode': args.moe_dispatch_mode,
+                    'moe_topk_warmup_steps': args.moe_topk_warmup_steps,
+                    'moe_aux_loss_free_bias': args.moe_aux_loss_free_bias,
+                    'moe_expert_dropout': args.moe_expert_dropout,
+                    'moe_mtp_mode': args.moe_mtp_mode,
+                    'moe_mtp_horizons': args.moe_mtp_horizons,
                     'self_cond': args.self_cond,
                     'cross_layer_state': args.cross_layer_state,
                     'max_seq_len': args.max_seq_len,
@@ -372,6 +400,27 @@ if __name__ == '__main__':
                         choices=['none', 'topk'])
     parser.add_argument('--cell_topk', type=int, default=512)
     parser.add_argument('--cell_sparsity_rescale', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--moe_routing_mode', type=str, default='none',
+                        choices=[
+                            'none', 'topk', 'top1', 'top2', 'top4',
+                            'expert_choice', 'hash', 'shared_topk', 'topk_warmup'
+                        ])
+    parser.add_argument('--moe_num_experts', type=int, default=1)
+    parser.add_argument('--moe_topk_experts', type=int, default=1)
+    parser.add_argument('--moe_shared_experts', type=int, default=0)
+    parser.add_argument('--moe_expert_size', type=int, default=0)
+    parser.add_argument('--moe_load_balance_weight', type=float, default=0.0)
+    parser.add_argument('--moe_router_entropy_weight', type=float, default=0.0)
+    parser.add_argument('--moe_router_z_loss_weight', type=float, default=0.0)
+    parser.add_argument('--moe_capacity_factor', type=float, default=1.0)
+    parser.add_argument('--moe_drop_tokens', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--moe_dispatch_mode', type=str, default='dense_mask',
+                        choices=['dense_mask', 'dropless', 'capacity_drop', 'block_sparse'])
+    parser.add_argument('--moe_topk_warmup_steps', type=int, default=0)
+    parser.add_argument('--moe_aux_loss_free_bias', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--moe_expert_dropout', type=float, default=0.0)
+    parser.add_argument('--moe_mtp_mode', type=str, default='none')
+    parser.add_argument('--moe_mtp_horizons', type=str, default='')
     parser.add_argument('--ttt_layer', type=int, default=0, choices=[0, 1])
     parser.add_argument('--ttt_hidden_mult', type=int, default=2)
     parser.add_argument('--ttt_gate_init', type=float, default=-2.0)
@@ -447,6 +496,22 @@ if __name__ == '__main__':
         cell_sparsity_mode=args.cell_sparsity_mode,
         cell_topk=args.cell_topk,
         cell_sparsity_rescale=bool(args.cell_sparsity_rescale),
+        moe_routing_mode=args.moe_routing_mode,
+        moe_num_experts=args.moe_num_experts,
+        moe_topk_experts=args.moe_topk_experts,
+        moe_shared_experts=args.moe_shared_experts,
+        moe_expert_size=args.moe_expert_size,
+        moe_load_balance_weight=args.moe_load_balance_weight,
+        moe_router_entropy_weight=args.moe_router_entropy_weight,
+        moe_router_z_loss_weight=args.moe_router_z_loss_weight,
+        moe_capacity_factor=args.moe_capacity_factor,
+        moe_drop_tokens=bool(args.moe_drop_tokens),
+        moe_dispatch_mode=args.moe_dispatch_mode,
+        moe_topk_warmup_steps=args.moe_topk_warmup_steps,
+        moe_aux_loss_free_bias=bool(args.moe_aux_loss_free_bias),
+        moe_expert_dropout=args.moe_expert_dropout,
+        moe_mtp_mode=args.moe_mtp_mode,
+        moe_mtp_horizons=args.moe_mtp_horizons,
         ttt_layer=bool(args.ttt_layer),
         ttt_hidden_mult=args.ttt_hidden_mult,
         ttt_gate_init=args.ttt_gate_init,
