@@ -42,7 +42,7 @@ def bs_for(d_model, *, halt=False, long=False):
     return batch
 
 
-def regional(plan, name, question, *, num_experts, expert_size, max_steps=1500,
+def regional(plan, name, question, *, num_experts, expert_size, max_steps=3500,
              iterations=2, activation_passes=4, topk_experts=1,
              shared_experts=1, halt_mode="none", halt_threshold=0.65,
              mtp_mode="none", mtp_horizons="", **kwargs):
@@ -75,7 +75,7 @@ def regional(plan, name, question, *, num_experts, expert_size, max_steps=1500,
 
 
 def single_moe(plan, name, question, *, num_experts, expert_size, topk_experts,
-               routing="topk", max_steps=1500, **kwargs):
+               routing="topk", max_steps=3500, **kwargs):
     d_model = num_experts * expert_size
     base.add_moe_experiment(
         plan,
@@ -101,10 +101,10 @@ def build_plan(stage, plan_size="full"):
 
     if stage in ("og00", "all"):
         anchors = [
-            ("dense_d512_tick2", 512, 512, 2, 1000),
-            ("dense_d1024_tick2", 1024, 1024, 2, 1000),
-            ("topk_d1024_k128", 1024, 128, 2, 1200),
-            ("topk_d1024_k256", 1024, 256, 2, 1200),
+            ("dense_d512_tick2", 512, 512, 2, 2500),
+            ("dense_d1024_tick2", 1024, 1024, 2, 2500),
+            ("topk_d1024_k128", 1024, 128, 2, 6000),
+            ("topk_d1024_k256", 1024, 256, 2, 6000),
         ]
         for tag, d_model, topk, iterations, steps in anchors:
             base.add_sparse_experiment(
@@ -123,14 +123,14 @@ def build_plan(stage, plan_size="full"):
             plan, "og00_anchor_regional_d1024_p4_shared1_top1",
             "Implementation-validation regional winner anchor.",
             num_experts=16, expert_size=64, activation_passes=4,
-            shared_experts=1, topk_experts=1, max_steps=1500)
+            shared_experts=1, topk_experts=1, max_steps=3500)
         regional(
             plan, "og00_anchor_regional_d512_p4_halt0p30_mtp124",
             "Composite dynamic tick plus MTP anchor.",
             num_experts=16, expert_size=32, activation_passes=4,
             shared_experts=1, topk_experts=1, iterations=4,
             halt_mode="threshold", halt_threshold=0.30,
-            mtp_mode="mtp_1_2_4", mtp_horizons="1,2,4", max_steps=1500)
+            mtp_mode="mtp_1_2_4", mtp_horizons="1,2,4", max_steps=3500)
 
     if stage in ("og01", "all"):
         # Capacity-gradient proxy: same or larger d_model, different physical
@@ -152,7 +152,7 @@ def build_plan(stage, plan_size="full"):
                 "Capacity-gradient proxy: compare expert granularity and active width.",
                 num_experts=num_experts, expert_size=expert_size,
                 activation_passes=passes, shared_experts=shared,
-                topk_experts=topk, max_steps=1500)
+                topk_experts=topk, max_steps=3500)
 
     if stage in ("og02", "all"):
         # Variable active compute proxy: sweep active expert count from tiny to
@@ -170,7 +170,7 @@ def build_plan(stage, plan_size="full"):
                     "Variable Top-K active compute proxy at fixed capacity.",
                     num_experts=num_experts, expert_size=expert_size,
                     shared_experts=shared, topk_experts=topk,
-                    activation_passes=passes, max_steps=1200)
+                    activation_passes=passes, max_steps=3000)
 
     if stage in ("og03", "all"):
         for dtag, num_experts, expert_size in [("d512", 16, 32), ("d1024", 16, 64)]:
@@ -181,7 +181,7 @@ def build_plan(stage, plan_size="full"):
                     "No-halt control for dynamic tick budget.",
                     num_experts=num_experts, expert_size=expert_size,
                     activation_passes=4, iterations=iterations,
-                    max_steps=1200)
+                    max_steps=3000)
                 for threshold in [0.15, 0.30, 0.45, 0.60]:
                     regional(
                         plan,
@@ -191,7 +191,7 @@ def build_plan(stage, plan_size="full"):
                         activation_passes=4, iterations=iterations,
                         halt_mode="threshold", halt_threshold=threshold,
                         tick_compute_weight=2e-3 if iterations >= 6 else 1e-3,
-                        max_steps=1200)
+                        max_steps=3000)
 
     if stage in ("og04", "all"):
         regs = [
@@ -217,7 +217,7 @@ def build_plan(stage, plan_size="full"):
                 moe_router_entropy_weight=entropy,
                 moe_router_z_loss_weight=z_loss,
                 moe_expert_dropout=dropout,
-                max_steps=1500)
+                max_steps=3500)
         for routing in ["topk", "top1", "top2", "expert_choice", "hash", "topk_warmup"]:
             single_moe(
                 plan,
@@ -226,7 +226,7 @@ def build_plan(stage, plan_size="full"):
                 num_experts=16, expert_size=64, topk_experts=2,
                 routing=routing,
                 moe_topk_warmup_steps=500 if routing == "topk_warmup" else 0,
-                max_steps=1200)
+                max_steps=3000)
 
     if stage in ("og05", "all"):
         dispatches = [
@@ -248,7 +248,7 @@ def build_plan(stage, plan_size="full"):
                     moe_dispatch_mode=dispatch,
                     moe_capacity_factor=capacity,
                     moe_drop_tokens=drop,
-                    max_steps=1200)
+                    max_steps=3000)
 
     if stage in ("og06", "all"):
         mtp_grid = [
@@ -274,20 +274,20 @@ def build_plan(stage, plan_size="full"):
                     mtp_mode=mtp, mtp_horizons=horizons,
                     elf_horizon_mode=elf, elf_max_horizon=elf_max,
                     tick_improve_weight=improve,
-                    max_steps=1500)
+                    max_steps=3500)
 
     if stage in ("og07", "all"):
         confirms = [
-            ("d512_p4_plain", 16, 32, 4, "none", 0.65, "none", "", 5000),
-            ("d512_p4_halt030", 16, 32, 4, "threshold", 0.30, "none", "", 5000),
-            ("d512_p4_mtp124", 16, 32, 4, "none", 0.65, "mtp_1_2_4", "1,2,4", 5000),
-            ("d512_p4_halt030_mtp124", 16, 32, 4, "threshold", 0.30, "mtp_1_2_4", "1,2,4", 5000),
-            ("d1024_p4_plain", 16, 64, 4, "none", 0.65, "none", "", 5000),
-            ("d1024_p4_mtp124", 16, 64, 4, "none", 0.65, "mtp_1_2_4", "1,2,4", 5000),
-            ("d1024_p4_halt030", 16, 64, 4, "threshold", 0.30, "none", "", 5000),
-            ("d1536_p4_plain", 24, 64, 4, "none", 0.65, "none", "", 4000),
-            ("d1536_p4_mtp124", 24, 64, 4, "none", 0.65, "mtp_1_2_4", "1,2,4", 4000),
-            ("d2048_p3_plain", 32, 64, 3, "none", 0.65, "none", "", 3000),
+            ("d512_p4_plain", 16, 32, 4, "none", 0.65, "none", "", 9000),
+            ("d512_p4_halt030", 16, 32, 4, "threshold", 0.30, "none", "", 9000),
+            ("d512_p4_mtp124", 16, 32, 4, "none", 0.65, "mtp_1_2_4", "1,2,4", 9000),
+            ("d512_p4_halt030_mtp124", 16, 32, 4, "threshold", 0.30, "mtp_1_2_4", "1,2,4", 9000),
+            ("d1024_p4_plain", 16, 64, 4, "none", 0.65, "none", "", 9000),
+            ("d1024_p4_mtp124", 16, 64, 4, "none", 0.65, "mtp_1_2_4", "1,2,4", 9000),
+            ("d1024_p4_halt030", 16, 64, 4, "threshold", 0.30, "none", "", 9000),
+            ("d1536_p4_plain", 24, 64, 4, "none", 0.65, "none", "", 7500),
+            ("d1536_p4_mtp124", 24, 64, 4, "none", 0.65, "mtp_1_2_4", "1,2,4", 7500),
+            ("d2048_p3_plain", 32, 64, 3, "none", 0.65, "none", "", 6000),
         ]
         for tag, num_experts, expert_size, passes, halt, threshold, mtp, horizons, steps in confirms:
             regional(
