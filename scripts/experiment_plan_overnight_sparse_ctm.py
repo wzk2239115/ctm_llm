@@ -22,6 +22,7 @@ OVERNIGHT_STAGES = (
     "og06",
     "og07",
     "og08",
+    "og09",
     "all",
 )
 OVERNIGHT_PREFIXES = tuple(f"{stage}_" for stage in OVERNIGHT_STAGES if stage != "all")
@@ -380,6 +381,121 @@ def build_plan(stage, plan_size="full"):
                 tick_improve_weight=0.03,
                 max_steps=3500,
                 batch_size=8 if dtag == "d512" else 6,
+            )
+
+    if stage in ("og09", "all"):
+        # Differentiated Fast-Slow / Developmental CTM proxy. True learned cell
+        # growth, lineage splitting, asynchronous clocks, resident reflex cells,
+        # and slow-to-fast head distillation require model changes. These runs
+        # use existing knobs to probe memory scale differentiation, anytime
+        # latency targets, reflex/habit/deliberative compute, and counterfactual
+        # high-compute recruitment.
+        for d_model, topk, ticks, memory_length, tag in [
+            (256, 256, 1, 4, "reflex_d256_tick1_mem4"),
+            (512, 128, 1, 4, "reflex_d512_k128_tick1_mem4"),
+            (512, 256, 2, 4, "reflex_d512_k256_tick2_mem4"),
+            (512, 512, 2, 8, "fast_dense_d512_tick2_mem8"),
+        ]:
+            base.add_sparse_experiment(
+                plan,
+                f"og09_fastpath_{tag}",
+                "Reflex-path proxy: very low latency with short memory and small active width.",
+                d_model,
+                topk=topk,
+                iterations=ticks,
+                memory_length=memory_length,
+                synapse_depth=2,
+                memory_hidden_dims=2,
+                max_steps=3500,
+                batch_size=12,
+            )
+
+        for dtag, num_experts, expert_size in [
+            ("d512", 16, 32),
+            ("d1024", 16, 64),
+        ]:
+            for memory_length, ticks, path in [
+                (4, 2, "reflex"),
+                (8, 4, "habit"),
+                (16, 8, "delib"),
+                (32, 12, "slow"),
+                (64, 16, "very_slow"),
+            ]:
+                regional(
+                    plan,
+                    f"og09_memory_{dtag}_{path}_tick{ticks}_mem{memory_length}",
+                    "Memory-timescale differentiation proxy across fast, habitual, and deliberative paths.",
+                    num_experts=num_experts,
+                    expert_size=expert_size,
+                    activation_passes=2 if ticks <= 4 else 4,
+                    shared_experts=0 if ticks <= 2 else 1,
+                    topk_experts=1,
+                    iterations=ticks,
+                    memory_length=memory_length,
+                    tick_compute_weight=3e-3 if ticks >= 12 else 1e-3,
+                    max_steps=3000,
+                    batch_size=8 if dtag == "d512" else 6,
+                )
+
+        anytime = [
+            ("early_tick1", 1, "none", "", "none", 4, 0.0),
+            ("habit_tick4_elf_h2", 4, "none", "", "linear", 2, 0.01),
+            ("habit_tick4_mtp12", 4, "mtp_1_2", "1,2", "none", 4, 0.0),
+            ("delib_tick8_mtp124", 8, "mtp_1_2_4", "1,2,4", "none", 4, 0.03),
+            ("delib_tick12_mtp1248", 12, "mtp_1_2_4_8", "1,2,4,8", "none", 8, 0.03),
+            ("delib_tick16_mtp1248", 16, "mtp_1_2_4_8", "1,2,4,8", "none", 8, 0.05),
+        ]
+        for dtag, num_experts, expert_size in [
+            ("d512", 16, 32),
+            ("d1024", 16, 64),
+        ]:
+            for tag, ticks, mtp, horizons, elf, elf_max, improve in anytime:
+                regional(
+                    plan,
+                    f"og09_anytime_{dtag}_{tag}",
+                    "Anytime-output proxy: supervise usable early ticks and slower corrective ticks.",
+                    num_experts=num_experts,
+                    expert_size=expert_size,
+                    activation_passes=4 if ticks >= 4 else 1,
+                    shared_experts=1 if ticks >= 4 else 0,
+                    topk_experts=1,
+                    iterations=ticks,
+                    mtp_mode=mtp,
+                    mtp_horizons=horizons,
+                    elf_horizon_mode=elf,
+                    elf_max_horizon=elf_max,
+                    tick_improve_weight=improve,
+                    tick_compute_weight=2e-3 if ticks >= 8 else 1e-3,
+                    max_steps=3500,
+                    batch_size=8 if dtag == "d512" else 6,
+                )
+
+        for tag, num_experts, expert_size, passes, shared, topk, ticks, diversity in [
+            ("surprise_low_compute_d512", 16, 32, 2, 0, 1, 4, 0.0),
+            ("surprise_recruit_d512", 16, 32, 4, 1, 2, 8, 1e-3),
+            ("counterfactual_d512", 16, 32, 5, 2, 2, 12, 3e-3),
+            ("surprise_low_compute_d1024", 16, 64, 2, 0, 1, 4, 0.0),
+            ("surprise_recruit_d1024", 16, 64, 4, 1, 2, 8, 1e-3),
+            ("counterfactual_d1024", 16, 64, 5, 2, 2, 12, 3e-3),
+            ("competing_thoughts_d1536", 24, 64, 5, 2, 2, 12, 3e-3),
+            ("competing_thoughts_d2048", 32, 64, 4, 2, 2, 12, 3e-3),
+        ]:
+            regional(
+                plan,
+                f"og09_recruit_{tag}",
+                "Surprise/counterfactual recruitment proxy: compare low compute to larger competing assemblies.",
+                num_experts=num_experts,
+                expert_size=expert_size,
+                activation_passes=passes,
+                shared_experts=shared,
+                topk_experts=topk,
+                iterations=ticks,
+                diversity=diversity,
+                mtp_mode="mtp_1_2_4",
+                mtp_horizons="1,2,4",
+                tick_improve_weight=0.03,
+                max_steps=3500,
+                batch_size=bs_for(num_experts * expert_size, halt=False),
             )
 
     return base.validate_plan(plan)
