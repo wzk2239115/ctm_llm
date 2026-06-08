@@ -1497,6 +1497,24 @@ def recommend_batches(args):
     print(f"wrote batch recommendations: {args.output}")
 
 
+def run_probe_and_parallel(args):
+    quick_output = args.quick_output
+    batch_profile = args.batch_profile
+
+    print(f"[probe-and-run] probing batches -> {quick_output}", flush=True)
+    args.output = quick_output
+    run_quick_probe(args)
+
+    print(f"[probe-and-run] recommending batches -> {batch_profile}", flush=True)
+    args.output = batch_profile
+    recommend_batches(args)
+
+    print(f"[probe-and-run] starting run-parallel with {batch_profile}", flush=True)
+    args.batch_profile = batch_profile
+    args.batch_tune = False
+    run_parallel(args)
+
+
 def latest_row_by_experiment(metrics_dir):
     by_name = {}
     for row in latest_rows(metrics_dir):
@@ -1741,6 +1759,36 @@ def parse_args():
                    help="Split bare single-node groups into GPU lanes; default 2 gives 16 two-GPU lanes for four 8-GPU nodes.")
     p.add_argument("--gpus_per_node", type=int, default=8)
     p.set_defaults(func=run_quick_probe)
+
+    p = sub.add_parser("probe-and-run", parents=[common])
+    p.add_argument("--startup_grace", type=float, default=60.0)
+    p.add_argument("--poll_interval", type=float, default=10.0)
+    p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
+    p.add_argument("--tune_steps", type=int, default=3)
+    p.add_argument("--tune_log_interval", type=int, default=1)
+    p.add_argument("--time_limit_min", type=float, default=15.0)
+    p.add_argument("--metrics_settle_seconds", type=float, default=45.0,
+                   help="Wait this long for metrics/failure files after a lane becomes idle.")
+    p.add_argument("--oom_backoff_ratio", type=float, default=0.67,
+                   help="After OOM/over_memory, only try remaining batches <= current_batch * ratio; set 1.0 to disable.")
+    p.add_argument("--refine_bracket_after_ok", action=argparse.BooleanOptionalAction, default=True,
+                   help="After a lower batch succeeds below an OOM/over_memory batch, try one skipped middle batch when memory looks safe.")
+    p.add_argument("--refine_memory_margin", type=float, default=0.97,
+                   help="Only run bracket refinement when linear memory estimate is below limit * margin.")
+    p.add_argument("--metrics_dir", default="runs/metrics")
+    p.add_argument("--quick_output", default="runs/metrics/impl_validation_batch_profile_quick.csv")
+    p.add_argument("--report_output", default="runs/metrics/impl_validation_quick_probe_report.csv")
+    p.add_argument("--batch_profile", default="runs/metrics/impl_validation_batch_profile.csv")
+    p.add_argument("--target_memory_gb", type=float, default=80.0)
+    p.add_argument("--memory_util", type=float, default=0.90)
+    p.add_argument("--fallback_batch_size", type=int, default=None,
+                   help="Batch size used for experiments not resolved before the time limit; default=min(batch_sizes).")
+    p.add_argument("--node_groups", nargs="*", default=None,
+                   help="Node groups for quick probe and run lanes; omitted means NODE_ADDRS from --config.")
+    p.add_argument("--gpus_per_lane", type=int, default=2,
+                   help="Split bare single-node groups into GPU lanes; default 2 gives 16 two-GPU lanes for four 8-GPU nodes.")
+    p.add_argument("--gpus_per_node", type=int, default=8)
+    p.set_defaults(func=run_probe_and_parallel)
 
     p = sub.add_parser("summarize")
     p.add_argument("--metrics_dir", default="runs/metrics")
