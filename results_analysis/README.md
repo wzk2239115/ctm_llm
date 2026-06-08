@@ -1,8 +1,10 @@
 # CTM-LLM Experiment Results Analysis
 
-This folder records the first full 71-experiment CTM-LLM sweep.
+This folder records the first full 71-experiment CTM-LLM sweep and the follow-up
+49-experiment sparsity sweep.
 
 Source summary: `summary.csv` exported from `runs/metrics`.
+Sparsity source summary: `sparsity_summary.csv` exported from `runs/metrics`.
 
 Filtering rule:
 - Keep only formal experiment names matching `s00_` to `s05_`.
@@ -19,6 +21,17 @@ Formal experiment count:
 | s03 | 14 | ELF and multi-token prediction variants |
 | s04 | 16 | cell count, cell width, and sparse top-k cells |
 | s05 | 11 | CTM ablations and promising base candidates |
+
+Sparsity experiment count:
+
+| Stage | Count | Topic |
+| --- | ---: | --- |
+| sp00 | 2 | sparse smoke checks |
+| sp01 | 10 | cell size/count dense vs top-k compass |
+| sp02 | 12 | top-k active ratio sweep |
+| sp03 | 12 | synapse/memory simplification under sparsity |
+| sp04 | 9 | tick count crossed with sparse cells |
+| sp05 | 4 | 2000-step sparse confirmation runs |
 
 ## High-Level Findings
 
@@ -40,6 +53,15 @@ Formal experiment count:
 6. The strongest CTM candidate is an ablation, not the default.
    `s05_synapse2_mh2` is the best CTM result: loss `5.3612`, throughput `2629 tok/s`, peak memory `41.6 GB`.
 
+7. The sparsity sweep finds a new CTM short-run frontier.
+   `sp05_confirm_d512_dense_sd2_mh2_tick2` reaches loss `4.9729`, throughput `4982 tok/s`, and peak memory `24.1 GB`.
+
+8. Current top-k sparsity preserves quality better than expected, but still does not save memory.
+   For example, `sp05_confirm_d512_topk256_sd2_mh2_tick2` reaches loss `5.0482` at active fraction `0.5`, but memory is `24.5 GB`, slightly above the dense d512 confirm.
+
+9. Tick1 sparse variants are the best cost frontier, but need longer confirmation.
+   `sp04_d512_topk256_tick1` reaches loss `5.2979`, throughput `7455 tok/s`, and peak memory `16.2 GB`.
+
 ## Recommended Next Direction
 
 Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted sweeps around:
@@ -49,6 +71,7 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - ELF short horizon with a stronger multi-token loss;
 - true sparse cell execution that avoids inactive cell projections, trace storage, and repeated full-width state work;
 - direct matched Transformer controls at equal wall-clock budget and equal memory budget.
+- 2000/4000-step confirmation of d512 and d768 tick1/tick2 sparse variants.
 
 ## Files
 
@@ -58,4 +81,9 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - `s03_elf.md`
 - `s04_cells_sparsity.md`
 - `s05_ablations.md`
-
+- `sp00_sparse_smoke.md`
+- `sp01_cell_size_count.md`
+- `sp02_topk_ratio.md`
+- `sp03_synapse_memory.md`
+- `sp04_tick_sparse.md`
+- `sp05_best_sparse_confirm.md`

@@ -1005,6 +1005,14 @@ def is_sparsity_experiment(name):
     return bool(name) and name.startswith(SPARSITY_PREFIXES)
 
 
+def is_final_metrics_row(row):
+    name = row.get("experiment_name", "")
+    metrics_file = row.get("metrics_file", "")
+    if not is_sparsity_experiment(name):
+        return False
+    return os.path.basename(metrics_file) == f"{name}.csv"
+
+
 def recommend_batches(args):
     rows = latest_rows(args.metrics_dir)
     probes = []
@@ -1164,7 +1172,7 @@ def export_final_plan(args):
 def summarize(args):
     rows = [
         row for row in latest_rows(args.metrics_dir)
-        if is_sparsity_experiment(row.get("experiment_name", ""))
+        if is_final_metrics_row(row)
     ]
     for row in rows:
         loss = parse_float(row, "loss")
