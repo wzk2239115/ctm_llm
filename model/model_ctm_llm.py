@@ -65,7 +65,13 @@ class CTMBlock(nn.Module):
             getattr(config, 'moe_router_entropy_weight', 0.0))
         self.moe_router_z_loss_weight = float(
             getattr(config, 'moe_router_z_loss_weight', 0.0))
+        self.moe_dispatch_mode = getattr(config, 'moe_dispatch_mode', 'dense_mask')
+        self.moe_capacity_factor = float(getattr(config, 'moe_capacity_factor', 1.0))
+        self.moe_drop_tokens = bool(getattr(config, 'moe_drop_tokens', False))
+        self.moe_aux_loss_free_bias = bool(
+            getattr(config, 'moe_aux_loss_free_bias', False))
         self.moe_aux_loss = None
+        self.last_executed_ticks = 0
 
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -95,6 +101,17 @@ class CTMBlock(nn.Module):
                 synapse_in, config.d_model, config.synapse_depth, dropout=config.dropout)
 
         self.trace_processor = self._build_nlms(config)
+        self.group_synapses = None
+        self.group_trace_processors = None
+        if self._can_build_group_sparse_backend():
+            self.group_synapses = nn.ModuleList([
+                self._build_group_synapse(config, self.moe_expert_size)
+                for _ in range(self.moe_num_experts)
+            ])
+            self.group_trace_processors = nn.ModuleList([
+                self._build_nlms_for_size(config, self.moe_expert_size)
+                for _ in range(self.moe_num_experts)
+            ])
         self.ttt_layer = None
         if config.ttt_layer:
             self.ttt_layer = TTTMLP(
@@ -129,19 +146,45 @@ class CTMBlock(nn.Module):
             self.synch_repr_out = (config.n_synch_out * (config.n_synch_out + 1)) // 2
 
     def _build_nlms(self, config):
+        return self._build_nlms_for_size(config, config.d_model)
+
+    def _build_nlms_for_size(self, config, d_model):
         if config.deep_nlms:
             return nn.Sequential(
                 SuperLinear(config.memory_length, 2 * config.memory_hidden_dims,
-                            config.d_model, dropout=config.dropout),
+                            d_model, dropout=config.dropout),
                 nn.GLU(),
                 SuperLinear(config.memory_hidden_dims, 2,
-                            config.d_model, dropout=config.dropout),
+                            d_model, dropout=config.dropout),
                 nn.GLU(),
                 Squeeze(-1))
         return nn.Sequential(
-            SuperLinear(config.memory_length, 2, config.d_model, dropout=config.dropout),
+            SuperLinear(config.memory_length, 2, d_model, dropout=config.dropout),
             nn.GLU(),
             Squeeze(-1))
+
+    def _can_build_group_sparse_backend(self):
+        if self.moe_routing_mode not in ('regional_topk', 'regional_shared_topk'):
+            return False
+        if self.moe_dispatch_mode == 'dense_mask':
+            return False
+        if self.moe_num_experts <= 1 or self.moe_expert_size <= 0:
+            return False
+        return self.moe_expert_size * self.moe_num_experts == self.d_model
+
+    def _build_group_synapse(self, config, expert_size):
+        synapse_in = config.d_input + expert_size
+        if config.self_cond:
+            synapse_in += expert_size
+        if config.synapse_depth == 1:
+            return nn.Sequential(
+                nn.Dropout(config.dropout),
+                nn.Linear(synapse_in, expert_size * 2),
+                nn.GLU(),
+                nn.LayerNorm(expert_size)
+            )
+        return SynapseUNET(
+            synapse_in, expert_size, config.synapse_depth, dropout=config.dropout)
 
     def _init_synch(self, config):
         d = config.d_model
@@ -271,7 +314,8 @@ class CTMBlock(nn.Module):
         self, activated, x, scores, raw_scores, shared, routed_count, topk,
         routed_scores, routed_raw_scores,
     ):
-        passes = min(max(1, self.moe_activation_passes), max(1, routed_count))
+        max_distinct_passes = max(1, math.ceil(routed_count / max(1, topk)))
+        passes = min(max(1, self.moe_activation_passes), max_distinct_passes)
         pass_outputs = []
         pass_masks = []
         selected = torch.zeros_like(routed_scores, dtype=torch.bool)
@@ -343,9 +387,122 @@ class CTMBlock(nn.Module):
             aux = aux + self.moe_router_z_loss_weight * z_loss
         self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
 
+    def _use_group_sparse_backend(self):
+        if self.moe_routing_mode not in ('regional_topk', 'regional_shared_topk'):
+            return False
+        if self.moe_dispatch_mode == 'dense_mask':
+            return False
+        return self.group_synapses is not None and self.group_trace_processors is not None
+
+    def _route_experts(self, scores, shared, routed_count, topk, selected=None):
+        routed_scores = scores[:, :, shared:]
+        if selected is not None:
+            routed_scores = routed_scores.masked_fill(selected, float("-inf"))
+        idx = torch.topk(routed_scores, topk, dim=-1).indices
+        expert_mask = torch.zeros_like(scores)
+        expert_mask[:, :, shared:].scatter_(-1, idx, 1.0)
+        if shared > 0:
+            expert_mask[:, :, :shared] = 1.0
+        if self.training and self.moe_expert_dropout > 0:
+            keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
+            if shared > 0:
+                keep[:, :, :shared] = True
+            expert_mask = expert_mask * keep.type_as(expert_mask)
+        if self.moe_dispatch_mode == 'capacity_drop' or self.moe_drop_tokens:
+            expert_mask = self._apply_expert_capacity(expert_mask, scores)
+        return expert_mask, idx
+
+    def _apply_expert_capacity(self, expert_mask, scores):
+        B, T, E = expert_mask.shape
+        active_per_token = expert_mask.sum(dim=-1).float().mean().clamp(min=1.0)
+        capacity = int(math.ceil(self.moe_capacity_factor * B * T * active_per_token / E))
+        capacity = max(1, capacity)
+        flat_mask = expert_mask.reshape(B * T, E)
+        flat_scores = scores.reshape(B * T, E)
+        kept = torch.zeros_like(flat_mask)
+        for expert in range(E):
+            active = flat_mask[:, expert].bool()
+            if not active.any():
+                continue
+            active_idx = active.nonzero(as_tuple=False).squeeze(-1)
+            if active_idx.numel() > capacity:
+                expert_scores = flat_scores[active_idx, expert]
+                active_idx = active_idx[torch.topk(expert_scores, capacity).indices]
+            kept[active_idx, expert] = 1.0
+        return kept.view_as(expert_mask)
+
+    def _run_group_sparse_regional_tick(
+        self, attn, activated, state_trace, prev_sync_o_activated,
+    ):
+        B, T, _ = activated.shape
+        expert_size = self.moe_expert_size
+        num_experts = self.moe_num_experts
+        x = activated.view(B, T, num_experts, expert_size)
+        raw_scores = x.abs().mean(dim=-1)
+        scores = raw_scores.detach()
+        shared = min(self.moe_shared_experts, num_experts)
+        routed_count = max(num_experts - shared, 1)
+        topk = self._effective_moe_topk(routed_count)
+        passes = min(max(1, self.moe_activation_passes), max(1, routed_count))
+        selected = torch.zeros_like(scores[:, :, shared:], dtype=torch.bool)
+        pass_masks = []
+
+        flat_attn = attn.reshape(B * T, self.d_input)
+        flat_active = activated.reshape(B * T, self.d_model).clone()
+        flat_trace = state_trace.reshape(B * T, self.d_model, self.memory_length).clone()
+        flat_self = None
+        if self.self_cond:
+            if prev_sync_o_activated is None:
+                flat_self = torch.zeros_like(flat_active)
+            else:
+                flat_self = prev_sync_o_activated.reshape(B * T, self.d_model)
+
+        for _ in range(passes):
+            current_scores = flat_active.view(B, T, num_experts, expert_size) \
+                .abs().mean(dim=-1).detach()
+            expert_mask, _ = self._route_experts(
+                current_scores, shared, routed_count, topk, selected)
+            selected = selected | expert_mask[:, :, shared:].bool()
+            pass_masks.append(expert_mask[:, :, shared:])
+            flat_mask = expert_mask.reshape(B * T, num_experts).bool()
+
+            for expert in range(num_experts):
+                token_idx = flat_mask[:, expert].nonzero(as_tuple=False).squeeze(-1)
+                if token_idx.numel() == 0:
+                    continue
+                start = expert * expert_size
+                end = start + expert_size
+                parts = [
+                    flat_attn[token_idx],
+                    flat_active[token_idx, start:end],
+                ]
+                if self.self_cond:
+                    parts.append(flat_self[token_idx, start:end])
+                pre_syn = torch.cat(parts, dim=-1)
+                state = self.group_synapses[expert](pre_syn)
+                prev_trace = flat_trace[token_idx, start:end, :]
+                new_trace = torch.cat(
+                    [prev_trace[:, :, 1:], state.unsqueeze(-1)], dim=-1)
+                group_active = self.group_trace_processors[expert](
+                    new_trace.unsqueeze(1)).squeeze(1)
+                flat_trace[token_idx, start:end, :] = new_trace
+                flat_active[token_idx, start:end] = group_active
+
+        self._update_moe_aux_loss(raw_scores[:, :, shared:])
+        self._update_region_diversity_loss(pass_masks)
+        activated = flat_active.view(B, T, self.d_model)
+        state_trace = flat_trace.view(B, T, self.d_model, self.memory_length)
+        if self.cell_sparsity_rescale:
+            active = torch.stack(pass_masks, dim=0).float().mean(dim=0).sum(dim=-1, keepdim=True)
+            active = active + (1.0 if shared > 0 else 0.0)
+            scale = self.moe_num_experts / active.clamp(min=1.0)
+            activated = activated * scale
+        return activated, state_trace
+
     def forward(self, x, pos_emb=None, past_kv=None, use_cache=False, track=False,
                 num_iters=None, return_all_ticks=False,
-                prev_activated=None, prev_trace=None):
+                prev_activated=None, prev_trace=None,
+                halt_lm_head=None, enable_tick_halt=False):
         B, T, _ = x.shape
         device = x.device
         self.moe_aux_loss = None
@@ -398,6 +555,8 @@ class CTMBlock(nn.Module):
         num_iters = num_iters if num_iters is not None else self.iterations
         all_tick_outs = [] if (track or return_all_ticks) else None
         prev_sync_o_activated = None
+        last_sync_o = None
+        self.last_executed_ticks = 0
 
         for tick in range(num_iters):
             sync_a, alpha_a, beta_a = self._compute_synch(
@@ -418,27 +577,35 @@ class CTMBlock(nn.Module):
             attn = self.attn_drop(
                 self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1)))
 
-            pre_syn_parts = [attn, activated]
-            if self.self_cond:
-                if prev_sync_o_activated is not None:
-                    pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
-                else:
-                    pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
-            pre_syn = torch.cat(pre_syn_parts, dim=-1)
-            state = self.synapses(pre_syn)
+            if self._use_group_sparse_backend():
+                activated, state_trace = self._run_group_sparse_regional_tick(
+                    attn, activated, state_trace, prev_sync_o_activated)
+                state = activated
+            else:
+                pre_syn_parts = [attn, activated]
+                if self.self_cond:
+                    if prev_sync_o_activated is not None:
+                        pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
+                    else:
+                        pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
+                pre_syn = torch.cat(pre_syn_parts, dim=-1)
+                state = self.synapses(pre_syn)
 
-            state_trace = torch.cat(
-                [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
+                state_trace = torch.cat(
+                    [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
 
-            activated = self.trace_processor(state_trace)
+                activated = self.trace_processor(state_trace)
             if self.ttt_layer is not None:
                 activated = activated + self.ttt_layer(activated)
-            activated = self._apply_cell_sparsity(activated)
+            if not self._use_group_sparse_backend():
+                activated = self._apply_cell_sparsity(activated)
 
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
+            last_sync_o = sync_o
             prev_sync_o_activated = activated
             tick_out = self.output_proj(sync_o)
+            self.last_executed_ticks = tick + 1
             if all_tick_outs is not None:
                 all_tick_outs.append(tick_out)
 
@@ -448,9 +615,22 @@ class CTMBlock(nn.Module):
                 tracking['sync_action'].append(sync_a[0].detach().cpu().numpy())
                 tracking['state_trace'].append(state_trace[0].detach().cpu().numpy())
 
+            if (
+                enable_tick_halt
+                and halt_lm_head is not None
+                and self.config.tick_halt_mode != 'none'
+                and tick + 1 < num_iters
+            ):
+                with torch.no_grad():
+                    logits = halt_lm_head(tick_out.detach())
+                    probs = F.softmax(logits, dim=-1)
+                    entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
+                    confidence = 1 - entropy / math.log(logits.size(-1))
+                    if confidence.mean() >= float(self.config.tick_halt_threshold):
+                        break
+
         ctm_out = all_tick_outs[-1] if all_tick_outs is not None else \
-            self.output_proj(self._compute_synch(
-                activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)[0])
+            self.output_proj(last_sync_o)
         x = x + self.resid_drop(ctm_out)
         x = x + self.mlp(self.post_ctm_norm(x))
 
@@ -482,7 +662,8 @@ class CTMModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, track=False,
-                num_iters=None, return_all_ticks=False):
+                num_iters=None, return_all_ticks=False,
+                halt_lm_head=None, enable_tick_halt=False):
         B, T = input_ids.shape
         if past_key_values is None:
             past_key_values = [None] * len(self.layers)
@@ -491,6 +672,7 @@ class CTMModel(nn.Module):
         presents = []
         tracking_all = {}
         last_tick_outs = None
+        executed_ticks = []
 
         prev_activated = None
         prev_trace = None
@@ -502,6 +684,8 @@ class CTMModel(nn.Module):
                 use_cache=use_cache, num_iters=num_iters,
                 prev_activated=prev_activated if self.config.cross_layer_state else None,
                 prev_trace=prev_trace if self.config.cross_layer_state else None,
+                halt_lm_head=halt_lm_head if is_last else None,
+                enable_tick_halt=enable_tick_halt and is_last,
             )
 
             if track and not is_last:
@@ -527,6 +711,7 @@ class CTMModel(nn.Module):
                 prev_activated = extras.get('final_activated', prev_activated)
                 prev_trace = extras.get('final_trace', prev_trace)
 
+            executed_ticks.append(getattr(layer, 'last_executed_ticks', 0))
             presents.append(present)
 
         h = self.norm(h)
@@ -536,6 +721,8 @@ class CTMModel(nn.Module):
             outputs.append(last_tick_outs)
         if track:
             outputs.append(tracking_all)
+        if enable_tick_halt:
+            outputs.append(executed_ticks)
 
         if len(outputs) == 2:
             return tuple(outputs)
@@ -570,6 +757,24 @@ class CTMForCausalLM(nn.Module):
         if mode == 'pow2':
             return min(2 ** tick, max_horizon)
         raise ValueError(f"Unknown elf_horizon_mode: {mode}")
+
+    def _mtp_horizons(self):
+        mode = getattr(self.config, 'moe_mtp_mode', 'none')
+        raw = str(getattr(self.config, 'moe_mtp_horizons', '') or '')
+        if mode == 'none' or not raw.strip():
+            return []
+        horizons = []
+        for item in raw.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                horizon = int(item)
+            except ValueError:
+                continue
+            if horizon > 0 and horizon not in horizons:
+                horizons.append(horizon)
+        return horizons
 
     @staticmethod
     def _per_sample_lm_loss(logits, labels, horizon):
@@ -643,8 +848,11 @@ class CTMForCausalLM(nn.Module):
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
                 num_iters=None):
-        h, past_key_values = self.model(
-            input_ids, past_key_values, use_cache, track=False, num_iters=num_iters)
+        enable_halt = self.config.tick_halt_mode != 'none'
+        result = self.model(
+            input_ids, past_key_values, use_cache, track=False, num_iters=num_iters,
+            halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
+        h, past_key_values = result[0], result[1]
         logits = self.lm_head(h)
         loss = None
         if labels is not None:
@@ -658,8 +866,11 @@ class CTMForCausalLM(nn.Module):
 
     def forward_train(self, input_ids, labels, num_iters=None):
         B = input_ids.size(0)
-        h, _, tick_outs = self.model(
-            input_ids, track=False, num_iters=num_iters, return_all_ticks=True)
+        enable_halt = self.config.tick_halt_mode != 'none'
+        result = self.model(
+            input_ids, track=False, num_iters=num_iters, return_all_ticks=True,
+            halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
+        h, tick_outs = result[0], result[2]
         num_ticks = tick_outs.size(-1)
 
         final_logits = self.lm_head(h)
@@ -672,11 +883,23 @@ class CTMForCausalLM(nn.Module):
         losses = []
         next_losses = []
         certainties = []
+        mtp_horizons = self._mtp_horizons()
         for t in range(num_ticks):
             logits_t = self.lm_head(tick_outs[..., t])
-            horizon = self._tick_horizon(t, num_ticks)
-            per_sample_loss, label_mask = self._per_sample_lm_loss(
-                logits_t, labels, horizon=horizon)
+            if mtp_horizons:
+                horizon_losses = []
+                label_mask = None
+                for horizon in mtp_horizons:
+                    horizon_loss, horizon_mask = self._per_sample_lm_loss(
+                        logits_t, labels, horizon=horizon)
+                    horizon_losses.append(horizon_loss)
+                    if horizon == 1 or label_mask is None:
+                        label_mask = horizon_mask
+                per_sample_loss = torch.stack(horizon_losses, dim=1).mean(dim=1)
+            else:
+                horizon = self._tick_horizon(t, num_ticks)
+                per_sample_loss, label_mask = self._per_sample_lm_loss(
+                    logits_t, labels, horizon=horizon)
             losses.append(per_sample_loss)
 
             next_loss, next_mask = self._per_sample_lm_loss(
