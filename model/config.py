@@ -52,6 +52,9 @@ class CTMLLMConfig:
         self.moe_topk_warmup_steps = kwargs.get('moe_topk_warmup_steps', 0)
         self.moe_aux_loss_free_bias = kwargs.get('moe_aux_loss_free_bias', False)
         self.moe_expert_dropout = kwargs.get('moe_expert_dropout', 0.0)
+        self.moe_activation_passes = kwargs.get('moe_activation_passes', 1)
+        self.moe_region_diversity_weight = kwargs.get('moe_region_diversity_weight', 0.0)
+        self.global_step = kwargs.get('global_step', 0)
         self.moe_mtp_mode = kwargs.get('moe_mtp_mode', 'none')
         self.moe_mtp_horizons = kwargs.get('moe_mtp_horizons', '')
 

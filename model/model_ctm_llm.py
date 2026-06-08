@@ -55,6 +55,10 @@ class CTMBlock(nn.Module):
         if self.moe_expert_size <= 0 and self.moe_num_experts > 0:
             self.moe_expert_size = config.d_model // self.moe_num_experts
         self.moe_expert_dropout = float(getattr(config, 'moe_expert_dropout', 0.0))
+        self.moe_activation_passes = max(1, int(
+            getattr(config, 'moe_activation_passes', 1)))
+        self.moe_region_diversity_weight = float(
+            getattr(config, 'moe_region_diversity_weight', 0.0))
         self.moe_load_balance_weight = float(
             getattr(config, 'moe_load_balance_weight', 0.0))
         self.moe_router_entropy_weight = float(
@@ -214,10 +218,15 @@ class CTMBlock(nn.Module):
 
         shared = min(self.moe_shared_experts, num_experts)
         routed_count = max(num_experts - shared, 1)
-        topk = min(self.moe_topk_experts, routed_count)
+        topk = self._effective_moe_topk(routed_count)
         routed_scores = scores[:, :, shared:]
         routed_raw_scores = raw_scores[:, :, shared:]
         mode = self.moe_routing_mode
+
+        if mode in ('regional_topk', 'regional_shared_topk') or self.moe_activation_passes > 1:
+            return self._apply_regional_moe_sparsity(
+                activated, x, scores, raw_scores, shared, routed_count, topk,
+                routed_scores, routed_raw_scores)
 
         if mode == 'hash':
             pos = torch.arange(T, device=activated.device).view(1, T, 1)
@@ -247,6 +256,67 @@ class CTMBlock(nn.Module):
             mask = mask * (self.d_model / active_cells)
         self._update_moe_aux_loss(routed_raw_scores)
         return activated * mask
+
+    def _effective_moe_topk(self, routed_count):
+        target = min(self.moe_topk_experts, routed_count)
+        warmup_steps = max(0, int(getattr(self.config, 'moe_topk_warmup_steps', 0)))
+        if warmup_steps <= 0:
+            return target
+        current_step = max(0, int(getattr(self.config, 'global_step', 0)))
+        progress = min(1.0, current_step / max(1, warmup_steps))
+        warm_topk = int(math.ceil(target + (routed_count - target) * (1.0 - progress)))
+        return min(max(target, warm_topk), routed_count)
+
+    def _apply_regional_moe_sparsity(
+        self, activated, x, scores, raw_scores, shared, routed_count, topk,
+        routed_scores, routed_raw_scores,
+    ):
+        passes = min(max(1, self.moe_activation_passes), max(1, routed_count))
+        pass_outputs = []
+        pass_masks = []
+        selected = torch.zeros_like(routed_scores, dtype=torch.bool)
+
+        for _ in range(passes):
+            masked_scores = routed_scores.masked_fill(selected, float("-inf"))
+            idx = torch.topk(masked_scores, topk, dim=-1).indices
+            routed_mask = torch.zeros_like(routed_scores)
+            routed_mask.scatter_(-1, idx, 1.0)
+            selected = selected | routed_mask.bool()
+
+            expert_mask = torch.zeros_like(scores)
+            expert_mask[:, :, shared:] = routed_mask
+            if shared > 0:
+                expert_mask[:, :, :shared] = 1.0
+
+            if self.training and self.moe_expert_dropout > 0:
+                keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
+                if shared > 0:
+                    keep[:, :, :shared] = True
+                expert_mask = expert_mask * keep.type_as(expert_mask)
+
+            active_cells = expert_mask.sum(dim=-1, keepdim=True).clamp(min=1) * self.moe_expert_size
+            mask = expert_mask.unsqueeze(-1).expand_as(x).reshape_as(activated)
+            if self.cell_sparsity_rescale:
+                mask = mask * (self.d_model / active_cells)
+            pass_outputs.append(activated * mask)
+            pass_masks.append(expert_mask[:, :, shared:])
+
+        self._update_moe_aux_loss(routed_raw_scores)
+        self._update_region_diversity_loss(pass_masks)
+        return torch.stack(pass_outputs, dim=0).mean(dim=0)
+
+    def _update_region_diversity_loss(self, pass_masks):
+        if self.moe_region_diversity_weight <= 0 or len(pass_masks) <= 1:
+            return
+        overlaps = []
+        for i in range(len(pass_masks)):
+            for j in range(i + 1, len(pass_masks)):
+                overlaps.append((pass_masks[i] * pass_masks[j]).sum(dim=-1).mean())
+        if not overlaps:
+            return
+        diversity_loss = torch.stack(overlaps).mean() / max(1, self.moe_topk_experts)
+        aux = self.moe_region_diversity_weight * diversity_loss
+        self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
 
     def _update_moe_aux_loss(self, routed_scores):
         if (

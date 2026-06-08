@@ -146,6 +146,10 @@ def effective_tick_from_certainties(certainties, args):
 def active_cell_fraction(args):
     if args.model_type != 'ctm' or args.cell_sparsity_mode == 'none':
         return 1.0
+    if getattr(args, 'moe_routing_mode', 'none') in ('regional_topk', 'regional_shared_topk'):
+        active_experts = args.moe_topk_experts + args.moe_shared_experts
+        if args.moe_num_experts > 0:
+            return min(max(active_experts, 1), args.moe_num_experts) / args.moe_num_experts
     return min(max(args.cell_topk, 1), args.d_model) / max(args.d_model, 1)
 
 
@@ -178,6 +182,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
         for pg in optimizer.param_groups:
             pg['lr'] = lr
 
+        raw_model.config.global_step = global_step
         with autocast_ctx:
             loss, losses_per_tick, certainties = raw_model.forward_train(
                 input_ids, labels, num_iters=args.iterations)
@@ -316,6 +321,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'moe_topk_warmup_steps': args.moe_topk_warmup_steps,
                     'moe_aux_loss_free_bias': args.moe_aux_loss_free_bias,
                     'moe_expert_dropout': args.moe_expert_dropout,
+                    'moe_activation_passes': args.moe_activation_passes,
+                    'moe_region_diversity_weight': args.moe_region_diversity_weight,
                     'moe_mtp_mode': args.moe_mtp_mode,
                     'moe_mtp_horizons': args.moe_mtp_horizons,
                     'self_cond': args.self_cond,
@@ -403,7 +410,8 @@ if __name__ == '__main__':
     parser.add_argument('--moe_routing_mode', type=str, default='none',
                         choices=[
                             'none', 'topk', 'top1', 'top2', 'top4',
-                            'expert_choice', 'hash', 'shared_topk', 'topk_warmup'
+                            'expert_choice', 'hash', 'shared_topk', 'topk_warmup',
+                            'regional_topk', 'regional_shared_topk'
                         ])
     parser.add_argument('--moe_num_experts', type=int, default=1)
     parser.add_argument('--moe_topk_experts', type=int, default=1)
@@ -419,6 +427,8 @@ if __name__ == '__main__':
     parser.add_argument('--moe_topk_warmup_steps', type=int, default=0)
     parser.add_argument('--moe_aux_loss_free_bias', type=int, default=0, choices=[0, 1])
     parser.add_argument('--moe_expert_dropout', type=float, default=0.0)
+    parser.add_argument('--moe_activation_passes', type=int, default=1)
+    parser.add_argument('--moe_region_diversity_weight', type=float, default=0.0)
     parser.add_argument('--moe_mtp_mode', type=str, default='none')
     parser.add_argument('--moe_mtp_horizons', type=str, default='')
     parser.add_argument('--ttt_layer', type=int, default=0, choices=[0, 1])
@@ -510,6 +520,8 @@ if __name__ == '__main__':
         moe_topk_warmup_steps=args.moe_topk_warmup_steps,
         moe_aux_loss_free_bias=bool(args.moe_aux_loss_free_bias),
         moe_expert_dropout=args.moe_expert_dropout,
+        moe_activation_passes=args.moe_activation_passes,
+        moe_region_diversity_weight=args.moe_region_diversity_weight,
         moe_mtp_mode=args.moe_mtp_mode,
         moe_mtp_horizons=args.moe_mtp_horizons,
         ttt_layer=bool(args.ttt_layer),
