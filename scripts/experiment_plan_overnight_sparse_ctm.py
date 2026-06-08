@@ -24,6 +24,7 @@ OVERNIGHT_STAGES = (
     "og08",
     "og09",
     "og10",
+    "real",
     "all",
 )
 OVERNIGHT_PREFIXES = tuple(f"{stage}_" for stage in OVERNIGHT_STAGES if stage != "all")
@@ -101,6 +102,14 @@ def single_moe(plan, name, question, *, num_experts, expert_size, topk_experts,
 
 def build_plan(stage, plan_size="full"):
     plan = []
+    real_stages = (
+        "og00", "og01", "og02", "og03", "og04",
+        "og05", "og06", "og07", "og10",
+    )
+    if stage == "real":
+        for item in real_stages:
+            plan.extend(build_plan(item, plan_size))
+        return base.validate_plan(plan)
 
     if stage in ("og00", "all"):
         anchors = [
@@ -623,6 +632,31 @@ base.REGIONAL_PREFIXES = OVERNIGHT_PREFIXES
 base.build_plan = build_plan
 
 
+def audit_realism():
+    labels = {
+        "og00": "real: dense/top-k/regional anchors",
+        "og01": "real: physical expert granularity/active width sweep",
+        "og02": "real: active expert count/pass sweep",
+        "og03": "real: implemented tick halt sweep",
+        "og04": "real: implemented routing regularizers/routing modes",
+        "og05": "real: implemented dispatch/capacity/drop modes",
+        "og06": "real: implemented ELF/MTP losses",
+        "og07": "real: long confirmation runs",
+        "og08": "proxy: delta-cache/sticky-routing not implemented",
+        "og09": "proxy: developmental/asynchronous/skill-compilation concepts not fully implemented",
+        "og10": "real: learned differentiated cells plus resident reflex/anytime outputs",
+    }
+    for stage in OVERNIGHT_STAGES:
+        if stage in {"all", "real"}:
+            continue
+        plan = build_plan(stage, "full")
+        print(f"{stage}: {len(plan):3d} {labels[stage]}")
+
+
 if __name__ == "__main__":
-    args = base.parse_args()
-    args.func(args)
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "audit-realism":
+        audit_realism()
+    else:
+        args = base.parse_args()
+        args.func(args)
