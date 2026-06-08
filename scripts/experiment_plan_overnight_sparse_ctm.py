@@ -21,6 +21,7 @@ OVERNIGHT_STAGES = (
     "og05",
     "og06",
     "og07",
+    "og08",
     "all",
 )
 OVERNIGHT_PREFIXES = tuple(f"{stage}_" for stage in OVERNIGHT_STAGES if stage != "all")
@@ -300,6 +301,86 @@ def build_plan(stage, plan_size="full"):
                 halt_mode=halt, halt_threshold=threshold,
                 mtp_mode=mtp, mtp_horizons=horizons,
                 max_steps=steps)
+
+    if stage in ("og08", "all"):
+        # Sparse-Delta / Keyframe-Delta proxy. The actual delta cache, sticky
+        # routing, and per-cell freezing need model code. These runs keep rich
+        # internal time but restrict per-tick active compute with low top-k,
+        # periodic-refresh-like pass counts, and halt/freezing-style thresholds.
+        tick_grids = [
+            ("d512", 16, 32, 8),
+            ("d512", 16, 32, 12),
+            ("d512", 16, 32, 16),
+            ("d1024", 16, 64, 8),
+            ("d1024", 16, 64, 12),
+            ("d1024", 16, 64, 16),
+        ]
+        for dtag, num_experts, expert_size, ticks in tick_grids:
+            for passes, shared, topk in [
+                (1, 0, 1),
+                (2, 0, 1),
+                (3, 1, 1),
+                (4, 1, 1),
+            ]:
+                regional(
+                    plan,
+                    f"og08_delta_time_{dtag}_tick{ticks}_p{passes}_sh{shared}_top{topk}",
+                    "Keyframe-Delta proxy: preserve many ticks while limiting active cells per tick.",
+                    num_experts=num_experts,
+                    expert_size=expert_size,
+                    activation_passes=passes,
+                    shared_experts=shared,
+                    topk_experts=topk,
+                    iterations=ticks,
+                    tick_compute_weight=2e-3 if ticks >= 12 else 1e-3,
+                    max_steps=3000,
+                    batch_size=8 if dtag == "d512" else 6,
+                )
+        for dtag, num_experts, expert_size, ticks in [
+            ("d512", 16, 32, 12),
+            ("d512", 16, 32, 16),
+            ("d1024", 16, 64, 12),
+            ("d1024", 16, 64, 16),
+        ]:
+            for threshold in [0.15, 0.30, 0.45]:
+                regional(
+                    plan,
+                    f"og08_delta_halt_{dtag}_tick{ticks}_thr{str(threshold).replace('.', 'p')}",
+                    "Cell-freezing proxy: long internal time plus early tick exit pressure.",
+                    num_experts=num_experts,
+                    expert_size=expert_size,
+                    activation_passes=4,
+                    shared_experts=1,
+                    topk_experts=1,
+                    iterations=ticks,
+                    halt_mode="threshold",
+                    halt_threshold=threshold,
+                    tick_compute_weight=3e-3,
+                    max_steps=3000,
+                    batch_size=8 if dtag == "d512" else 6,
+                )
+        for dtag, num_experts, expert_size, ticks, mtp, horizons in [
+            ("d512", 16, 32, 12, "mtp_1_2_4", "1,2,4"),
+            ("d512", 16, 32, 16, "mtp_1_2_4_8", "1,2,4,8"),
+            ("d1024", 16, 64, 12, "mtp_1_2_4", "1,2,4"),
+            ("d1024", 16, 64, 16, "mtp_1_2_4_8", "1,2,4,8"),
+        ]:
+            regional(
+                plan,
+                f"og08_delta_mtp_{dtag}_tick{ticks}_{mtp.replace('_', '')}",
+                "Cache-consistency proxy: long internal time with multi-horizon supervision.",
+                num_experts=num_experts,
+                expert_size=expert_size,
+                activation_passes=4,
+                shared_experts=1,
+                topk_experts=1,
+                iterations=ticks,
+                mtp_mode=mtp,
+                mtp_horizons=horizons,
+                tick_improve_weight=0.03,
+                max_steps=3500,
+                batch_size=8 if dtag == "d512" else 6,
+            )
 
     return base.validate_plan(plan)
 
