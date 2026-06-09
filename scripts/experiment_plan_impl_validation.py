@@ -67,6 +67,19 @@ REGIONAL_STAGES = (
     "all",
 )
 REGIONAL_PREFIXES = tuple(f"{stage}_" for stage in REGIONAL_STAGES if stage != "all")
+PLAN_METRICS_PREFIX = "impl_validation"
+
+
+def metrics_path(name):
+    return f"runs/metrics/{PLAN_METRICS_PREFIX}_{name}"
+
+
+def configure_plan_defaults(*, metrics_prefix=None, cluster_config=None):
+    global PLAN_METRICS_PREFIX, DEFAULT_CLUSTER_CONFIG
+    if metrics_prefix:
+        PLAN_METRICS_PREFIX = metrics_prefix
+    if cluster_config:
+        DEFAULT_CLUSTER_CONFIG = cluster_config
 
 
 def merge_args(**overrides):
@@ -689,6 +702,10 @@ def quick_probe_experiment(exp, batch_size, max_steps, log_interval):
     )
 
 
+def memory_limit_mb(args):
+    return args.target_memory_gb * 1024 * args.memory_util
+
+
 def load_batch_profile(path):
     if not path:
         return {}
@@ -703,6 +720,441 @@ def load_batch_profile(path):
             if name and batch:
                 profile[name] = int(float(batch))
     return profile
+
+
+def load_batch_profile_meta(path):
+    meta = {}
+    if not path or not os.path.exists(path):
+        return meta
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            name = row.get("experiment_name") or row.get("base_experiment") or row.get("name")
+            batch = row.get("batch_size") or row.get("recommended_batch_size")
+            if not name or not batch:
+                continue
+            meta[name] = {
+                "batch_size": int(float(batch)),
+                "source": row.get("selected_probe", "profile_csv"),
+                "peak_memory_mb": row.get("peak_memory_mb", ""),
+                "metrics_file": row.get("metrics_file", ""),
+            }
+    return meta
+
+
+def count_quick_probe_metrics(metrics_dir):
+    pattern = os.path.join(metrics_dir, "qp__*.csv")
+    return len(glob.glob(pattern))
+
+
+def completed_final_experiments(metrics_dir):
+    done = set()
+    for name, row in latest_row_by_experiment(metrics_dir).items():
+        if is_final_metrics_row(row):
+            done.add(name)
+    return done
+
+
+def experiment_memory_family(exp):
+    args = exp["args"]
+    d_model = int(args.get("d_model", 512))
+    iterations = int(args.get("iterations", 4))
+    memory_length = int(args.get("memory_length", 8))
+    activation_passes = int(args.get("moe_activation_passes", 1))
+    active_width = int(args.get("cell_topk", d_model))
+    mtp = args.get("moe_mtp_mode", "none")
+    elf = args.get("elf_horizon_mode", "none")
+    fast_output = args.get("fast_output_mode", "none")
+    diff_cell = args.get("diff_cell_mode", "none")
+
+    if d_model <= 512:
+        d_bucket = 512
+    elif d_model <= 1024:
+        d_bucket = 1024
+    elif d_model <= 1536:
+        d_bucket = 1536
+    else:
+        d_bucket = 2048
+
+    if iterations <= 2:
+        tick_bucket = "t2"
+    elif iterations <= 6:
+        tick_bucket = "t6"
+    elif iterations <= 12:
+        tick_bucket = "t12"
+    else:
+        tick_bucket = "t16"
+
+    if memory_length <= 4:
+        mem_bucket = "m4"
+    elif memory_length <= 8:
+        mem_bucket = "m8"
+    elif memory_length <= 16:
+        mem_bucket = "m16"
+    else:
+        mem_bucket = "m32"
+
+    width_bucket = min(active_width, 2048)
+    width_bucket = int(math.ceil(width_bucket / 64.0) * 64)
+
+    return (
+        f"d{d_bucket}_{tick_bucket}_{mem_bucket}_p{activation_passes}"
+        f"_w{width_bucket}_mtp{int(mtp != 'none')}_elf{int(elf != 'none')}"
+        f"_fast{int(fast_output != 'none')}_diff{int(diff_cell != 'none')}"
+    )
+
+
+def conservative_heuristic_batch(exp, batch_sizes, limit_mb, fallback):
+    args = exp["args"]
+    d_model = int(args.get("d_model", 512))
+    iterations = int(args.get("iterations", 4))
+    memory_length = int(args.get("memory_length", 8))
+    activation_passes = int(args.get("moe_activation_passes", 1))
+    active_width = int(args.get("cell_topk", d_model))
+    plan_default = int(args.get("batch_size", fallback))
+
+    if d_model <= 512:
+        batch = 12
+    elif d_model <= 768:
+        batch = 10
+    elif d_model <= 1024:
+        batch = 8
+    elif d_model <= 1536:
+        batch = 6
+    else:
+        batch = 4
+
+    if iterations >= 12:
+        batch -= 2
+    elif iterations >= 8:
+        batch -= 1
+    if memory_length >= 32:
+        batch -= 2
+    elif memory_length >= 16:
+        batch -= 1
+    if activation_passes >= 5:
+        batch -= 2
+    elif activation_passes >= 4:
+        batch -= 1
+    if active_width >= 512:
+        batch -= 2
+    elif active_width >= 256:
+        batch -= 1
+    if args.get("moe_mtp_mode", "none") != "none":
+        batch -= 1
+    if args.get("elf_horizon_mode", "none") != "none":
+        batch -= 1
+    if args.get("fast_output_mode", "none") != "none":
+        batch -= 1
+    if args.get("diff_cell_mode", "none") != "none":
+        batch -= 1
+
+    batch = max(min(batch_sizes), min(max(batch_sizes), batch, plan_default))
+    return batch
+
+
+def infer_batch_from_family(exp, family_samples, batch_sizes, limit_mb, fallback):
+    if not family_samples:
+        return conservative_heuristic_batch(exp, batch_sizes, limit_mb, fallback), "heuristic"
+
+    valid = []
+    for item in family_samples:
+        if item.get("batch_size", 0) <= 0:
+            continue
+        peak = parse_float(item, "peak_memory_mb")
+        if math.isnan(peak):
+            continue
+        valid.append({**item, "peak_memory_mb": peak})
+    if not valid:
+        return conservative_heuristic_batch(exp, batch_sizes, limit_mb, fallback), "heuristic"
+
+    best = None
+    for candidate in sorted(set(batch_sizes), reverse=True):
+        predicted = []
+        for sample in valid:
+            peak = float(sample["peak_memory_mb"])
+            sample_batch = int(sample["batch_size"])
+            if sample_batch <= 0:
+                continue
+            predicted.append(peak * (candidate / sample_batch))
+        if not predicted:
+            continue
+        worst = max(predicted)
+        if worst <= limit_mb:
+            best = candidate
+            break
+    if best is None:
+        smallest = sorted(valid, key=lambda x: (float(x["peak_memory_mb"]), -int(x["batch_size"])))[0]
+        best = max(min(batch_sizes), int(smallest["batch_size"]))
+        return best, "family_conservative"
+    return best, "family_inferred"
+
+
+def load_probe_samples_from_metrics(metrics_dir, base_names, limit_mb):
+    metrics = latest_row_by_experiment(metrics_dir)
+    failures = failure_reports_by_experiment(metrics_dir)
+    samples = {}
+    for row in metrics.values():
+        probe_name = row.get("experiment_name", "")
+        base = batch_probe_base_name(probe_name)
+        if not base or base not in base_names:
+            continue
+        peak = parse_float(row, "peak_memory_mb")
+        batch = int(parse_float(row, "batch_size", 0))
+        if batch <= 0 or math.isnan(peak):
+            continue
+        status = "ok" if peak <= limit_mb else "over_memory"
+        samples.setdefault(base, []).append({
+            "base_experiment": base,
+            "batch_size": batch,
+            "peak_memory_mb": peak,
+            "status": status,
+            "probe_name": probe_name,
+            "metrics_file": row.get("metrics_file", ""),
+            "source": "resume_metrics",
+        })
+    for probe_name, failure in failures.items():
+        base = batch_probe_base_name(probe_name)
+        if not base or base not in base_names:
+            continue
+        peak = failure.get("peak_memory_mb", "")
+        try:
+            peak = float(peak) if peak != "" else math.nan
+        except (TypeError, ValueError):
+            peak = math.nan
+        batch = int(parse_float({"batch_size": failure.get("batch_size", "")}, "batch_size", 0))
+        if batch <= 0:
+            continue
+        samples.setdefault(base, []).append({
+            "base_experiment": base,
+            "batch_size": batch,
+            "peak_memory_mb": peak,
+            "status": failure.get("status", "failed"),
+            "probe_name": probe_name,
+            "metrics_file": "",
+            "source": "resume_failure",
+        })
+    return samples
+
+
+def best_probe_sample(samples):
+    under = [x for x in samples if x.get("status") == "ok" and not math.isnan(float(x["peak_memory_mb"]))]
+    if under:
+        return sorted(under, key=lambda x: (x["batch_size"], -float(x["peak_memory_mb"])), reverse=True)[0]
+    valid = [x for x in samples if not math.isnan(float(x.get("peak_memory_mb", math.nan)))]
+    if valid:
+        return sorted(valid, key=lambda x: (float(x["peak_memory_mb"]), x["batch_size"]))[0]
+    return None
+
+
+def build_smart_profile(base_plan, args):
+    batch_sizes = sorted(set(args.batch_sizes), reverse=True)
+    if args.fallback_batch_size is None:
+        args.fallback_batch_size = min(batch_sizes)
+    limit_mb = memory_limit_mb(args)
+    base_names = {exp["name"] for exp in base_plan}
+
+    profile = {}
+    meta = {}
+
+    for path, source in (
+        (args.batch_profile, "profile_csv"),
+        (args.quick_output, "quick_csv"),
+    ):
+        for name, item in load_batch_profile_meta(path).items():
+            if name in base_names and name not in profile:
+                profile[name] = item["batch_size"]
+                meta[name] = {**item, "source": source}
+
+    probe_samples = load_probe_samples_from_metrics(args.metrics_dir, base_names, limit_mb)
+    for base, items in probe_samples.items():
+        if base in profile:
+            continue
+        selected = best_probe_sample(items)
+        if selected and selected.get("status") == "ok":
+            profile[base] = int(selected["batch_size"])
+            meta[base] = {
+                "batch_size": int(selected["batch_size"]),
+                "source": "resume_metrics",
+                "peak_memory_mb": selected.get("peak_memory_mb", ""),
+                "metrics_file": selected.get("metrics_file", ""),
+                "selected_probe": selected.get("probe_name", ""),
+            }
+
+    family_probed = {}
+    exp_by_name = {exp["name"]: exp for exp in base_plan}
+    for name in sorted(profile):
+        exp = exp_by_name.get(name)
+        if not exp:
+            continue
+        family = experiment_memory_family(exp)
+        peak = meta.get(name, {}).get("peak_memory_mb", "")
+        try:
+            peak_val = float(peak) if peak != "" else math.nan
+        except (TypeError, ValueError):
+            peak_val = math.nan
+        if math.isnan(peak_val):
+            continue
+        family_probed.setdefault(family, []).append({
+            "base_experiment": name,
+            "batch_size": profile[name],
+            "peak_memory_mb": peak_val,
+        })
+
+    for exp in base_plan:
+        name = exp["name"]
+        if name in profile:
+            continue
+        family = experiment_memory_family(exp)
+        batch, source = infer_batch_from_family(
+            exp, family_probed.get(family, []), batch_sizes, limit_mb, args.fallback_batch_size)
+        profile[name] = batch
+        meta[name] = {
+            "batch_size": batch,
+            "source": source,
+            "peak_memory_mb": "",
+            "metrics_file": "",
+            "selected_probe": source,
+        }
+
+    return profile, meta
+
+
+def write_merged_batch_profile(path, base_plan, profile, meta, args):
+    limit_mb = memory_limit_mb(args)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fields = [
+        "experiment_name", "recommended_batch_size", "peak_memory_mb",
+        "tokens_per_sec", "memory_limit_mb", "num_successful_probes",
+        "selected_probe", "metrics_file",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for exp in base_plan:
+            name = exp["name"]
+            item = meta.get(name, {})
+            writer.writerow({
+                "experiment_name": name,
+                "recommended_batch_size": profile[name],
+                "peak_memory_mb": item.get("peak_memory_mb", ""),
+                "tokens_per_sec": item.get("tokens_per_sec", ""),
+                "memory_limit_mb": round(limit_mb, 3),
+                "num_successful_probes": 1 if item.get("source") in {
+                    "profile_csv", "quick_csv", "resume_metrics", "probed",
+                } else 0,
+                "selected_probe": item.get("selected_probe", item.get("source", "inferred")),
+                "metrics_file": item.get("metrics_file", ""),
+            })
+
+
+def select_probe_targets(base_plan, profile_meta, args):
+    if args.max_probe_experiments <= 0:
+        return []
+
+    candidates = []
+    for exp in base_plan:
+        name = exp["name"]
+        item = profile_meta.get(name, {})
+        source = item.get("source", "")
+        if source in {"profile_csv", "quick_csv", "resume_metrics", "probed"}:
+            continue
+        candidates.append(exp)
+
+    if not candidates:
+        return []
+
+    by_family = {}
+    for exp in candidates:
+        by_family.setdefault(experiment_memory_family(exp), []).append(exp)
+
+    targets = []
+    for family in sorted(by_family):
+        targets.append(by_family[family][0]["name"])
+        if len(targets) >= args.max_probe_experiments:
+            return targets
+
+    for exp in candidates:
+        if exp["name"] not in targets:
+            targets.append(exp["name"])
+        if len(targets) >= args.max_probe_experiments:
+            break
+    return targets
+
+
+def effective_probe_budget_min(args):
+    probe_budget = getattr(args, "probe_time_budget_min", 0) or 0
+    if probe_budget > 0:
+        return probe_budget
+    legacy = getattr(args, "time_limit_min", 0) or 0
+    return legacy if legacy > 0 else 0
+
+
+def prepare_probe_run_args(args):
+    batch_sizes = sorted(set(args.batch_sizes), reverse=True)
+    if args.fallback_batch_size is None:
+        args.fallback_batch_size = min(batch_sizes)
+    if args.cmd in ("probe-and-run", "quick-probe") and args.master_addr is None:
+        args.master_addr = "11.131.210.78"
+    if args.cmd in ("probe-and-run", "quick-probe") and args.port is None:
+        args.port = 8765
+
+
+def print_execution_plan(args, base_plan, *, mode, probe_targets=None, profile=None, profile_meta=None):
+    total = len(base_plan)
+    done = completed_final_experiments(args.metrics_dir)
+    pending_runs = total - len(done)
+    qp_count = count_quick_probe_metrics(args.metrics_dir)
+    has_profile = bool(args.batch_profile and os.path.exists(args.batch_profile))
+    has_quick = bool(args.quick_output and os.path.exists(args.quick_output))
+    budget_min = effective_probe_budget_min(args)
+    probe_targets = probe_targets or []
+    profile = profile or {}
+    profile_meta = profile_meta or {}
+
+    probed = sum(1 for item in profile_meta.values() if item.get("source") in {
+        "profile_csv", "quick_csv", "resume_metrics", "probed"})
+    inferred = sum(1 for item in profile_meta.values() if item.get("source", "").startswith("family"))
+    heuristic = sum(1 for item in profile_meta.values() if item.get("source") == "heuristic")
+
+    print("\n=== execution plan ===", flush=True)
+    print(f"mode: {mode}", flush=True)
+    print(f"stage={args.stage} plan_size={args.plan_size} total_experiments={total}", flush=True)
+    print(f"formal_runs_pending={pending_runs} already_completed={len(done)}", flush=True)
+    print(f"existing_qp_metrics={qp_count}", flush=True)
+    print(f"batch_profile={args.batch_profile} exists={has_profile}", flush=True)
+    print(f"quick_profile={args.quick_output} exists={has_quick}", flush=True)
+    if mode != "run-only":
+        print(f"probe_targets={len(probe_targets)} max_probe_experiments={args.max_probe_experiments}", flush=True)
+        print(f"max_probe_attempts={args.max_probe_attempts} probe_time_budget_min={budget_min or 'unlimited'}", flush=True)
+        print(f"streaming={getattr(args, 'streaming', False)} max_probe_lanes={getattr(args, 'max_probe_lanes', 0)}", flush=True)
+    if profile_meta:
+        print(
+            f"batch_sources: probed_or_cached={probed} family_inferred={inferred} "
+            f"heuristic={heuristic}",
+            flush=True,
+        )
+    if mode == "run-only":
+        print("TIP: use run-only when batch_profile already exists to avoid repeating probe.", flush=True)
+    elif has_profile and not args.force_probe:
+        print("TIP: batch_profile exists; default is run-only unless --force_probe.", flush=True)
+    elif qp_count >= max(32, total // 2):
+        print(
+            f"WARNING: found {qp_count} qp__ metrics. Consider run-only:\n"
+            f"  python ... run-parallel --stage {args.stage} "
+            f"--batch_profile {args.batch_profile}",
+            flush=True,
+        )
+    print("======================\n", flush=True)
+
+
+def should_skip_probe(args, base_plan):
+    if args.force_probe:
+        return False
+    if args.batch_profile and os.path.exists(args.batch_profile):
+        profile = load_batch_profile(args.batch_profile)
+        if profile:
+            return True
+    return False
 
 
 def apply_batch_profile(plan, profile):
@@ -1029,6 +1481,13 @@ def run_parallel(args):
         )
 
     node_groups = resolve_node_groups(args, "run-parallel")
+    metrics_dir = getattr(args, "metrics_dir", "runs/metrics")
+    if getattr(args, "resume", True):
+        done = completed_final_experiments(metrics_dir)
+        if done:
+            before = len(plan)
+            plan = [exp for exp in plan if exp["name"] not in done]
+            print(f"resume: skipping {before - len(plan)} experiments with final metrics", flush=True)
 
     queue = list(plan)
     running = {}
@@ -1226,7 +1685,65 @@ def write_quick_outputs(args, selected, attempts):
             writer.writerows(attempts)
 
 
+def probe_task_already_done(probe_name, metrics_dir):
+    metrics = latest_row_by_experiment(metrics_dir)
+    if probe_name in metrics:
+        return True
+    failures = failure_reports_by_experiment(metrics_dir)
+    return probe_name in failures
+
+
+def seed_quick_probe_state(base_plan, args, probe_targets=None):
+    batch_sizes = sorted(set(args.batch_sizes), reverse=True)
+    limit_mb = memory_limit_mb(args)
+    base_names = {exp["name"] for exp in base_plan}
+    target_set = set(probe_targets) if probe_targets is not None else None
+
+    selected = {}
+    for name, item in load_batch_profile_meta(args.quick_output).items():
+        if name in base_names and (target_set is None or name in target_set):
+            selected[name] = {
+                "batch_size": item["batch_size"],
+                "probe_name": item.get("selected_probe", "quick_csv"),
+                "peak_memory_mb": item.get("peak_memory_mb", ""),
+                "metrics_file": item.get("metrics_file", ""),
+                "source": "quick_csv",
+            }
+
+    for base, samples in load_probe_samples_from_metrics(args.metrics_dir, base_names, limit_mb).items():
+        if target_set is not None and base not in target_set:
+            continue
+        if base in selected:
+            continue
+        best = best_probe_sample(samples)
+        if best and best.get("status") == "ok":
+            selected[base] = {
+                "batch_size": int(best["batch_size"]),
+                "probe_name": best.get("probe_name", ""),
+                "peak_memory_mb": best.get("peak_memory_mb", ""),
+                "metrics_file": best.get("metrics_file", ""),
+                "source": "resume_metrics",
+            }
+
+    pending = {}
+    for exp in base_plan:
+        name = exp["name"]
+        if target_set is not None and name not in target_set:
+            continue
+        if name in selected:
+            continue
+        pending[name] = {
+            "exp": exp,
+            "batches": list(batch_sizes),
+            "done": False,
+            "attempts": [],
+        }
+
+    return pending, selected
+
+
 def run_quick_probe(args):
+    prepare_probe_run_args(args)
     base_plan = build_plan(args.stage, args.plan_size)
     batch_sizes = sorted(set(args.batch_sizes), reverse=True)
     if args.fallback_batch_size is None:
@@ -1234,22 +1751,23 @@ def run_quick_probe(args):
     args._quick_base_names = [exp["name"] for exp in base_plan]
     node_groups = resolve_node_groups(args, "quick-probe")
 
-    pending = {
-        exp["name"]: {
-            "exp": exp,
-            "batches": list(batch_sizes),
-            "done": False,
-            "attempts": [],
-        }
-        for exp in base_plan
-    }
+    probe_targets = getattr(args, "_probe_targets", None)
+    if probe_targets is None and args.max_probe_experiments > 0:
+        profile, meta = build_smart_profile(base_plan, args)
+        probe_targets = select_probe_targets(base_plan, meta, args)
+    elif probe_targets is None:
+        probe_targets = [exp["name"] for exp in base_plan]
+
+    pending, selected = seed_quick_probe_state(base_plan, args, probe_targets)
     queue = list(pending.keys())
     running = {}
-    selected = {}
     attempts = []
+    probe_attempts = 0
     started_at = time.time()
-    deadline = started_at + args.time_limit_min * 60 if args.time_limit_min > 0 else None
-    limit_mb = args.target_memory_gb * 1024 * args.memory_util
+    budget_min = effective_probe_budget_min(args)
+    deadline = started_at + budget_min * 60 if budget_min > 0 else None
+    limit_mb = memory_limit_mb(args)
+    max_attempts = max(0, getattr(args, "max_probe_attempts", 0))
 
     def next_probe():
         while queue:
@@ -1258,14 +1776,24 @@ def run_quick_probe(args):
             if item["done"] or not item["batches"]:
                 continue
             batch_size = item["batches"].pop(0)
-            return base_name, quick_probe_experiment(
+            probe_exp = quick_probe_experiment(
                 item["exp"], batch_size, args.tune_steps, args.tune_log_interval)
+            if getattr(args, "resume", True) and probe_task_already_done(
+                    probe_exp["name"], args.metrics_dir):
+                item["attempts"].append({
+                    "batch_size": batch_size,
+                    "status": "resume_skip",
+                    "peak_memory_mb": None,
+                })
+                continue
+            return base_name, probe_exp
         return None, None
 
-    total = len(base_plan)
+    total = len(probe_targets) if probe_targets else len(base_plan)
     while queue or running:
         now = time.time()
-        scheduling_open = deadline is None or now < deadline
+        attempts_open = max_attempts <= 0 or probe_attempts < max_attempts
+        scheduling_open = attempts_open and (deadline is None or now < deadline)
         status = pool_status(args.master_addr, args.port)
         if scheduling_open:
             for idx, group in enumerate(node_groups):
@@ -1278,9 +1806,10 @@ def run_quick_probe(args):
                     continue
                 exp["node_addrs"] = group
                 batch_size = exp["args"]["batch_size"]
+                probe_attempts += 1
                 print(
-                    f"\n[quick {len(selected)}/{total}] lane={idx} "
-                    f"{base_name} bs={batch_size}",
+                    f"\n[quick {len(selected)}/{total}] attempt={probe_attempts} "
+                    f"lane={idx} {base_name} bs={batch_size}",
                     flush=True,
                 )
                 task = submit_exp(args, exp, wait=0)
@@ -1351,11 +1880,15 @@ def run_quick_probe(args):
                 else:
                     base["done"] = True
                     selected[item["base_name"]] = selected_item
+                    selected[item["base_name"]]["source"] = "probed"
                 print(
                     f"[selected {len(selected)}/{total}] {item['base_name']} "
                     f"bs={item['batch_size']} mem={result.get('peak_memory_mb', '')}",
                     flush=True,
                 )
+                on_selected = getattr(args, "_on_probe_selected", None)
+                if on_selected:
+                    on_selected(item["base_name"], selected[item["base_name"]])
             else:
                 if status in {"oom", "over_memory"}:
                     apply_oom_backoff(base, item["batch_size"], args.oom_backoff_ratio)
@@ -1375,9 +1908,11 @@ def run_quick_probe(args):
                 )
             write_quick_outputs(args, selected, attempts)
 
+        if max_attempts > 0 and probe_attempts >= max_attempts and not running:
+            queue = []
         if deadline is not None and time.time() >= deadline and not running:
-            break
-        if deadline is not None and time.time() >= deadline and queue:
+            queue = []
+        if deadline is not None and time.time() >= deadline and queue and not running:
             queue = []
         if queue or running:
             time.sleep(args.poll_interval)
@@ -1386,9 +1921,10 @@ def run_quick_probe(args):
     missing = total - len(selected)
     print(
         f"quick probe done: selected={len(selected)} missing={missing} "
-        f"profile={args.output} report={args.report_output}",
+        f"attempts={probe_attempts} profile={args.output} report={args.report_output}",
         flush=True,
     )
+    return selected
 
 
 def latest_rows(metrics_dir):
@@ -1497,21 +2033,291 @@ def recommend_batches(args):
     print(f"wrote batch recommendations: {args.output}")
 
 
+def run_streaming_probe_and_parallel(args, base_plan, profile, profile_meta, probe_targets):
+    prepare_probe_run_args(args)
+    limit_mb = memory_limit_mb(args)
+    done = completed_final_experiments(args.metrics_dir)
+    run_plan = apply_batch_profile(base_plan, profile)
+    run_queue = [exp for exp in run_plan if exp["name"] not in done]
+
+    node_groups = resolve_node_groups(args, "probe-and-run")
+    max_probe_lanes = min(max(0, args.max_probe_lanes), len(node_groups))
+    probe_lane_ids = set(range(max_probe_lanes))
+
+    pending, selected = seed_quick_probe_state(base_plan, args, probe_targets)
+    queue = list(pending.keys())
+    running_probes = {}
+    running_runs = {}
+    completed_runs = 0
+    total_runs = len(run_queue)
+    probe_attempts = 0
+    attempts = []
+    started_at = time.time()
+    budget_min = effective_probe_budget_min(args)
+    deadline = started_at + budget_min * 60 if budget_min > 0 else None
+    max_attempts = max(0, args.max_probe_attempts)
+
+    args.output = args.quick_output
+    args._quick_base_names = [exp["name"] for exp in base_plan]
+
+    def on_probe_selected(base_name, item):
+        profile[base_name] = int(item["batch_size"])
+        profile_meta[base_name] = {
+            "batch_size": int(item["batch_size"]),
+            "source": "probed",
+            "peak_memory_mb": item.get("peak_memory_mb", ""),
+            "metrics_file": item.get("metrics_file", ""),
+            "selected_probe": item.get("probe_name", "probed"),
+        }
+        write_merged_batch_profile(args.batch_profile, base_plan, profile, profile_meta, args)
+
+    args._on_probe_selected = on_probe_selected
+
+    def next_probe():
+        while queue:
+            base_name = queue.pop(0)
+            item = pending[base_name]
+            if item["done"] or not item["batches"]:
+                continue
+            batch_size = item["batches"].pop(0)
+            probe_exp = quick_probe_experiment(
+                item["exp"], batch_size, args.tune_steps, args.tune_log_interval)
+            if args.resume and probe_task_already_done(probe_exp["name"], args.metrics_dir):
+                item["attempts"].append({
+                    "batch_size": batch_size,
+                    "status": "resume_skip",
+                    "peak_memory_mb": None,
+                })
+                continue
+            return base_name, probe_exp
+        return None, None
+
+    total_probe = len(probe_targets)
+    write_merged_batch_profile(args.batch_profile, base_plan, profile, profile_meta, args)
+    print(
+        f"[streaming] starting formal runs ({total_runs}) while probing "
+        f"{len(probe_targets)} representatives on {max_probe_lanes} lane(s)",
+        flush=True,
+    )
+
+    while run_queue or running_runs or queue or running_probes:
+        now = time.time()
+        attempts_open = max_attempts <= 0 or probe_attempts < max_attempts
+        probe_open = attempts_open and (deadline is None or now < deadline)
+        status = pool_status(args.master_addr, args.port)
+
+        for idx, group in enumerate(node_groups):
+            if idx in running_runs or idx in running_probes:
+                continue
+            if not node_group_idle_from_status(status, group):
+                continue
+
+            if run_queue:
+                exp = dict(run_queue.pop(0))
+                exp["node_addrs"] = group
+                print(
+                    f"\n[run {completed_runs + len(running_runs) + 1}/{total_runs}] "
+                    f"lane={idx} {exp['name']} bs={exp['args'].get('batch_size', '')}",
+                    flush=True,
+                )
+                task = submit_exp(args, exp, wait=0)
+                running_runs[idx] = {
+                    "task_id": task["task_id"],
+                    "nodes": group,
+                    "name": exp["name"],
+                    "submitted_at": time.time(),
+                }
+                continue
+
+            if probe_open and (idx in probe_lane_ids or not run_queue):
+                base_name, exp = next_probe()
+                if exp is None:
+                    continue
+                exp["node_addrs"] = group
+                batch_size = exp["args"]["batch_size"]
+                probe_attempts += 1
+                print(
+                    f"\n[quick {len(selected)}/{total_probe}] attempt={probe_attempts} "
+                    f"lane={idx} {base_name} bs={batch_size}",
+                    flush=True,
+                )
+                task = submit_exp(args, exp, wait=0)
+                running_probes[idx] = {
+                    "task_id": task["task_id"],
+                    "nodes": group,
+                    "name": exp["name"],
+                    "base_name": base_name,
+                    "batch_size": batch_size,
+                    "submitted_at": time.time(),
+                }
+
+        done_runs = []
+        status = pool_status(args.master_addr, args.port)
+        for idx, item in running_runs.items():
+            if time.time() - item["submitted_at"] < args.startup_grace:
+                continue
+            if (
+                node_group_idle_from_status(status, item["nodes"])
+                and not task_running_in_status(status, item["task_id"])
+            ):
+                done_runs.append(idx)
+        for idx in done_runs:
+            item = running_runs.pop(idx)
+            completed_runs += 1
+            print(
+                f"[done run {completed_runs}/{total_runs}] lane={idx} "
+                f"{item['name']} task={item['task_id']}",
+                flush=True,
+            )
+
+        done_probes = []
+        status = pool_status(args.master_addr, args.port)
+        for idx, item in running_probes.items():
+            if time.time() - item["submitted_at"] < args.startup_grace:
+                continue
+            if (
+                node_group_idle_from_status(status, item["nodes"])
+                and not task_running_in_status(status, item["task_id"])
+            ):
+                done_probes.append(idx)
+
+        for idx in done_probes:
+            item = running_probes.pop(idx)
+            result = probe_result_after_settle(
+                item["name"], args.metrics_dir, args.metrics_settle_seconds)
+            peak_memory_mb = result_peak_memory_mb(result)
+            status_name = result["status"]
+            if status_name == "ok" and peak_memory_mb is not None and peak_memory_mb > limit_mb:
+                status_name = "over_memory"
+                result = dict(result)
+                result["status"] = status_name
+            attempt = {
+                "base_experiment": item["base_name"],
+                "probe_experiment": item["name"],
+                "batch_size": item["batch_size"],
+                "memory_limit_mb": round(limit_mb, 3),
+                **result,
+            }
+            attempts.append(attempt)
+            base = pending[item["base_name"]]
+            base["attempts"].append({
+                "batch_size": item["batch_size"],
+                "status": status_name,
+                "peak_memory_mb": peak_memory_mb,
+            })
+            if status_name == "ok":
+                selected_item = {
+                    "batch_size": item["batch_size"],
+                    "probe_name": item["name"],
+                    "peak_memory_mb": result.get("peak_memory_mb", ""),
+                    "tokens_per_sec": result.get("tokens_per_sec", ""),
+                    "metrics_file": result.get("metrics_file", ""),
+                    "source": "probed",
+                }
+                refine_batch = maybe_refine_quick_probe(
+                    base, item["batch_size"], peak_memory_mb, limit_mb, args)
+                if refine_batch is not None:
+                    selected[item["base_name"]] = selected_item
+                    base["done"] = False
+                    base["batches"] = [refine_batch]
+                    queue.append(item["base_name"])
+                else:
+                    base["done"] = True
+                    selected[item["base_name"]] = selected_item
+                    on_probe_selected(item["base_name"], selected_item)
+            else:
+                if status_name in {"oom", "over_memory"}:
+                    apply_oom_backoff(base, item["batch_size"], args.oom_backoff_ratio)
+                if base["batches"]:
+                    queue.append(item["base_name"])
+                else:
+                    retry_batch = maybe_retry_skipped_after_missing(base, args)
+                    if retry_batch is not None and item["base_name"] not in selected:
+                        base["batches"] = [retry_batch]
+                        queue.append(item["base_name"])
+                    else:
+                        base["done"] = True
+
+            write_quick_outputs(args, selected, attempts)
+
+        if max_attempts > 0 and probe_attempts >= max_attempts and not running_probes:
+            queue = []
+        if deadline is not None and time.time() >= deadline and not running_probes:
+            queue = []
+
+        if run_queue or running_runs or queue or running_probes:
+            time.sleep(args.poll_interval)
+
+    write_quick_outputs(args, selected, attempts)
+    write_merged_batch_profile(args.batch_profile, base_plan, profile, profile_meta, args)
+    print(
+        f"[streaming] done: runs={completed_runs}/{total_runs} "
+        f"probe_selected={len(selected)}/{total_probe} probe_attempts={probe_attempts}",
+        flush=True,
+    )
+
+
+def run_only(args):
+    prepare_probe_run_args(args)
+    if not args.batch_profile or not os.path.exists(args.batch_profile):
+        raise SystemExit(
+            f"run-only requires an existing --batch_profile; not found: {args.batch_profile}"
+        )
+    base_plan = build_plan(args.stage, args.plan_size)
+    profile = load_batch_profile(args.batch_profile)
+    print_execution_plan(
+        args, base_plan, mode="run-only", profile=profile,
+        profile_meta=load_batch_profile_meta(args.batch_profile),
+    )
+    args.batch_tune = False
+    run_parallel(args)
+
+
 def run_probe_and_parallel(args):
+    prepare_probe_run_args(args)
+    base_plan = build_plan(args.stage, args.plan_size)
+
+    if should_skip_probe(args, base_plan):
+        profile = load_batch_profile(args.batch_profile)
+        print_execution_plan(
+            args, base_plan, mode="run-only (batch_profile exists)",
+            profile=profile, profile_meta=load_batch_profile_meta(args.batch_profile),
+        )
+        print(
+            f"[probe-and-run] skipping probe; using existing profile {args.batch_profile}",
+            flush=True,
+        )
+        args.batch_tune = False
+        run_parallel(args)
+        return
+
+    profile, profile_meta = build_smart_profile(base_plan, args)
+    probe_targets = select_probe_targets(base_plan, profile_meta, args)
+    print_execution_plan(
+        args, base_plan, mode="probe-and-run", probe_targets=probe_targets,
+        profile=profile, profile_meta=profile_meta,
+    )
+
+    write_merged_batch_profile(args.batch_profile, base_plan, profile, profile_meta, args)
+    args.batch_tune = False
+
+    if args.streaming:
+        run_streaming_probe_and_parallel(args, base_plan, profile, profile_meta, probe_targets)
+        return
+
     quick_output = args.quick_output
     batch_profile = args.batch_profile
-
-    print(f"[probe-and-run] probing batches -> {quick_output}", flush=True)
+    args._probe_targets = probe_targets
+    print(f"[probe-and-run] limited probe -> {quick_output}", flush=True)
     args.output = quick_output
     run_quick_probe(args)
 
-    print(f"[probe-and-run] recommending batches -> {batch_profile}", flush=True)
-    args.output = batch_profile
-    recommend_batches(args)
+    print(f"[probe-and-run] merging recommendations -> {batch_profile}", flush=True)
+    profile, profile_meta = build_smart_profile(base_plan, args)
+    write_merged_batch_profile(batch_profile, base_plan, profile, profile_meta, args)
 
     print(f"[probe-and-run] starting run-parallel with {batch_profile}", flush=True)
     args.batch_profile = batch_profile
-    args.batch_tune = False
     run_parallel(args)
 
 
@@ -1690,8 +2496,8 @@ def parse_args():
     p.set_defaults(func=print_commands)
 
     p = sub.add_parser("final-plan", parents=[common])
-    p.add_argument("--output", default="runs/experiment_plans/impl_validation_final_plan.csv")
-    p.add_argument("--batch_profile", default="runs/metrics/impl_validation_batch_profile.csv")
+    p.add_argument("--output", default=None)
+    p.add_argument("--batch_profile", default=None)
     p.set_defaults(func=export_final_plan)
 
     p = sub.add_parser("batch-commands", parents=[common])
@@ -1720,6 +2526,8 @@ def parse_args():
     p.add_argument("--startup_grace", type=float, default=20.0)
     p.add_argument("--poll_interval", type=float, default=30.0)
     p.add_argument("--batch_profile", default=None)
+    p.add_argument("--metrics_dir", default="runs/metrics")
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--batch_tune", action="store_true")
     p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
     p.add_argument("--tune_steps", type=int, default=80)
@@ -1731,73 +2539,76 @@ def parse_args():
     p.add_argument("--gpus_per_node", type=int, default=8)
     p.set_defaults(func=run_parallel)
 
-    p = sub.add_parser("quick-probe", parents=[common])
-    p.add_argument("--startup_grace", type=float, default=60.0)
-    p.add_argument("--poll_interval", type=float, default=10.0)
-    p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
-    p.add_argument("--tune_steps", type=int, default=3)
-    p.add_argument("--tune_log_interval", type=int, default=1)
-    p.add_argument("--time_limit_min", type=float, default=15.0)
-    p.add_argument("--metrics_settle_seconds", type=float, default=45.0,
-                   help="Wait this long for metrics/failure files after a lane becomes idle.")
-    p.add_argument("--oom_backoff_ratio", type=float, default=0.67,
-                   help="After OOM/over_memory, only try remaining batches <= current_batch * ratio; set 1.0 to disable.")
-    p.add_argument("--refine_bracket_after_ok", action=argparse.BooleanOptionalAction, default=True,
-                   help="After a lower batch succeeds below an OOM/over_memory batch, try one skipped middle batch when memory looks safe.")
-    p.add_argument("--refine_memory_margin", type=float, default=0.97,
-                   help="Only run bracket refinement when linear memory estimate is below limit * margin.")
-    p.add_argument("--metrics_dir", default="runs/metrics")
-    p.add_argument("--output", default="runs/metrics/impl_validation_batch_profile_quick.csv")
-    p.add_argument("--report_output", default="runs/metrics/impl_validation_quick_probe_report.csv")
-    p.add_argument("--target_memory_gb", type=float, default=80.0)
-    p.add_argument("--memory_util", type=float, default=0.90)
-    p.add_argument("--fallback_batch_size", type=int, default=None,
-                   help="Batch size used for experiments not resolved before the time limit; default=min(batch_sizes).")
-    p.add_argument("--node_groups", nargs="*", default=None,
-                   help="Node groups for quick probe lanes; omitted means NODE_ADDRS from --config.")
-    p.add_argument("--gpus_per_lane", type=int, default=2,
-                   help="Split bare single-node groups into GPU lanes; default 2 gives 16 two-GPU lanes for four 8-GPU nodes.")
-    p.add_argument("--gpus_per_node", type=int, default=8)
+    probe_common = argparse.ArgumentParser(add_help=False)
+    probe_common.add_argument("--startup_grace", type=float, default=60.0)
+    probe_common.add_argument("--poll_interval", type=float, default=10.0)
+    probe_common.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
+    probe_common.add_argument("--tune_steps", type=int, default=3)
+    probe_common.add_argument("--tune_log_interval", type=int, default=1)
+    probe_common.add_argument("--time_limit_min", type=float, default=15.0)
+    probe_common.add_argument("--probe_time_budget_min", type=float, default=45.0,
+                              help="Hard cap on probe phase wall time; 0 disables.")
+    probe_common.add_argument("--max_probe_experiments", type=int, default=32,
+                              help="Probe at most this many base experiments (family representatives); 0 disables live probe.")
+    probe_common.add_argument("--max_probe_attempts", type=int, default=96,
+                              help="Hard cap on total probe task submissions across all experiments; 0 disables.")
+    probe_common.add_argument("--max_probe_lanes", type=int, default=2,
+                              help="Lanes reserved for probe tasks during streaming; remaining lanes run formal jobs.")
+    probe_common.add_argument("--metrics_settle_seconds", type=float, default=45.0,
+                              help="Wait this long for metrics/failure files after a lane becomes idle.")
+    probe_common.add_argument("--oom_backoff_ratio", type=float, default=0.67,
+                              help="After OOM/over_memory, only try remaining batches <= current_batch * ratio; set 1.0 to disable.")
+    probe_common.add_argument("--refine_bracket_after_ok", action=argparse.BooleanOptionalAction, default=True,
+                              help="After a lower batch succeeds below an OOM/over_memory batch, try one skipped middle batch when memory looks safe.")
+    probe_common.add_argument("--refine_memory_margin", type=float, default=0.97,
+                              help="Only run bracket refinement when linear memory estimate is below limit * margin.")
+    probe_common.add_argument("--metrics_dir", default="runs/metrics")
+    probe_common.add_argument("--target_memory_gb", type=float, default=80.0)
+    probe_common.add_argument("--memory_util", type=float, default=0.90)
+    probe_common.add_argument("--fallback_batch_size", type=int, default=None,
+                              help="Batch size used for experiments not resolved before limits; default=min(batch_sizes).")
+    probe_common.add_argument("--node_groups", nargs="*", default=None,
+                              help="Node groups for quick probe lanes; omitted means NODE_ADDRS from --config.")
+    probe_common.add_argument("--gpus_per_lane", type=int, default=2,
+                              help="Split bare single-node groups into GPU lanes; default 2 gives 16 two-GPU lanes for four 8-GPU nodes.")
+    probe_common.add_argument("--gpus_per_node", type=int, default=8)
+    probe_common.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
+                              help="Reuse existing qp__ metrics and final og metrics instead of resubmitting.")
+
+    p = sub.add_parser("quick-probe", parents=[common, probe_common])
+    p.add_argument("--output", default=None)
+    p.add_argument("--report_output", default=None)
     p.set_defaults(func=run_quick_probe)
 
-    p = sub.add_parser("probe-and-run", parents=[common])
-    p.add_argument("--startup_grace", type=float, default=60.0)
-    p.add_argument("--poll_interval", type=float, default=10.0)
-    p.add_argument("--batch_sizes", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12])
-    p.add_argument("--tune_steps", type=int, default=3)
-    p.add_argument("--tune_log_interval", type=int, default=1)
-    p.add_argument("--time_limit_min", type=float, default=15.0)
-    p.add_argument("--metrics_settle_seconds", type=float, default=45.0,
-                   help="Wait this long for metrics/failure files after a lane becomes idle.")
-    p.add_argument("--oom_backoff_ratio", type=float, default=0.67,
-                   help="After OOM/over_memory, only try remaining batches <= current_batch * ratio; set 1.0 to disable.")
-    p.add_argument("--refine_bracket_after_ok", action=argparse.BooleanOptionalAction, default=True,
-                   help="After a lower batch succeeds below an OOM/over_memory batch, try one skipped middle batch when memory looks safe.")
-    p.add_argument("--refine_memory_margin", type=float, default=0.97,
-                   help="Only run bracket refinement when linear memory estimate is below limit * margin.")
-    p.add_argument("--metrics_dir", default="runs/metrics")
-    p.add_argument("--quick_output", default="runs/metrics/impl_validation_batch_profile_quick.csv")
-    p.add_argument("--report_output", default="runs/metrics/impl_validation_quick_probe_report.csv")
-    p.add_argument("--batch_profile", default="runs/metrics/impl_validation_batch_profile.csv")
-    p.add_argument("--target_memory_gb", type=float, default=80.0)
-    p.add_argument("--memory_util", type=float, default=0.90)
-    p.add_argument("--fallback_batch_size", type=int, default=None,
-                   help="Batch size used for experiments not resolved before the time limit; default=min(batch_sizes).")
-    p.add_argument("--node_groups", nargs="*", default=None,
-                   help="Node groups for quick probe and run lanes; omitted means NODE_ADDRS from --config.")
-    p.add_argument("--gpus_per_lane", type=int, default=2,
-                   help="Split bare single-node groups into GPU lanes; default 2 gives 16 two-GPU lanes for four 8-GPU nodes.")
-    p.add_argument("--gpus_per_node", type=int, default=8)
+    p = sub.add_parser("probe-and-run", parents=[common, probe_common])
+    p.add_argument("--quick_output", default=None)
+    p.add_argument("--report_output", default=None)
+    p.add_argument("--batch_profile", default=None)
+    p.add_argument("--force_probe", action="store_true",
+                   help="Run probe even when batch_profile already exists.")
+    p.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True,
+                   help="Start formal runs immediately using inferred batches while limited probe runs in background.")
     p.set_defaults(func=run_probe_and_parallel)
+
+    p = sub.add_parser("run-only", parents=[common])
+    p.add_argument("--startup_grace", type=float, default=20.0)
+    p.add_argument("--poll_interval", type=float, default=30.0)
+    p.add_argument("--batch_profile", default=None)
+    p.add_argument("--metrics_dir", default="runs/metrics")
+    p.add_argument("--node_groups", nargs="*", default=None)
+    p.add_argument("--gpus_per_lane", type=int, default=2)
+    p.add_argument("--gpus_per_node", type=int, default=8)
+    p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    p.set_defaults(func=run_only)
 
     p = sub.add_parser("summarize")
     p.add_argument("--metrics_dir", default="runs/metrics")
-    p.add_argument("--output", default="runs/metrics/impl_validation_summary.csv")
+    p.add_argument("--output", default=None)
     p.set_defaults(func=summarize)
 
     p = sub.add_parser("recommend-batches")
     p.add_argument("--metrics_dir", default="runs/metrics")
-    p.add_argument("--output", default="runs/metrics/impl_validation_batch_profile.csv")
+    p.add_argument("--output", default=None)
     p.add_argument("--target_memory_gb", type=float, default=80.0)
     p.add_argument("--memory_util", type=float, default=0.90)
     p.set_defaults(func=recommend_batches)
@@ -1813,11 +2624,33 @@ def parse_args():
     p.set_defaults(func=batch_report)
 
     args = parser.parse_args()
-    if args.cmd in ("run", "run-parallel", "quick-probe"):
+    if getattr(args, "output", None) is None:
+        if args.cmd == "summarize":
+            args.output = metrics_path("summary.csv")
+        elif args.cmd == "recommend-batches":
+            args.output = metrics_path("batch_profile.csv")
+        elif args.cmd == "final-plan":
+            args.output = f"runs/experiment_plans/{PLAN_METRICS_PREFIX}_final_plan.csv"
+        elif args.cmd == "quick-probe":
+            args.output = metrics_path("batch_profile_quick.csv")
+            args.report_output = metrics_path("quick_probe_report.csv")
+    if args.cmd == "probe-and-run":
+        if getattr(args, "quick_output", None) is None:
+            args.quick_output = metrics_path("batch_profile_quick.csv")
+        if getattr(args, "report_output", None) is None:
+            args.report_output = metrics_path("quick_probe_report.csv")
+        if getattr(args, "batch_profile", None) is None:
+            args.batch_profile = metrics_path("batch_profile.csv")
+    if args.cmd == "run-only":
+        if getattr(args, "batch_profile", None) is None:
+            args.batch_profile = metrics_path("batch_profile.csv")
+    if args.cmd in ("run", "run-parallel", "quick-probe", "probe-and-run", "run-only"):
         if args.master_addr is None:
             args.master_addr = "11.131.210.78"
         if args.port is None:
             args.port = 8765
+    if args.cmd == "final-plan" and getattr(args, "batch_profile", None) is None:
+        args.batch_profile = metrics_path("batch_profile.csv")
     return args
 
 

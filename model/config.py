@@ -71,6 +71,13 @@ class CTMLLMConfig:
         self.fast_output_ticks = kwargs.get('fast_output_ticks', '1,4')
         self.fast_output_distill_weight = kwargs.get('fast_output_distill_weight', 0.0)
 
+        self.async_tick_mode = kwargs.get('async_tick_mode', 'none')
+        self.async_tick_periods = kwargs.get('async_tick_periods', '1,2,4,8')
+        self.async_tick_phases = kwargs.get('async_tick_phases', '')
+        self.async_fast_band = kwargs.get('async_fast_band', 0)
+        self.async_fast_output_weight = kwargs.get('async_fast_output_weight', 0.0)
+        self.async_stale_band_weight = kwargs.get('async_stale_band_weight', 0.35)
+
         self.ttt_layer = kwargs.get('ttt_layer', False)
         self.ttt_hidden_mult = kwargs.get('ttt_hidden_mult', 2)
         self.ttt_gate_init = kwargs.get('ttt_gate_init', -2.0)

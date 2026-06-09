@@ -338,6 +338,12 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'slow_output_weight': args.slow_output_weight,
                     'fast_output_ticks': args.fast_output_ticks,
                     'fast_output_distill_weight': args.fast_output_distill_weight,
+                    'async_tick_mode': args.async_tick_mode,
+                    'async_tick_periods': args.async_tick_periods,
+                    'async_tick_phases': args.async_tick_phases,
+                    'async_fast_band': args.async_fast_band,
+                    'async_fast_output_weight': args.async_fast_output_weight,
+                    'async_stale_band_weight': args.async_stale_band_weight,
                     'self_cond': args.self_cond,
                     'cross_layer_state': args.cross_layer_state,
                     'max_seq_len': args.max_seq_len,
@@ -459,6 +465,13 @@ if __name__ == '__main__':
     parser.add_argument('--slow_output_weight', type=float, default=0.0)
     parser.add_argument('--fast_output_ticks', type=str, default='1,4')
     parser.add_argument('--fast_output_distill_weight', type=float, default=0.0)
+    parser.add_argument('--async_tick_mode', type=str, default='none',
+                        choices=['none', 'banded'])
+    parser.add_argument('--async_tick_periods', type=str, default='1,2,4,8')
+    parser.add_argument('--async_tick_phases', type=str, default='')
+    parser.add_argument('--async_fast_band', type=int, default=0)
+    parser.add_argument('--async_fast_output_weight', type=float, default=0.0)
+    parser.add_argument('--async_stale_band_weight', type=float, default=0.35)
     parser.add_argument('--ttt_layer', type=int, default=0, choices=[0, 1])
     parser.add_argument('--ttt_hidden_mult', type=int, default=2)
     parser.add_argument('--ttt_gate_init', type=float, default=-2.0)
@@ -565,6 +578,12 @@ if __name__ == '__main__':
         slow_output_weight=args.slow_output_weight,
         fast_output_ticks=args.fast_output_ticks,
         fast_output_distill_weight=args.fast_output_distill_weight,
+        async_tick_mode=args.async_tick_mode,
+        async_tick_periods=args.async_tick_periods,
+        async_tick_phases=args.async_tick_phases,
+        async_fast_band=args.async_fast_band,
+        async_fast_output_weight=args.async_fast_output_weight,
+        async_stale_band_weight=args.async_stale_band_weight,
         ttt_layer=bool(args.ttt_layer),
         ttt_hidden_mult=args.ttt_hidden_mult,
         ttt_gate_init=args.ttt_gate_init,

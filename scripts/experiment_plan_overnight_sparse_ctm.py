@@ -627,6 +627,7 @@ def build_plan(stage, plan_size="full"):
     return base.validate_plan(plan)
 
 
+base.configure_plan_defaults(metrics_prefix="overnight_sparse_ctm")
 base.REGIONAL_STAGES = OVERNIGHT_STAGES
 base.REGIONAL_PREFIXES = OVERNIGHT_PREFIXES
 base.build_plan = build_plan

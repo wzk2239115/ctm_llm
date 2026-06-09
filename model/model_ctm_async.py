@@ -1,3 +1,10 @@
+"""Async-first CTM backend copied from model_ctm_llm.py.
+
+Each clock band owns its own local tick counter, cell slice, trace carry rules,
+and output projection. Fast bands (period=1) fire every global tick and anchor
+guaranteed emission; slow bands keep their last projection in the mix while they
+wait for their next fire.
+"""
 import math
 import torch
 import torch.nn as nn
@@ -27,6 +34,163 @@ def _parse_int_list(raw, *, max_value=None):
     return sorted(values)
 
 
+class AsyncClockBand:
+    """One asynchronous oscillator lane inside a CTM block."""
+
+    __slots__ = (
+        'band_id', 'period', 'phase', 'd_start', 'd_end',
+        'expert_start', 'expert_end', 'use_expert_layout',
+        'local_tick', 'last_tick_out', 'stale_weight',
+    )
+
+    def __init__(
+        self,
+        band_id,
+        period,
+        phase,
+        d_start,
+        d_end,
+        *,
+        expert_start=0,
+        expert_end=0,
+        use_expert_layout=False,
+        stale_weight=0.35,
+    ):
+        self.band_id = band_id
+        self.period = max(1, int(period))
+        self.phase = int(phase)
+        self.d_start = d_start
+        self.d_end = d_end
+        self.expert_start = expert_start
+        self.expert_end = expert_end
+        self.use_expert_layout = use_expert_layout
+        self.local_tick = 0
+        self.last_tick_out = None
+        self.stale_weight = float(stale_weight)
+
+    def fires(self, global_tick):
+        return (global_tick + self.phase) % self.period == 0
+
+    @property
+    def is_fast(self):
+        return self.period == 1
+
+    def reset_runtime(self):
+        self.local_tick = 0
+        self.last_tick_out = None
+
+    def mask_activated(self, activated):
+        masked = torch.zeros_like(activated)
+        masked[:, :, self.d_start:self.d_end] = activated[:, :, self.d_start:self.d_end]
+        return masked
+
+    def emission_weight(self, global_tick):
+        if self.is_fast or self.fires(global_tick):
+            return 1.0
+        return self.stale_weight
+
+
+class AsyncClockEngine(nn.Module):
+    """Drives per-band clocks, carry, and fused emission inside AsyncCTMBlock."""
+
+    def __init__(self, block, config):
+        super().__init__()
+        periods = _parse_int_list(getattr(config, 'async_tick_periods', '1,2,4,8'))
+        phases = _parse_int_list(getattr(config, 'async_tick_phases', ''))
+        if not periods:
+            periods = [1]
+        self.num_bands = len(periods)
+        self.fast_band = min(
+            max(0, int(getattr(config, 'async_fast_band', 0))),
+            self.num_bands - 1)
+        stale = float(getattr(config, 'async_stale_band_weight', 0.35))
+        while len(phases) < self.num_bands:
+            phases.append(0)
+        phases = phases[:self.num_bands]
+
+        self.bands = []
+        if block._async_expert_layout():
+            per_band = max(1, math.ceil(block.moe_num_experts / self.num_bands))
+            for band_id, period in enumerate(periods):
+                expert_start = band_id * per_band
+                expert_end = (
+                    block.moe_num_experts
+                    if band_id == self.num_bands - 1
+                    else min((band_id + 1) * per_band, block.moe_num_experts))
+                d_start = expert_start * block.moe_expert_size
+                d_end = expert_end * block.moe_expert_size
+                self.bands.append(AsyncClockBand(
+                    band_id, period, phases[band_id], d_start, d_end,
+                    expert_start=expert_start, expert_end=expert_end,
+                    use_expert_layout=True, stale_weight=stale))
+        else:
+            per_band = max(1, math.ceil(block.d_model / self.num_bands))
+            for band_id, period in enumerate(periods):
+                d_start = band_id * per_band
+                d_end = block.d_model if band_id == self.num_bands - 1 else (band_id + 1) * per_band
+                self.bands.append(AsyncClockBand(
+                    band_id, period, phases[band_id], d_start, d_end,
+                    stale_weight=stale))
+
+        self.band_output_projs = nn.ModuleList([
+            nn.Linear(block.synch_repr_out, config.hidden_size, bias=False)
+            for _ in range(self.num_bands)
+        ])
+        self.fuse_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.global_output_proj = block.output_proj
+        self.fast_output_weight = float(getattr(config, 'async_fast_output_weight', 0.0))
+
+    def reset_runtime(self):
+        for band in self.bands:
+            band.reset_runtime()
+
+    def bands_fired_count(self, global_tick):
+        return sum(1 for band in self.bands if band.fires(global_tick))
+
+    def band_for_expert(self, expert):
+        for band in self.bands:
+            if band.use_expert_layout and band.expert_start <= expert < band.expert_end:
+                return band
+        return self.bands[-1]
+
+    def apply_carry(self, activated, activated_prev, state_trace, trace_prev, global_tick):
+        for band in self.bands:
+            if band.fires(global_tick):
+                continue
+            activated[:, :, band.d_start:band.d_end] = (
+                activated_prev[:, :, band.d_start:band.d_end])
+            state_trace[:, :, band.d_start:band.d_end, :] = (
+                trace_prev[:, :, band.d_start:band.d_end, :])
+        return activated, state_trace
+
+    def emit_tick_output(self, block, activated, alpha_o, beta_o, r_o, global_tick):
+        weighted = []
+        weights = []
+        for band, proj in zip(self.bands, self.band_output_projs):
+            masked = band.mask_activated(activated)
+            sync_o, _, _ = block._compute_synch(
+                masked, alpha_o, beta_o, r_o, block.out_left, block.out_right)
+            band_out = proj(sync_o)
+            band.last_tick_out = band_out
+            w = band.emission_weight(global_tick)
+            weighted.append(band_out * w)
+            weights.append(w)
+
+        total_w = max(sum(weights), 1e-6)
+        tick_out = torch.stack(weighted, dim=0).sum(dim=0) / total_w
+        tick_out = self.fuse_norm(tick_out)
+
+        fast_w = self.fast_output_weight
+        if fast_w > 0:
+            fast_band = self.bands[self.fast_band]
+            if fast_band.last_tick_out is not None:
+                tick_out = tick_out * (1.0 - fast_w) + fast_band.last_tick_out * fast_w
+        return tick_out
+
+    def local_tick_vector(self):
+        return [band.local_tick for band in self.bands]
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -50,7 +214,7 @@ class FeedForward(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class CTMBlock(nn.Module):
+class AsyncCTMBlock(nn.Module):
     def __init__(self, layer_id: int, config: CTMLLMConfig):
         super().__init__()
         self.layer_id = layer_id
@@ -91,6 +255,8 @@ class CTMBlock(nn.Module):
             getattr(config, 'moe_aux_loss_free_bias', False))
         self.moe_aux_loss = None
         self.last_executed_ticks = 0
+        self.last_async_bands_fired = 0
+        self.last_async_local_ticks = []
         self.diff_cell_mode = getattr(config, 'diff_cell_mode', 'none')
         self.diff_cell_temperature = float(
             getattr(config, 'diff_cell_temperature', 1.0))
@@ -176,10 +342,18 @@ class CTMBlock(nn.Module):
         self._init_synch(config)
 
         self.output_proj = nn.Linear(self.synch_repr_out, config.hidden_size, bias=False)
+        self.clock_engine = AsyncClockEngine(self, config)
 
         self.post_ctm_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config.hidden_size)
         self.resid_drop = nn.Dropout(config.dropout)
+
+    def _async_expert_layout(self):
+        return (
+            self.moe_num_experts > 1
+            and self.moe_expert_size > 0
+            and self.moe_expert_size * self.moe_num_experts == self.d_model
+        )
 
     def _calc_sizes(self, config):
         if config.neuron_select_type == 'random-pairing':
@@ -577,7 +751,7 @@ class CTMBlock(nn.Module):
         return self.trace_processor(new_trace), new_trace
 
     def _run_group_sparse_regional_tick(
-        self, attn, activated, state_trace, prev_sync_o_activated,
+        self, attn, activated, state_trace, prev_sync_o_activated, global_tick=0,
     ):
         B, T, _ = activated.shape
         expert_size = self.moe_expert_size
@@ -624,6 +798,9 @@ class CTMBlock(nn.Module):
             flat_trace = base_flat_trace.clone()
 
             for expert in range(num_experts):
+                band = self.clock_engine.band_for_expert(expert)
+                if not band.fires(global_tick):
+                    continue
                 token_idx = flat_mask[:, expert].nonzero(as_tuple=False).squeeze(-1)
                 if token_idx.numel() == 0:
                     continue
@@ -731,8 +908,13 @@ class CTMBlock(nn.Module):
         prev_sync_o_activated = None
         last_sync_o = None
         self.last_executed_ticks = 0
+        self.clock_engine.reset_runtime()
 
         for tick in range(num_iters):
+            activated_prev = activated
+            trace_prev = state_trace
+            self.last_async_bands_fired = self.clock_engine.bands_fired_count(tick)
+
             sync_a, alpha_a, beta_a = self._compute_synch(
                 activated, alpha_a, beta_a, r_a, self.action_left, self.action_right)
 
@@ -753,7 +935,7 @@ class CTMBlock(nn.Module):
 
             if self._use_group_sparse_backend():
                 activated, state_trace = self._run_group_sparse_regional_tick(
-                    attn, activated, state_trace, prev_sync_o_activated)
+                    attn, activated, state_trace, prev_sync_o_activated, global_tick=tick)
                 state = activated
             else:
                 pre_syn_parts = [attn, activated]
@@ -773,13 +955,20 @@ class CTMBlock(nn.Module):
                 activated = activated + self.ttt_layer(activated)
             if not self._use_group_sparse_backend():
                 activated = self._apply_cell_sparsity(activated)
+            activated, state_trace = self.clock_engine.apply_carry(
+                activated, activated_prev, state_trace, trace_prev, tick)
+            for band in self.clock_engine.bands:
+                if band.fires(tick):
+                    band.local_tick += 1
 
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
             last_sync_o = sync_o
             prev_sync_o_activated = activated
-            tick_out = self.output_proj(sync_o)
+            tick_out = self.clock_engine.emit_tick_output(
+                self, activated, alpha_o, beta_o, r_o, tick)
             self.last_executed_ticks = tick + 1
+            self.last_async_local_ticks = self.clock_engine.local_tick_vector()
             if all_tick_outs is not None:
                 all_tick_outs.append(tick_out)
 
@@ -824,7 +1013,7 @@ class CTMBlock(nn.Module):
         return x, present_kv
 
 
-class CTMModel(nn.Module):
+class AsyncCTMModel(nn.Module):
     def __init__(self, config: CTMLLMConfig):
         super().__init__()
         self.config = config
@@ -832,7 +1021,7 @@ class CTMModel(nn.Module):
         self.pos_embed = nn.Embedding(config.max_position_embeddings, config.d_input)
         self.drop = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
-            [CTMBlock(i, config) for i in range(config.num_hidden_layers)])
+            [AsyncCTMBlock(i, config) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, track=False,
@@ -903,11 +1092,11 @@ class CTMModel(nn.Module):
         return tuple(outputs)
 
 
-class CTMForCausalLM(nn.Module):
+class AsyncCTMForCausalLM(nn.Module):
     def __init__(self, config: CTMLLMConfig):
         super().__init__()
         self.config = config
-        self.model = CTMModel(config)
+        self.model = AsyncCTMModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.reflex_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.reflex_adapter = nn.Sequential(
@@ -1232,11 +1421,3 @@ class CTMForCausalLM(nn.Module):
         ent = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
         norm_ent = ent / math.log(logits_seq.size(-1))
         return norm_ent
-
-
-def build_ctm_for_causal_lm(config: CTMLLMConfig):
-    """Return sync CTM by default; async backend when banded clocks are enabled."""
-    if getattr(config, 'async_tick_mode', 'none') == 'banded':
-        from model.model_ctm_async import AsyncCTMForCausalLM
-        return AsyncCTMForCausalLM(config)
-    return CTMForCausalLM(config)

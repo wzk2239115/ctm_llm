@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 from model.config import CTMLLMConfig
-from model.model_ctm_llm import CTMForCausalLM
+from model.model_ctm_llm import CTMForCausalLM, build_ctm_for_causal_lm
 from model.model_transformer import TransformerForCausalLM
 
 
@@ -36,7 +36,7 @@ def log_model_params(model):
 def create_model(config: CTMLLMConfig, device='cpu'):
     model_type = getattr(config, "model_type", "ctm")
     if model_type == "ctm":
-        model = CTMForCausalLM(config).to(device)
+        model = build_ctm_for_causal_lm(config).to(device)
     elif model_type == "transformer":
         model = TransformerForCausalLM(config).to(device)
     else:
