@@ -792,6 +792,9 @@ class CTMForCausalLM(nn.Module):
         self.dino_teacher_model = None
         self.dino_teacher_head = None
         self.last_dino_loss = 0.0
+        self._dino_step_counter = 0
+        self._cached_dino_teacher_probs = None
+        self._cached_dino_token_mask = None
         if self.dino_enabled:
             self.dino_student_head = DINOProjectionHead(
                 config.hidden_size,
@@ -939,29 +942,37 @@ class CTMForCausalLM(nn.Module):
         student_temp = max(float(self.config.dino_student_temperature), 1e-4)
         teacher_temp = max(float(self.config.dino_teacher_temperature), 1e-4)
         center_momentum = float(self.config.dino_center_momentum)
+        teacher_freq = max(1, int(getattr(self.config, 'dino_teacher_update_freq', 4)))
 
         student_logits = self.dino_student_head(student_hidden.float())
-        with torch.no_grad():
-            self.dino_teacher_model.eval()
-            self.dino_teacher_head.eval()
-            teacher_hidden = self.dino_teacher_model(
-                input_ids, use_cache=False, track=False, num_iters=num_iters,
-                return_all_ticks=False,
-            )[0]
-            teacher_logits = self.dino_teacher_head(teacher_hidden.float())
-            teacher_probs = F.softmax(
-                (teacher_logits - self.dino_center.to(teacher_logits.device)) / teacher_temp,
-                dim=-1,
-            )
-            batch_center = teacher_logits[token_mask].mean(dim=0, keepdim=True).view(1, 1, -1)
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(batch_center)
-                batch_center = batch_center / dist.get_world_size()
-            self.dino_center.mul_(center_momentum).add_(
-                batch_center.to(self.dino_center.device),
-                alpha=1.0 - center_momentum,
-            )
 
+        self._dino_step_counter += 1
+        if self._dino_step_counter % teacher_freq == 1 or self._cached_dino_teacher_probs is None:
+            teacher_ticks = max(1, num_iters)
+            with torch.no_grad():
+                self.dino_teacher_model.eval()
+                self.dino_teacher_head.eval()
+                teacher_hidden = self.dino_teacher_model(
+                    input_ids, use_cache=False, track=False, num_iters=teacher_ticks,
+                    return_all_ticks=False,
+                )[0]
+                teacher_logits = self.dino_teacher_head(teacher_hidden.float())
+                batch_center = teacher_logits[token_mask].mean(dim=0, keepdim=True).view(1, 1, -1)
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(batch_center)
+                    batch_center = batch_center / dist.get_world_size()
+                self.dino_center.mul_(center_momentum).add_(
+                    batch_center.to(self.dino_center.device),
+                    alpha=1.0 - center_momentum,
+                )
+                teacher_probs = F.softmax(
+                    (teacher_logits - self.dino_center.to(teacher_logits.device)) / teacher_temp,
+                    dim=-1,
+                )
+                self._cached_dino_teacher_probs = teacher_probs.detach()
+                self._cached_dino_token_mask = token_mask
+
+        teacher_probs = self._cached_dino_teacher_probs
         student_log_probs = F.log_softmax(student_logits / student_temp, dim=-1)
         per_token_loss = -(teacher_probs.detach() * student_log_probs).sum(dim=-1)
         return per_token_loss[token_mask].mean()
@@ -1159,8 +1170,17 @@ class CTMForCausalLM(nn.Module):
         loss = loss + fast_slow_aux
         dino_weight = float(getattr(self.config, 'dino_self_supervised_weight', 0.0))
         if dino_weight > 0:
+            student_ticks = int(getattr(self.config, 'dino_student_ticks', 1))
+            if student_ticks > 0 and student_ticks < (num_iters or 2):
+                with torch.no_grad():
+                    student_h = self.model(
+                        input_ids, track=False, num_iters=student_ticks,
+                        return_all_ticks=False,
+                    )[0]
+            else:
+                student_h = h.detach()
             dino_loss = self._dino_self_supervised_loss(
-                input_ids, labels, h, num_iters)
+                input_ids, labels, student_h, num_iters)
             self.last_dino_loss = float(dino_loss.detach().float().item())
             loss = loss + dino_weight * dino_loss
         else:

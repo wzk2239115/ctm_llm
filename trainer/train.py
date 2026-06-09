@@ -373,6 +373,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'dino_center_momentum': args.dino_center_momentum,
                     'dino_teacher_momentum': args.dino_teacher_momentum,
                     'dino_pad_token_id': args.dino_pad_token_id,
+                    'dino_student_ticks': args.dino_student_ticks,
+                    'dino_teacher_update_freq': args.dino_teacher_update_freq,
                     'async_tick_mode': args.async_tick_mode,
                     'async_tick_periods': args.async_tick_periods,
                     'async_tick_phases': args.async_tick_phases,
@@ -514,14 +516,16 @@ if __name__ == '__main__':
     parser.add_argument('--fast_output_ticks', type=str, default='1,4')
     parser.add_argument('--fast_output_distill_weight', type=float, default=0.0)
     parser.add_argument('--dino_self_supervised_weight', type=float, default=0.0)
-    parser.add_argument('--dino_out_dim', type=int, default=4096)
-    parser.add_argument('--dino_hidden_dim', type=int, default=2048)
-    parser.add_argument('--dino_bottleneck_dim', type=int, default=256)
+    parser.add_argument('--dino_out_dim', type=int, default=512)
+    parser.add_argument('--dino_hidden_dim', type=int, default=256)
+    parser.add_argument('--dino_bottleneck_dim', type=int, default=64)
     parser.add_argument('--dino_student_temperature', type=float, default=0.10)
     parser.add_argument('--dino_teacher_temperature', type=float, default=0.04)
     parser.add_argument('--dino_center_momentum', type=float, default=0.90)
     parser.add_argument('--dino_teacher_momentum', type=float, default=0.996)
     parser.add_argument('--dino_pad_token_id', type=int, default=0)
+    parser.add_argument('--dino_student_ticks', type=int, default=1)
+    parser.add_argument('--dino_teacher_update_freq', type=int, default=4)
     parser.add_argument('--async_tick_mode', type=str, default='none',
                         choices=['none', 'banded'])
     parser.add_argument('--async_tick_periods', type=str, default='1,2,4,8')
@@ -662,6 +666,8 @@ if __name__ == '__main__':
         dino_center_momentum=args.dino_center_momentum,
         dino_teacher_momentum=args.dino_teacher_momentum,
         dino_pad_token_id=args.dino_pad_token_id,
+        dino_student_ticks=args.dino_student_ticks,
+        dino_teacher_update_freq=args.dino_teacher_update_freq,
         async_tick_mode=args.async_tick_mode,
         async_tick_periods=args.async_tick_periods,
         async_tick_phases=args.async_tick_phases,

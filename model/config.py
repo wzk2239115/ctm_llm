@@ -99,14 +99,16 @@ class CTMLLMConfig:
         self.draft_slot_attention = kwargs.get('draft_slot_attention', 'causal_slots')
 
         self.dino_self_supervised_weight = kwargs.get('dino_self_supervised_weight', 0.0)
-        self.dino_out_dim = kwargs.get('dino_out_dim', 4096)
-        self.dino_hidden_dim = kwargs.get('dino_hidden_dim', 2048)
-        self.dino_bottleneck_dim = kwargs.get('dino_bottleneck_dim', 256)
+        self.dino_out_dim = kwargs.get('dino_out_dim', 512)
+        self.dino_hidden_dim = kwargs.get('dino_hidden_dim', 256)
+        self.dino_bottleneck_dim = kwargs.get('dino_bottleneck_dim', 64)
         self.dino_student_temperature = kwargs.get('dino_student_temperature', 0.10)
         self.dino_teacher_temperature = kwargs.get('dino_teacher_temperature', 0.04)
         self.dino_center_momentum = kwargs.get('dino_center_momentum', 0.90)
         self.dino_teacher_momentum = kwargs.get('dino_teacher_momentum', 0.996)
         self.dino_pad_token_id = kwargs.get('dino_pad_token_id', 0)
+        self.dino_student_ticks = kwargs.get('dino_student_ticks', 1)
+        self.dino_teacher_update_freq = kwargs.get('dino_teacher_update_freq', 4)
 
         assert self.d_model >= max(self.n_synch_out, self.n_synch_action), \
             f"d_model({self.d_model}) must >= n_synch_out({self.n_synch_out}) and n_synch_action({self.n_synch_action})"
