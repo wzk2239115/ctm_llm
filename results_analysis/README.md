@@ -1,16 +1,21 @@
 # CTM-LLM Experiment Results Analysis
 
 This folder records the first full 71-experiment CTM-LLM sweep, the follow-up
-49-experiment sparsity sweep, the 32-experiment MoE sparsity sweep, and the
-82-experiment regional multi-pass MoE sweep.
+49-experiment sparsity sweep, the 32-experiment MoE sparsity sweep, the
+82-experiment regional multi-pass MoE sweep, the 73-experiment
+implementation-validation sweep, and the 225-base-experiment overnight sparse
+CTM quick-probe sweep.
 
 Source summary: `summary.csv` exported from `runs/metrics`.
 Sparsity source summary: `sparsity_summary.csv` exported from `runs/metrics`.
 MoE sparsity source summary: `moe_sparsity_summary.csv` exported from `runs/metrics`.
 Regional MoE source summary: `regional_moe_summary.csv` exported from `runs/metrics`.
+Implementation-validation source summary: `impl_validation_73_summary.csv` exported from `runs/metrics`.
+Overnight sparse CTM quick-probe report: `overnight_sparse_ctm_quick_probe_report.csv`.
+Overnight sparse CTM source summary: `overnight_sparse_ctm_summary.csv` exported from `runs/metrics` (currently header-only, no final rows).
 
 Filtering rule:
-- Keep only formal experiment names matching `s00_` to `s05_`.
+- Keep only formal experiment names matching each sweep prefix: `s00_` to `s05_`, `sp00_` to `sp05_`, `moe00_` to `moe07_`, `rg00_` to `rg11_`, and `iv00_` to `iv08_`.
 - Exclude `bt__` batch-tune probes, `qp__` quick-probe probes, and empty rows.
 - Deduplicate by `experiment_name` using the latest valid metric row.
 
@@ -66,6 +71,36 @@ Regional multi-pass MoE experiment count:
 | rg10 | 5 | ELF/MTP crossed with regional routing |
 | rg11 | 7 | 2000-step broad confirmation runs |
 
+Implementation-validation experiment count:
+
+| Stage | Count | Topic |
+| --- | ---: | --- |
+| iv00 | 5 | smoke anchors for dense, single-pass MoE, regional sparse, halt, and MTP |
+| iv01 | 8 | backend controls |
+| iv02 | 10 | regional pass count and routed top-k after grouped sparse implementation |
+| iv03 | 7 | d_model/pass/top-k base grid |
+| iv04 | 10 | real tick early-exit |
+| iv05 | 10 | MTP/ELF loss variants |
+| iv06 | 8 | regional sparse, halt, and MTP composition |
+| iv07 | 9 | longer implementation-validation confirmations |
+| iv08 | 6 | dispatch and capacity mode checks |
+
+Overnight sparse CTM quick-probe count:
+
+| Stage | Base Experiments | Runnable | Topic |
+| --- | ---: | ---: | --- |
+| og00 | 6 | 6 | dense/top-k/regional anchors |
+| og01 | 12 | 12 | capacity-gradient proxy |
+| og02 | 24 | 24 | variable active compute |
+| og03 | 30 | 30 | dynamic tick halt |
+| og04 | 16 | 16 | router regularization and routing controls |
+| og05 | 12 | 12 | dispatch/capacity/drop modes |
+| og06 | 20 | 20 | ELF/MTP losses |
+| og07 | 10 | 10 | long confirmation candidates |
+| og08 | 40 | 34 | long-tick delta/cache proxies |
+| og09 | 34 | 26 | fast/slow, memory-timescale, and recruitment proxies |
+| og10 | 21 | 20 | differentiated cells and fast/slow output losses |
+
 ## High-Level Findings
 
 1. Transformer is still the strongest baseline on loss and cost.
@@ -104,6 +139,15 @@ Regional multi-pass MoE experiment count:
 12. Regional multi-pass routing is the strongest CTM direction so far.
    `rg11_confirm_d1024_p4_shared1_top1` reaches loss `4.8437` with active fraction `0.125`. `rg11_confirm_d512_p4_shared1_top1` reaches loss `4.9395` at `4418 tok/s` and `26.0 GB`, making it the best quality/cost regional candidate.
 
+13. The implementation-validation sweep found a grouped sparse backend problem.
+   `dense_mask` and dense/top-k controls remain healthy around loss `5.7` to `5.8`, but `block_sparse`, `dropless`, and `capacity_drop` often produce huge loss or `NaN`. Treat earlier regional results as masked-routing modeling evidence until block-sparse parity is proven.
+
+14. The overnight sparse CTM quick probe is a feasibility screen, not a loss result.
+   210 of 225 base experiments had a runnable probe. Fast/reflex, low-active compute, MTP/ELF, and differentiated-cell probes fit well; long-tick, long-memory, recruitment, and fast/slow output families need smaller batches and separate profiling.
+
+15. The formal overnight sparse CTM summary is not populated yet.
+   `overnight_sparse_ctm_summary.csv` currently has only a header row, so it cannot support loss or quality conclusions until formal `og*.csv` metrics are exported.
+
 ## Recommended Next Direction
 
 Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted sweeps around:
@@ -114,6 +158,8 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - true sparse cell execution that avoids inactive cell projections, trace storage, and repeated full-width state work;
 - MoE-style grouped sparse execution with load balance, shared experts, and warmup;
 - regional p4/shared1/top1 as the main CTM branch, especially d512 and d1024 confirmations;
+- block-sparse parity against dense-mask routing before using grouped sparse regional rows for architecture decisions;
+- overnight sparse CTM subsets chosen from the quick-probe winners, with long-tick and fast/slow-output families isolated into low-batch plans;
 - direct matched Transformer controls at equal wall-clock budget and equal memory budget.
 - 2000/4000-step confirmation of d512 and d768 tick1/tick2 sparse variants.
 
@@ -133,3 +179,6 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - `sp05_best_sparse_confirm.md`
 - `moe_sparsity.md`
 - `regional_moe.md`
+- `impl_validation_73.md`
+- `overnight_sparse_ctm_quick_probe.md`
+- `overnight_sparse_ctm_summary.md`

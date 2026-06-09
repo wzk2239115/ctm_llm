@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import glob
 import math
 import os
@@ -25,8 +26,9 @@ def format_time(seconds):
     return f"{seconds / 3600:.2f}h"
 
 
-def setup_ddp():
-    dist.init_process_group(backend="nccl")
+def setup_ddp(timeout_minutes=60):
+    timeout = datetime.timedelta(minutes=timeout_minutes)
+    dist.init_process_group(backend="nccl", timeout=timeout)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     return local_rank, dist.get_rank(), dist.get_world_size()
@@ -222,7 +224,7 @@ def iter_token_batches(dataset, tokenizer, args, device):
 def train(args):
     ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
     if ddp:
-        local_rank, rank, world_size = setup_ddp()
+        local_rank, rank, world_size = setup_ddp(args.ddp_timeout_minutes)
         args.device = f"cuda:{local_rank}"
     else:
         local_rank, rank, world_size = 0, 0, 1
@@ -313,9 +315,14 @@ def train(args):
             log_loss = 0.0
             log_steps = 0
 
-        if rank == 0 and (step % args.save_interval == 0 or step == args.max_steps):
+        should_save = step % args.save_interval == 0 or step == args.max_steps
+        if ddp and should_save:
+            dist.barrier()
+        if rank == 0 and should_save:
             save_path = os.path.join(args.save_dir, f"{args.save_weight}_{args.hidden_size}.pth")
             save_model_only(model, save_path)
+        if ddp and should_save:
+            dist.barrier()
 
         if step >= args.max_steps:
             break
@@ -358,6 +365,7 @@ def parse_args():
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--ddp_timeout_minutes", type=int, default=60)
     parser.add_argument("--no_tensorboard", action="store_true")
     parser.add_argument("--tensorboard_log_dir", type=str, default="runs")
 
