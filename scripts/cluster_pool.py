@@ -26,6 +26,13 @@ STATE = {
 }
 LOCK = threading.Lock()
 
+FINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def task_set_status(task, status):
+    task["status"] = status
+    task["status_changed_at"] = time.time()
+
 
 def parse_gpu_spec(spec):
     if not spec:
@@ -196,17 +203,23 @@ def print_pool():
             flush=True,
         )
     if tasks:
-        for task in tasks:
-            assigned = ",".join(task.get("node_addrs") or [])
-            print(
-                f"  task={task['task_id']} nodes={assigned or 'all'} "
-                f"args={task.get('extra_args', '')}",
-                flush=True,
+        for t in tasks:
+            assigned = ",".join(t.get("node_addrs") or [])
+            st = t.get("status", "pending")
+            age = now - t.get("created_at", now)
+            line = (
+                f"  task={t['task_id']} status={st} "
+                f"nodes={assigned or 'all'} age={age:.0f}s "
+                f"args={t.get('extra_args', '')}"
             )
-            for addr, ack in sorted(acks.get(task["task_id"], {}).items()):
+            if t.get("return_code") is not None:
+                line += f" rc={t['return_code']}"
+            print(line, flush=True)
+            for addr, ack in sorted(acks.get(t["task_id"], {}).items()):
                 print(f"    ack {addr}: {ack.get('status')} {ack.get('message', '')}", flush=True)
     elif task:
-        print(f"  task={task['task_id']} args={task.get('extra_args', '')}", flush=True)
+        st = task.get("status", "pending")
+        print(f"  task={task['task_id']} status={st} args={task.get('extra_args', '')}", flush=True)
         legacy_acks = acks.get(task["task_id"], acks)
         for addr, ack in sorted(legacy_acks.items()):
             print(f"    ack {addr}: {ack.get('status')} {ack.get('message', '')}", flush=True)
@@ -249,81 +262,145 @@ class PoolHandler(BaseHTTPRequestHandler):
                 task = None
                 acked = False
                 for candidate in STATE.get("tasks", []):
+                    if candidate.get("status") in FINAL_STATUSES:
+                        continue
                     if not task_matches_addr(candidate, addr):
                         continue
                     node = STATE["nodes"].get(addr, {})
                     if not node_can_accept_task(node, candidate, addr):
                         continue
                     if STATE["acks"].get(candidate["task_id"], {}).get(addr):
+                        acked_task = candidate
+                        acked = True
                         continue
                     task = candidate
                     break
-                if task is None:
+                if task is None and not acked:
                     legacy = STATE.get("task")
-                    acked = (
-                        legacy is not None
-                        and STATE["acks"].get(legacy["task_id"], {}).get(addr)
-                    )
                     if (
                         legacy is not None
-                        and not acked
+                        and legacy.get("status") not in FINAL_STATUSES
                         and task_matches_addr(legacy, addr)
                         and node_can_accept_task(node, legacy, addr)
+                        and not STATE["acks"].get(legacy["task_id"], {}).get(addr)
                     ):
                         task = legacy
-            self._write_json({"task": None if acked else task})
+            self._write_json({"task": task})
             return
         self.send_error(404)
 
+    def _handle_heartbeat(self, payload):
+        addr = payload["node_addr"]
+        announce = False
+        with LOCK:
+            old = STATE["nodes"].get(addr)
+            announce = old is None or old.get("status") != payload.get("status")
+            payload["last_seen"] = time.time()
+            STATE["nodes"][addr] = payload
+        if announce:
+            print(f"[pool] node online/update: {addr} status={payload.get('status')}", flush=True)
+            print_pool()
+        self._write_json({"ok": True})
+
+    def _handle_submit(self, payload):
+        task_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+        with LOCK:
+            master_port = int(payload.get("master_port") or STATE.get("next_master_port", 20000))
+            STATE["next_master_port"] = 20000 + ((master_port - 19999) % 30000)
+        task = {
+            "task_id": task_id,
+            "config": payload["config"],
+            "extra_args": payload.get("extra_args", ""),
+            "node_addrs": payload.get("node_addrs") or [],
+            "master_port": master_port,
+            "created_at": time.time(),
+            "status": "pending",
+            "status_changed_at": time.time(),
+        }
+        with LOCK:
+            STATE["task"] = task
+            STATE.setdefault("tasks", []).append(task)
+            STATE["acks"].setdefault(task_id, {})
+        nodes = ",".join(task["node_addrs"]) if task["node_addrs"] else "all"
+        print(f"[pool] new task: {task_id} status=pending nodes={nodes} {task['extra_args']}", flush=True)
+        print_pool()
+        self._write_json({"ok": True, "task": task})
+
+    def _handle_ack(self, payload):
+        addr = payload["node_addr"]
+        task_id = payload["task_id"]
+        with LOCK:
+            STATE["acks"].setdefault(task_id, {})[addr] = payload
+            for t in STATE["tasks"]:
+                if t["task_id"] == task_id and t["status"] == "pending":
+                    task_set_status(t, "running")
+                    break
+        print(f"[pool] ack from {addr}: {payload.get('status')} {payload.get('message', '')}", flush=True)
+        print_pool()
+        self._write_json({"ok": True})
+
+    def _handle_complete(self, payload):
+        task_id = payload["task_id"]
+        addr = payload.get("node_addr", "?")
+        rc = payload.get("return_code")
+        status = "completed" if rc == 0 else "failed"
+        with LOCK:
+            for t in STATE["tasks"]:
+                if t["task_id"] == task_id:
+                    task_set_status(t, status)
+                    t["return_code"] = rc
+                    break
+        print(f"[pool] task {task_id} {status} (rc={rc}) reported by {addr}", flush=True)
+        print_pool()
+        self._write_json({"ok": True})
+
+    def _handle_cancel(self, payload):
+        task_id = payload.get("task_id")
+        with LOCK:
+            cancelled = []
+            for t in STATE["tasks"]:
+                if t["task_id"] == task_id and t["status"] not in FINAL_STATUSES:
+                    task_set_status(t, "cancelled")
+                    cancelled.append(t)
+            if not task_id:
+                for t in STATE["tasks"]:
+                    if t["status"] == "pending":
+                        task_set_status(t, "cancelled")
+                        cancelled.append(t)
+        for t in cancelled:
+            print(f"[pool] task {t['task_id']} cancelled", flush=True)
+        if cancelled:
+            print_pool()
+        self._write_json({"ok": True, "cancelled": [t["task_id"] for t in cancelled]})
+
     def do_POST(self):
         if self.path == "/heartbeat":
-            payload = self._read_json()
-            addr = payload["node_addr"]
-            announce = False
-            with LOCK:
-                old = STATE["nodes"].get(addr)
-                announce = old is None or old.get("status") != payload.get("status")
-                payload["last_seen"] = time.time()
-                STATE["nodes"][addr] = payload
-            if announce:
-                print(f"[pool] node online/update: {addr} status={payload.get('status')}", flush=True)
-                print_pool()
-            self._write_json({"ok": True})
+            self._handle_heartbeat(self._read_json())
             return
 
         if self.path == "/submit":
-            payload = self._read_json()
-            task_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
-            with LOCK:
-                master_port = int(payload.get("master_port") or STATE.get("next_master_port", 20000))
-                STATE["next_master_port"] = 20000 + ((master_port - 19999) % 30000)
-            task = {
-                "task_id": task_id,
-                "config": payload["config"],
-                "extra_args": payload.get("extra_args", ""),
-                "node_addrs": payload.get("node_addrs") or [],
-                "master_port": master_port,
-                "created_at": time.time(),
-            }
-            with LOCK:
-                STATE["task"] = task
-                STATE.setdefault("tasks", []).append(task)
-                STATE["acks"].setdefault(task_id, {})
-            nodes = ",".join(task["node_addrs"]) if task["node_addrs"] else "all"
-            print(f"[pool] new task: {task_id} nodes={nodes} {task['extra_args']}", flush=True)
-            print_pool()
-            self._write_json({"ok": True, "task": task})
+            self._handle_submit(self._read_json())
             return
 
         if self.path == "/ack":
-            payload = self._read_json()
-            addr = payload["node_addr"]
+            self._handle_ack(self._read_json())
+            return
+
+        if self.path == "/complete":
+            self._handle_complete(self._read_json())
+            return
+
+        if self.path == "/cancel":
+            self._handle_cancel(self._read_json())
+            return
+
+        if self.path == "/clear":
             with LOCK:
-                task_id = payload["task_id"]
-                STATE["acks"].setdefault(task_id, {})[addr] = payload
-            print(f"[pool] ack from {addr}: {payload.get('status')} {payload.get('message', '')}", flush=True)
-            print_pool()
-            self._write_json({"ok": True})
+                before = len(STATE["tasks"])
+                STATE["tasks"] = [t for t in STATE["tasks"] if t["status"] not in FINAL_STATUSES]
+                cleared = before - len(STATE["tasks"])
+            print(f"[pool] cleared {cleared} finished task(s)", flush=True)
+            self._write_json({"ok": True, "cleared": cleared})
             return
 
         self.send_error(404)
@@ -503,11 +580,20 @@ def run_worker(args):
                 finished.append(task_id)
         for task_id in finished:
             item = procs.pop(task_id)
+            rc = item["proc"].returncode
             print(
-                f"[worker] task {task_id} exited rc={item['proc'].returncode} "
+                f"[worker] task {task_id} exited rc={rc} "
                 f"gpus={item.get('gpus') or 'all'}",
                 flush=True,
             )
+            try:
+                post_json(f"{base}/complete", {
+                    "node_addr": node_addr,
+                    "task_id": task_id,
+                    "return_code": rc,
+                }, timeout=5)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                print(f"[worker] failed to report completion for {task_id}: {exc}", flush=True)
 
         busy_gpus = sorted({
             gpu
@@ -643,6 +729,71 @@ def run_status(args):
     print(json.dumps(status, indent=2, ensure_ascii=False))
 
 
+def run_task(args):
+    base = f"http://{args.master_addr}:{args.port}"
+    if args.task_cmd == "list":
+        status = get_json(f"{base}/status")
+        tasks = status.get("tasks", [])
+        if not tasks:
+            print("no tasks")
+            return
+        now = time.time()
+        fmt = "{:<22s} {:<12s} {:<8s} {:<6s} {}"
+        print(fmt.format("TASK_ID", "STATUS", "AGE(s)", "RC", "ARGS"))
+        for t in tasks:
+            age = int(now - t.get("created_at", now))
+            rc = str(t.get("return_code", "")) if t.get("return_code") is not None else ""
+            extra = t.get("extra_args", "")
+            if len(extra) > 50:
+                extra = extra[:47] + "..."
+            print(fmt.format(t["task_id"], t.get("status", "?"), str(age), rc, extra))
+    elif args.task_cmd == "cancel":
+        if not args.task_id:
+            print("error: --task_id required", file=sys.stderr)
+            sys.exit(1)
+        resp = post_json(f"{base}/cancel", {"task_id": args.task_id})
+        cancelled = resp.get("cancelled", [])
+        if cancelled:
+            print(f"cancelled: {', '.join(cancelled)}")
+        else:
+            print("nothing to cancel (task not found or already finished)")
+    elif args.task_cmd == "cancel-pending":
+        resp = post_json(f"{base}/cancel", {"task_id": None})
+        cancelled = resp.get("cancelled", [])
+        if cancelled:
+            print(f"cancelled: {', '.join(cancelled)}")
+        else:
+            print("no pending tasks to cancel")
+    elif args.task_cmd == "clear":
+        resp = post_json(f"{base}/clear", {})
+        cleared = resp.get("cleared", 0)
+        if cleared:
+            print(f"cleared {cleared} finished task(s)")
+        else:
+            print("no finished tasks to clear")
+    elif args.task_cmd == "info":
+        if not args.task_id:
+            print("error: --task_id required", file=sys.stderr)
+            sys.exit(1)
+        status = get_json(f"{base}/status")
+        tasks = status.get("tasks", [])
+        found = [t for t in tasks if t["task_id"] == args.task_id]
+        if not found:
+            print(f"task {args.task_id} not found")
+            return
+        t = found[0]
+        now = time.time()
+        print(json.dumps(t, indent=2, ensure_ascii=False))
+        acks = status.get("acks", {}).get(t["task_id"], {})
+        if acks:
+            print("acks:")
+            for addr, ack in sorted(acks.items()):
+                print(f"  {addr}: {ack.get('status')} {ack.get('message', '')}")
+    else:
+        print(f"unknown task command: {args.task_cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="CTM-LLM lightweight cluster pool")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -677,6 +828,13 @@ def main():
     p.add_argument("--master_addr", default="11.131.210.78")
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=run_status)
+
+    p = sub.add_parser("task")
+    p.add_argument("task_cmd", choices=["list", "cancel", "cancel-pending", "clear", "info"])
+    p.add_argument("--task_id", default=None)
+    p.add_argument("--master_addr", default="11.131.210.78")
+    p.add_argument("--port", type=int, default=8765)
+    p.set_defaults(func=run_task)
 
     args, unknown = parser.parse_known_args()
     if args.cmd == "submit" and unknown:

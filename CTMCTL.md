@@ -187,6 +187,50 @@ Prints raw JSON status, including nodes, GPU inventory, current task, and acks.
 ./scripts/ctmctl pool status --master_addr 11.131.210.78
 ```
 
+### `pool task`
+
+Manages the task queue. Each task has a lifecycle:
+`pending` → `running` → `completed` / `failed` / `cancelled`
+
+**List all tasks:**
+
+```bash
+./scripts/ctmctl pool task list
+```
+
+Output format:
+
+```text
+TASK_ID                STATUS       AGE(s)   RC     ARGS
+20250609_143000_012    completed    300      0      --iterations 5
+20250609_150000_045    running      120             --iterations 10
+20250609_151500_078    pending      30              --iterations 3
+```
+
+**Cancel a specific task:**
+
+```bash
+./scripts/ctmctl pool task cancel --task_id 20250609_151500_078
+```
+
+**Cancel all pending tasks:**
+
+```bash
+./scripts/ctmctl pool task cancel-pending
+```
+
+**Clear finished tasks** (completed/failed/cancelled) from the list:
+
+```bash
+./scripts/ctmctl pool task clear
+```
+
+**Show detailed task info:**
+
+```bash
+./scripts/ctmctl pool task info --task_id 20250609_143000_012
+```
+
 ### `train cluster`
 
 Runs node-list based `torchrun` directly on the current node. This is useful

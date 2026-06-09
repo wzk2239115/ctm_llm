@@ -11,6 +11,11 @@ Commands:
   pool worker [CONFIG] [args...] Start worker, auto rank, auto-pull before tasks
   pool submit [CONFIG] [args...] Submit task to pool
   pool status [args...]          Show pool status JSON
+  pool task list [args...]       List all tasks with status
+  pool task cancel --task_id ID  Cancel a specific task
+  pool task cancel-pending       Cancel all pending tasks
+  pool task clear                Clear finished tasks from list
+  pool task info --task_id ID    Show detailed task info
   train cluster --config CONFIG  Start cluster torchrun with auto rank
   train env ENV_FILE [args...]   Start torchrun from env file
   check [ENV_FILE]               Run cluster preflight checks
@@ -19,6 +24,9 @@ Examples:
   scripts/ctmctl pool server
   scripts/ctmctl pool worker infra/clusters/h100_2nodes.env
   scripts/ctmctl pool submit infra/clusters/h100_2nodes.env --iterations 5
+  scripts/ctmctl pool task list
+  scripts/ctmctl pool task cancel --task_id 20250101_120000_000
+  scripts/ctmctl pool task clear
   scripts/ctmctl train cluster --config infra/clusters/h100_2nodes.env
   scripts/ctmctl check infra/envs/smoke_8xh100.env
 EOF
@@ -85,6 +93,9 @@ case "$cmd" in
         ;;
       status)
         exec python scripts/cluster_pool.py status "$@"
+        ;;
+      task)
+        exec python scripts/cluster_pool.py task "$@"
         ;;
       *)
         echo "Unknown pool command: $sub" >&2

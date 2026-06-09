@@ -15,6 +15,22 @@ import json
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_CLUSTER_CONFIG = "infra/clusters/h100_4nodes.env"
+REGIONAL_DISPATCH_BLOCK_SPARSE = True
+
+
+class _PlanContext:
+    def __init__(self):
+        self.build_plan = None
+        self.summarize_fn = None
+        self.is_regional_experiment = None
+        self.is_final_metrics_row = None
+        self.stages = ()
+        self.prefixes = ()
+        self.metrics_prefix = "impl_validation"
+        self.cluster_config = "infra/clusters/h100_4nodes.env"
+
+
+_ctx = _PlanContext()
 
 BASE_ARGS = {
     "epochs": 1,
@@ -67,19 +83,49 @@ REGIONAL_STAGES = (
     "all",
 )
 REGIONAL_PREFIXES = tuple(f"{stage}_" for stage in REGIONAL_STAGES if stage != "all")
-PLAN_METRICS_PREFIX = "impl_validation"
+
+_ctx.stages = REGIONAL_STAGES
+_ctx.prefixes = REGIONAL_PREFIXES
+_ctx.metrics_prefix = "impl_validation"
+_ctx.cluster_config = DEFAULT_CLUSTER_CONFIG
 
 
 def metrics_path(name):
-    return f"runs/metrics/{PLAN_METRICS_PREFIX}_{name}"
+    return f"runs/metrics/{_ctx.metrics_prefix}_{name}"
 
 
-def configure_plan_defaults(*, metrics_prefix=None, cluster_config=None):
-    global PLAN_METRICS_PREFIX, DEFAULT_CLUSTER_CONFIG
+def configure_plan_defaults(
+    *,
+    metrics_prefix=None,
+    cluster_config=None,
+    dispatch_block_sparse=None,
+    build_plan=None,
+    summarize_fn=None,
+    is_regional_experiment=None,
+    is_final_metrics_row=None,
+    stages=None,
+    prefixes=None,
+):
+    global DEFAULT_CLUSTER_CONFIG, REGIONAL_DISPATCH_BLOCK_SPARSE
     if metrics_prefix:
-        PLAN_METRICS_PREFIX = metrics_prefix
+        _ctx.metrics_prefix = metrics_prefix
     if cluster_config:
         DEFAULT_CLUSTER_CONFIG = cluster_config
+        _ctx.cluster_config = cluster_config
+    if dispatch_block_sparse is not None:
+        REGIONAL_DISPATCH_BLOCK_SPARSE = dispatch_block_sparse
+    if build_plan is not None:
+        _ctx.build_plan = build_plan
+    if summarize_fn is not None:
+        _ctx.summarize_fn = summarize_fn
+    if is_regional_experiment is not None:
+        _ctx.is_regional_experiment = is_regional_experiment
+    if is_final_metrics_row is not None:
+        _ctx.is_final_metrics_row = is_final_metrics_row
+    if stages is not None:
+        _ctx.stages = stages
+    if prefixes is not None:
+        _ctx.prefixes = prefixes
 
 
 def merge_args(**overrides):
@@ -270,7 +316,8 @@ def add_regional_experiment(
     **kwargs,
 ):
     routing = routing or ("regional_shared_topk" if shared_experts else "regional_topk")
-    kwargs.setdefault("moe_dispatch_mode", "block_sparse")
+    if REGIONAL_DISPATCH_BLOCK_SPARSE:
+        kwargs.setdefault("moe_dispatch_mode", "block_sparse")
     d_model = num_experts * expert_size
     topk = active_topk(expert_size, topk_experts, shared_experts)
     add_sparse_experiment(
@@ -666,9 +713,12 @@ def build_plan(stage, plan_size="full"):
     return validate_plan(plan)
 
 
+_ctx.build_plan = build_plan
+
+
 def build_batch_tune_plan(stage, batch_sizes, max_steps, log_interval, plan_size="full"):
     plan = []
-    for exp in build_plan(stage, plan_size):
+    for exp in _ctx.build_plan(stage, plan_size):
         for batch_size in batch_sizes:
             name = f"bt__{exp['name']}__bs{batch_size}"
             plan.append(clone_experiment(
@@ -749,7 +799,7 @@ def count_quick_probe_metrics(metrics_dir):
 def completed_final_experiments(metrics_dir):
     done = set()
     for name, row in latest_row_by_experiment(metrics_dir).items():
-        if is_final_metrics_row(row):
+        if _ctx.is_final_metrics_row(row):
             done.add(name)
     return done
 
@@ -1241,7 +1291,7 @@ def write_manifest(plan, path, config, master_addr, port, wait):
 
 def print_commands(args):
     plan = apply_batch_profile(
-        build_plan(args.stage, args.plan_size),
+        _ctx.build_plan(args.stage, args.plan_size),
         load_batch_profile(args.batch_profile),
     )
     if args.output:
@@ -1489,7 +1539,7 @@ def run_plan(args):
             args.plan_size)
     else:
         plan = apply_batch_profile(
-            build_plan(args.stage, args.plan_size),
+            _ctx.build_plan(args.stage, args.plan_size),
             load_batch_profile(args.batch_profile),
         )
     for i, exp in enumerate(plan):
@@ -1514,7 +1564,7 @@ def run_parallel(args):
             args.plan_size)
     else:
         plan = apply_batch_profile(
-            build_plan(args.stage, args.plan_size),
+            _ctx.build_plan(args.stage, args.plan_size),
             load_batch_profile(args.batch_profile),
         )
 
@@ -1807,7 +1857,7 @@ def seed_quick_probe_state(base_plan, args, probe_targets=None):
 
 def run_quick_probe(args):
     prepare_probe_run_args(args)
-    base_plan = build_plan(args.stage, args.plan_size)
+    base_plan = _ctx.build_plan(args.stage, args.plan_size)
     batch_sizes = sorted(set(args.batch_sizes), reverse=True)
     if args.fallback_batch_size is None:
         args.fallback_batch_size = min(batch_sizes)
@@ -2023,15 +2073,19 @@ def batch_probe_base_name(experiment_name):
 
 
 def is_regional_experiment(name):
-    return bool(name) and name.startswith(REGIONAL_PREFIXES)
+    return bool(name) and name.startswith(_ctx.prefixes)
 
 
 def is_final_metrics_row(row):
     name = row.get("experiment_name", "")
     metrics_file = row.get("metrics_file", "")
-    if not is_regional_experiment(name):
+    if not _ctx.is_regional_experiment(name):
         return False
     return os.path.basename(metrics_file) == f"{name}.csv"
+
+
+_ctx.is_regional_experiment = is_regional_experiment
+_ctx.is_final_metrics_row = is_final_metrics_row
 
 
 def recommend_batches(args):
@@ -2039,7 +2093,7 @@ def recommend_batches(args):
     probes = []
     for row in rows:
         base = batch_probe_base_name(row.get("experiment_name", ""))
-        if not base or not is_regional_experiment(base):
+        if not base or not _ctx.is_regional_experiment(base):
             continue
         peak = parse_float(row, "peak_memory_mb")
         batch = int(parse_float(row, "batch_size", 0))
@@ -2348,7 +2402,7 @@ def run_only(args):
         raise SystemExit(
             f"run-only requires an existing --batch_profile; not found: {args.batch_profile}"
         )
-    base_plan = build_plan(args.stage, args.plan_size)
+    base_plan = _ctx.build_plan(args.stage, args.plan_size)
     profile = load_batch_profile(args.batch_profile)
     print_execution_plan(
         args, base_plan, mode="run-only", profile=profile,
@@ -2360,7 +2414,7 @@ def run_only(args):
 
 def run_probe_and_parallel(args):
     prepare_probe_run_args(args)
-    base_plan = build_plan(args.stage, args.plan_size)
+    base_plan = _ctx.build_plan(args.stage, args.plan_size)
 
     if should_skip_probe(args, base_plan):
         profile = load_batch_profile(args.batch_profile)
@@ -2495,7 +2549,7 @@ def batch_report(args):
 
 def export_final_plan(args):
     profile = load_batch_profile(args.batch_profile)
-    plan = apply_batch_profile(build_plan(args.stage, args.plan_size), profile)
+    plan = apply_batch_profile(_ctx.build_plan(args.stage, args.plan_size), profile)
     write_manifest(plan, args.output, args.config, args.master_addr, args.port, args.wait)
     print(f"wrote final execution plan: {args.output}")
 
@@ -2503,7 +2557,7 @@ def export_final_plan(args):
 def summarize(args):
     rows = [
         row for row in latest_rows(args.metrics_dir)
-        if is_final_metrics_row(row)
+        if _ctx.is_final_metrics_row(row)
     ]
     for row in rows:
         loss = parse_float(row, "loss")
@@ -2562,13 +2616,16 @@ def summarize(args):
     print(f"wrote summary: {args.output}")
 
 
+_ctx.summarize_fn = summarize
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="CTM implementation-validation experiment plan helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--stage", default="all", choices=REGIONAL_STAGES)
-    common.add_argument("--config", default=DEFAULT_CLUSTER_CONFIG)
+    common.add_argument("--stage", default="all", choices=_ctx.stages)
+    common.add_argument("--config", default=_ctx.cluster_config)
     common.add_argument("--master_addr", default=None)
     common.add_argument("--port", type=int, default=None)
     common.add_argument("--wait", type=float, default=30.0)
@@ -2697,7 +2754,7 @@ def parse_args():
     p = sub.add_parser("summarize")
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--output", default=None)
-    p.set_defaults(func=summarize)
+    p.set_defaults(func=_ctx.summarize_fn)
 
     p = sub.add_parser("recommend-batches")
     p.add_argument("--metrics_dir", default="runs/metrics")
@@ -2707,7 +2764,7 @@ def parse_args():
     p.set_defaults(func=recommend_batches)
 
     p = sub.add_parser("batch-report")
-    p.add_argument("--stage", default="all", choices=REGIONAL_STAGES)
+    p.add_argument("--stage", default="all", choices=_ctx.stages)
     p.add_argument("--plan_size", default="full", choices=PLAN_SIZES)
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--output", default="runs/metrics/impl_validation_batch_probe_report.csv")
@@ -2723,7 +2780,7 @@ def parse_args():
         elif args.cmd == "recommend-batches":
             args.output = metrics_path("batch_profile.csv")
         elif args.cmd == "final-plan":
-            args.output = f"runs/experiment_plans/{PLAN_METRICS_PREFIX}_final_plan.csv"
+            args.output = f"runs/experiment_plans/{_ctx.metrics_prefix}_final_plan.csv"
         elif args.cmd == "quick-probe":
             args.output = metrics_path("batch_profile_quick.csv")
             args.report_output = metrics_path("quick_probe_report.csv")
