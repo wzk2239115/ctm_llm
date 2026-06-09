@@ -264,7 +264,13 @@ class PoolHandler(BaseHTTPRequestHandler):
                         legacy is not None
                         and STATE["acks"].get(legacy["task_id"], {}).get(addr)
                     )
-                    task = None if acked else legacy
+                    if (
+                        legacy is not None
+                        and not acked
+                        and task_matches_addr(legacy, addr)
+                        and node_can_accept_task(node, legacy, addr)
+                    ):
+                        task = legacy
             self._write_json({"task": None if acked else task})
             return
         self.send_error(404)
