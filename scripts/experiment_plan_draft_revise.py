@@ -5,9 +5,7 @@ This plan separates two kinds of runs:
 
 - dr00/dr01/"real": runnable anchors and negative controls using the current
   training stack.
-- dr02+/"all": module-ablation matrix for the proposed CTM draft-revise block
-  generator. These stages intentionally use future draft_* knobs so they become
-  runnable once the model/trainer implementation lands.
+- dr02/dr02_elf/"real": parallel draft slots + ELF/MTP smoke matrix on regional dense_mask.
 - dr07 studies a DINO-like learning-speed spectrum: not one fixed
   teacher/student pair, but several EMA targets with different update speeds
   supervising fast ticks, slow ticks, and draft slots.
@@ -28,6 +26,7 @@ DRAFT_STAGES = (
     "dr00",
     "dr01",
     "dr02",
+    "dr02_elf",
     "dr03",
     "dr04",
     "dr05",
@@ -339,12 +338,18 @@ def build_plan(stage, plan_size="full"):
             )
 
     if stage in ("dr02", "all"):
-        for block in ([2, 4] if plan_size == "core" else [2, 4, 8]):
-            for head in ["shared", "slot_adapter", "slot_head"]:
+        blocks = [2, 4] if plan_size == "core" else [2, 4, 8]
+        heads = (
+            ["shared", "slot_adapter"]
+            if plan_size == "core"
+            else ["shared", "slot_adapter", "slot_head"]
+        )
+        for block in blocks:
+            for head in heads:
                 regional(
                     plan,
                     f"dr02_parallel_b{block}_{head}_d512",
-                    "Future module: parallel draft slots with slot-aware heads.",
+                    "Parallel draft slots with slot-aware heads on regional dense_mask.",
                     num_experts=16,
                     expert_size=32,
                     iterations=8,
@@ -352,6 +357,26 @@ def build_plan(stage, plan_size="full"):
                     max_steps=3500,
                     **draft_args(mode="parallel", block=block, head=head, loss=0.2),
                 )
+
+    if stage in ("dr02_elf", "all"):
+        elf_heads = ["shared", "slot_adapter"]
+        if base.include_plan_size(plan_size, "full"):
+            elf_heads.append("slot_head")
+        for head in elf_heads:
+            regional(
+                plan,
+                f"dr02_elf_parallel_b4_{head}_d512",
+                "Draft slots + ELF linear h4 + tick_improve confirm run.",
+                num_experts=16,
+                expert_size=32,
+                iterations=8,
+                activation_passes=4,
+                elf_horizon_mode="linear",
+                elf_max_horizon=4,
+                tick_improve_weight=0.05,
+                max_steps=3500,
+                **draft_args(mode="parallel", block=4, head=head, loss=0.2),
+            )
 
     if stage in ("dr03", "all"):
         for corrupt in ([0.15, 0.30] if plan_size == "core" else [0.10, 0.20, 0.35, 0.50]):

@@ -1367,6 +1367,44 @@ def resolve_node_groups(args, required_for):
     return node_groups
 
 
+def resolve_physical_node_groups(args):
+    """One full node per group, with any GPU suffix stripped."""
+    items = args.node_groups or load_cluster_node_addrs(args.config)
+    seen = []
+    for item in items or []:
+        for part in str(item).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            addr, _ = parse_node_spec(part)
+            if addr not in seen:
+                seen.append(addr)
+    return [[addr] for addr in seen]
+
+
+def group_slot_key(group):
+    return tuple(group)
+
+
+def should_use_tail_full_nodes(args, remaining, lane_groups, full_node_groups):
+    if not getattr(args, "tail_full_nodes", True):
+        return False
+    if not getattr(args, "gpus_per_lane", None):
+        return False
+    if not full_node_groups or len(lane_groups) <= len(full_node_groups):
+        return False
+    threshold = getattr(args, "tail_full_nodes_threshold", None)
+    if threshold is None:
+        threshold = len(full_node_groups)
+    return remaining <= threshold
+
+
+def active_parallel_groups(args, remaining, lane_groups, full_node_groups):
+    if should_use_tail_full_nodes(args, remaining, lane_groups, full_node_groups):
+        return full_node_groups, "full-node"
+    return lane_groups, "lane"
+
+
 def assign_node_groups(plan, node_groups):
     if not node_groups:
         return plan
@@ -1480,7 +1518,8 @@ def run_parallel(args):
             load_batch_profile(args.batch_profile),
         )
 
-    node_groups = resolve_node_groups(args, "run-parallel")
+    lane_groups = resolve_node_groups(args, "run-parallel")
+    full_node_groups = resolve_physical_node_groups(args)
     metrics_dir = getattr(args, "metrics_dir", "runs/metrics")
     if getattr(args, "resume", True):
         done = completed_final_experiments(metrics_dir)
@@ -1492,38 +1531,62 @@ def run_parallel(args):
     queue = list(plan)
     running = {}
     completed = 0
+    schedule_mode = "lane"
     while queue or running:
+        remaining = len(queue) + len(running)
+        active_groups, new_mode = active_parallel_groups(
+            args, remaining, lane_groups, full_node_groups)
+        if new_mode != schedule_mode:
+            print(
+                f"[tail] switching scheduler to {new_mode} "
+                f"({remaining} job(s) left, {len(full_node_groups)} full node(s))",
+                flush=True,
+            )
+            schedule_mode = new_mode
+
         status = pool_status(args.master_addr, args.port)
-        for idx, group in enumerate(node_groups):
-            if idx in running or not queue:
+        for group in active_groups:
+            key = group_slot_key(group)
+            if key in running or not queue:
                 continue
             if not node_group_idle_from_status(status, group):
                 continue
             exp = dict(queue.pop(0))
             exp["node_addrs"] = group
-            print(f"\n[{completed + len(running) + 1}/{len(plan)}] lane={idx} {exp['name']}")
+            slot_label = schedule_mode
+            slot_id = ",".join(group)
+            print(
+                f"\n[{completed + len(running) + 1}/{len(plan)}] "
+                f"{slot_label}={slot_id} {exp['name']}"
+            )
             task = submit_exp(args, exp, wait=0)
-            running[idx] = {
+            running[key] = {
                 "task_id": task["task_id"],
                 "nodes": group,
                 "name": exp["name"],
                 "submitted_at": time.time(),
+                "schedule_mode": schedule_mode,
             }
 
         done = []
         status = pool_status(args.master_addr, args.port)
-        for idx, item in running.items():
+        for key, item in running.items():
             if time.time() - item["submitted_at"] < args.startup_grace:
                 continue
             if (
                 node_group_idle_from_status(status, item["nodes"])
                 and not task_running_in_status(status, item["task_id"])
             ):
-                done.append(idx)
-        for idx in done:
-            item = running.pop(idx)
+                done.append(key)
+        for key in done:
+            item = running.pop(key)
             completed += 1
-            print(f"[done {completed}/{len(plan)}] lane={idx} {item['name']} task={item['task_id']}")
+            slot_id = ",".join(item["nodes"])
+            print(
+                f"[done {completed}/{len(plan)}] "
+                f"{item.get('schedule_mode', 'lane')}={slot_id} "
+                f"{item['name']} task={item['task_id']}"
+            )
 
         if queue or running:
             time.sleep(args.poll_interval)
@@ -2041,6 +2104,7 @@ def run_streaming_probe_and_parallel(args, base_plan, profile, profile_meta, pro
     run_queue = [exp for exp in run_plan if exp["name"] not in done]
 
     node_groups = resolve_node_groups(args, "probe-and-run")
+    full_node_groups = resolve_physical_node_groups(args)
     max_probe_lanes = min(max(0, args.max_probe_lanes), len(node_groups))
     probe_lane_ids = set(range(max_probe_lanes))
 
@@ -2050,6 +2114,7 @@ def run_streaming_probe_and_parallel(args, base_plan, profile, profile_meta, pro
     running_runs = {}
     completed_runs = 0
     total_runs = len(run_queue)
+    run_schedule_mode = "lane"
     probe_attempts = 0
     attempts = []
     started_at = time.time()
@@ -2106,27 +2171,45 @@ def run_streaming_probe_and_parallel(args, base_plan, profile, profile_meta, pro
         probe_open = attempts_open and (deadline is None or now < deadline)
         status = pool_status(args.master_addr, args.port)
 
-        for idx, group in enumerate(node_groups):
-            if idx in running_runs or idx in running_probes:
+        run_remaining = len(run_queue) + len(running_runs)
+        run_groups, new_run_mode = active_parallel_groups(
+            args, run_remaining, node_groups, full_node_groups)
+        if new_run_mode != run_schedule_mode:
+            print(
+                f"[tail] switching formal-run scheduler to {new_run_mode} "
+                f"({run_remaining} job(s) left, {len(full_node_groups)} full node(s))",
+                flush=True,
+            )
+            run_schedule_mode = new_run_mode
+
+        for group in run_groups:
+            key = group_slot_key(group)
+            if key in running_runs or not run_queue:
                 continue
             if not node_group_idle_from_status(status, group):
                 continue
+            exp = dict(run_queue.pop(0))
+            exp["node_addrs"] = group
+            slot_id = ",".join(group)
+            print(
+                f"\n[run {completed_runs + len(running_runs) + 1}/{total_runs}] "
+                f"{run_schedule_mode}={slot_id} {exp['name']} "
+                f"bs={exp['args'].get('batch_size', '')}",
+                flush=True,
+            )
+            task = submit_exp(args, exp, wait=0)
+            running_runs[key] = {
+                "task_id": task["task_id"],
+                "nodes": group,
+                "name": exp["name"],
+                "submitted_at": time.time(),
+                "schedule_mode": run_schedule_mode,
+            }
 
-            if run_queue:
-                exp = dict(run_queue.pop(0))
-                exp["node_addrs"] = group
-                print(
-                    f"\n[run {completed_runs + len(running_runs) + 1}/{total_runs}] "
-                    f"lane={idx} {exp['name']} bs={exp['args'].get('batch_size', '')}",
-                    flush=True,
-                )
-                task = submit_exp(args, exp, wait=0)
-                running_runs[idx] = {
-                    "task_id": task["task_id"],
-                    "nodes": group,
-                    "name": exp["name"],
-                    "submitted_at": time.time(),
-                }
+        for idx, group in enumerate(node_groups):
+            if group_slot_key(group) in running_runs or idx in running_probes:
+                continue
+            if not node_group_idle_from_status(status, group):
                 continue
 
             if probe_open and (idx in probe_lane_ids or not run_queue):
@@ -2153,19 +2236,21 @@ def run_streaming_probe_and_parallel(args, base_plan, profile, profile_meta, pro
 
         done_runs = []
         status = pool_status(args.master_addr, args.port)
-        for idx, item in running_runs.items():
+        for key, item in running_runs.items():
             if time.time() - item["submitted_at"] < args.startup_grace:
                 continue
             if (
                 node_group_idle_from_status(status, item["nodes"])
                 and not task_running_in_status(status, item["task_id"])
             ):
-                done_runs.append(idx)
-        for idx in done_runs:
-            item = running_runs.pop(idx)
+                done_runs.append(key)
+        for key in done_runs:
+            item = running_runs.pop(key)
             completed_runs += 1
+            slot_id = ",".join(item["nodes"])
             print(
-                f"[done run {completed_runs}/{total_runs}] lane={idx} "
+                f"[done run {completed_runs}/{total_runs}] "
+                f"{item.get('schedule_mode', 'lane')}={slot_id} "
                 f"{item['name']} task={item['task_id']}",
                 flush=True,
             )
@@ -2537,6 +2622,10 @@ def parse_args():
     p.add_argument("--gpus_per_lane", type=int, default=2,
                    help="Split bare single-node groups into GPU lanes; default 2 gives 16 two-GPU lanes for four 8-GPU nodes.")
     p.add_argument("--gpus_per_node", type=int, default=8)
+    p.add_argument("--tail_full_nodes", action=argparse.BooleanOptionalAction, default=True,
+                   help="When few jobs remain, schedule each on a full node instead of a GPU lane.")
+    p.add_argument("--tail_full_nodes_threshold", type=int, default=None,
+                   help="Switch to full-node scheduling when queue+running <= this; default=number of physical nodes.")
     p.set_defaults(func=run_parallel)
 
     probe_common = argparse.ArgumentParser(add_help=False)
@@ -2572,6 +2661,10 @@ def parse_args():
     probe_common.add_argument("--gpus_per_lane", type=int, default=2,
                               help="Split bare single-node groups into GPU lanes; default 2 gives 16 two-GPU lanes for four 8-GPU nodes.")
     probe_common.add_argument("--gpus_per_node", type=int, default=8)
+    probe_common.add_argument("--tail_full_nodes", action=argparse.BooleanOptionalAction, default=True,
+                              help="When few formal jobs remain, schedule each on a full node instead of a GPU lane.")
+    probe_common.add_argument("--tail_full_nodes_threshold", type=int, default=None,
+                              help="Switch to full-node scheduling when queue+running <= this; default=number of physical nodes.")
     probe_common.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
                               help="Reuse existing qp__ metrics and final og metrics instead of resubmitting.")
 

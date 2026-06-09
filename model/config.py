@@ -82,6 +82,22 @@ class CTMLLMConfig:
         self.ttt_hidden_mult = kwargs.get('ttt_hidden_mult', 2)
         self.ttt_gate_init = kwargs.get('ttt_gate_init', -2.0)
 
+        self.context_reading_mode = kwargs.get('context_reading_mode', 'none')
+        self.context_reading_sources = kwargs.get(
+            'context_reading_sources', 'local,compressed,retrieval,expert,egram')
+        self.context_reading_gate_init = kwargs.get('context_reading_gate_init', -2.0)
+        self.context_local_window = kwargs.get('context_local_window', 32)
+        self.context_compressed_stride = kwargs.get('context_compressed_stride', 16)
+        self.context_retrieval_topk = kwargs.get('context_retrieval_topk', 8)
+        self.context_expert_memory_slots = kwargs.get('context_expert_memory_slots', 4)
+        self.context_egram_decay = kwargs.get('context_egram_decay', 0.75)
+
+        self.draft_mode = kwargs.get('draft_mode', 'none')
+        self.draft_block_size = kwargs.get('draft_block_size', 4)
+        self.draft_head_mode = kwargs.get('draft_head_mode', 'shared')
+        self.draft_loss_weight = kwargs.get('draft_loss_weight', 0.0)
+        self.draft_slot_attention = kwargs.get('draft_slot_attention', 'causal_slots')
+
         assert self.d_model >= max(self.n_synch_out, self.n_synch_action), \
             f"d_model({self.d_model}) must >= n_synch_out({self.n_synch_out}) and n_synch_action({self.n_synch_action})"
         assert self.d_input % self.heads == 0, \

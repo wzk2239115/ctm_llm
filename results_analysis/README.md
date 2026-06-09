@@ -145,8 +145,8 @@ Overnight sparse CTM quick-probe count:
 14. The overnight sparse CTM quick probe is a feasibility screen, not a loss result.
    210 of 225 base experiments had a runnable probe. Fast/reflex, low-active compute, MTP/ELF, and differentiated-cell probes fit well; long-tick, long-memory, recruitment, and fast/slow output families need smaller batches and separate profiling.
 
-15. The formal overnight sparse CTM summary is not populated yet.
-   `overnight_sparse_ctm_summary.csv` currently has only a header row, so it cannot support loss or quality conclusions until formal `og*.csv` metrics are exported.
+15. The formal overnight sparse CTM summary is a partial survivor export, not the full 225-run matrix.
+   `csv_data/overnight_sparse_ctm_summary.csv` contains 33 completed runs (26 finite loss); 192 planned runs OOM'd on 2-GPU lanes. See `overnight_sparse_ctm_summary.md` for analysis of the passing experiments only.
 
 ## Recommended Next Direction
 

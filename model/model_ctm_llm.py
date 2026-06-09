@@ -6,6 +6,8 @@ import numpy as np
 
 from model.config import CTMLLMConfig
 from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze, TTTMLP
+from model.draft_modules import DraftSlotHead
+from model.moe_regional import RegionalMoEMixin
 
 
 def _parse_int_list(raw, *, max_value=None):
@@ -25,6 +27,15 @@ def _parse_int_list(raw, *, max_value=None):
         if value not in values:
             values.append(value)
     return sorted(values)
+
+
+def _parse_name_list(raw):
+    values = []
+    for item in str(raw or "").replace(";", ",").split(","):
+        item = item.strip().lower()
+        if item and item not in values:
+            values.append(item)
+    return values
 
 
 class RMSNorm(nn.Module):
@@ -50,7 +61,7 @@ class FeedForward(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class CTMBlock(nn.Module):
+class CTMBlock(RegionalMoEMixin, nn.Module):
     def __init__(self, layer_id: int, config: CTMLLMConfig):
         super().__init__()
         self.layer_id = layer_id
@@ -165,6 +176,41 @@ class CTMBlock(nn.Module):
                 dropout=config.dropout,
             )
 
+        self.context_reading_mode = getattr(config, 'context_reading_mode', 'none')
+        self.context_source_names = [
+            name for name in _parse_name_list(getattr(
+                config, 'context_reading_sources',
+                'local,compressed,retrieval,expert,egram'))
+            if name in ('local', 'compressed', 'retrieval', 'expert', 'egram')
+        ]
+        self.context_reading_enabled = (
+            self.context_reading_mode != 'none' and len(self.context_source_names) > 0)
+        self.context_source_to_idx = {
+            name: idx for idx, name in enumerate(self.context_source_names)}
+        self.context_local_window = max(1, int(getattr(config, 'context_local_window', 32)))
+        self.context_compressed_stride = max(
+            1, int(getattr(config, 'context_compressed_stride', 16)))
+        self.context_retrieval_topk = max(
+            1, int(getattr(config, 'context_retrieval_topk', 8)))
+        self.context_expert_memory_slots = max(
+            1, int(getattr(config, 'context_expert_memory_slots', 4)))
+        self.context_egram_decay = min(
+            max(float(getattr(config, 'context_egram_decay', 0.75)), 0.0), 0.99)
+        if self.context_reading_enabled:
+            self.context_source_gate = nn.Linear(
+                self.synch_repr_action, len(self.context_source_names), bias=False)
+            self.context_fusion_gate = nn.Parameter(torch.tensor(
+                float(getattr(config, 'context_reading_gate_init', -2.0))))
+            self.context_egram_proj = nn.Sequential(
+                nn.LayerNorm(config.d_model),
+                nn.Linear(config.d_model, config.d_input, bias=False),
+            )
+            num_memory_experts = max(1, self.moe_num_experts)
+            self.context_expert_memory = nn.Parameter(torch.empty(
+                num_memory_experts, self.context_expert_memory_slots, config.d_input))
+            nn.init.normal_(self.context_expert_memory, mean=0.0,
+                            std=1.0 / math.sqrt(config.d_input))
+
         self.start_activated_state = nn.Parameter(
             torch.zeros(config.d_model).uniform_(
                 -math.sqrt(1 / config.d_model), math.sqrt(1 / config.d_model)))
@@ -176,6 +222,12 @@ class CTMBlock(nn.Module):
         self._init_synch(config)
 
         self.output_proj = nn.Linear(self.synch_repr_out, config.hidden_size, bias=False)
+
+        self.draft_mode = getattr(config, 'draft_mode', 'none')
+        self.draft_slot_head = None
+        if self.draft_mode != 'none':
+            self.draft_slot_head = DraftSlotHead(
+                config, config.hidden_size, config.vocab_size)
 
         self.post_ctm_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config.hidden_size)
@@ -371,312 +423,96 @@ class CTMBlock(nn.Module):
             mask = mask * (self.d_model / self.cell_topk)
         return activated * mask
 
-    def _apply_moe_group_sparsity(self, activated):
-        expert_size = self.moe_expert_size
-        num_experts = self.moe_num_experts
-        if expert_size <= 0 or num_experts <= 0:
-            return None
-        if expert_size * num_experts != self.d_model:
-            return None
+    def _causal_mask(self, T, S, device):
+        query_pos = torch.arange(S - T, S, device=device).view(T, 1)
+        key_pos = torch.arange(S, device=device).view(1, S)
+        return key_pos <= query_pos
 
-        B, T, _ = activated.shape
-        x = activated.view(B, T, num_experts, expert_size)
-        raw_scores = x.abs().mean(dim=-1)
-        scores = raw_scores.detach()
+    def _local_context(self, v, T):
+        S = v.size(1)
+        window = min(self.context_local_window, S)
+        prefix = F.pad(v.cumsum(dim=1), (0, 0, 1, 0))
+        end = torch.arange(S - T + 1, S + 1, device=v.device)
+        start = (end - window).clamp(min=0)
+        sums = prefix[:, end] - prefix[:, start]
+        counts = (end - start).to(v.dtype).view(1, T, 1).clamp(min=1)
+        return sums / counts
 
-        shared = min(self.moe_shared_experts, num_experts)
-        routed_count = max(num_experts - shared, 1)
-        topk = self._effective_moe_topk(routed_count)
-        routed_scores = scores[:, :, shared:]
-        routed_raw_scores = raw_scores[:, :, shared:]
-        mode = self.moe_routing_mode
+    def _compressed_context(self, q, v, T):
+        S = v.size(1)
+        D = v.size(-1)
+        stride = min(self.context_compressed_stride, S)
+        prefix = F.pad(v.cumsum(dim=1), (0, 0, 1, 0))
+        end = torch.arange(1, S + 1, device=v.device)
+        start = (end - stride).clamp(min=0)
+        memory = (prefix[:, end] - prefix[:, start]) / \
+            (end - start).to(v.dtype).view(1, S, 1).clamp(min=1)
+        scores = torch.matmul(q, memory.transpose(1, 2)) / math.sqrt(D)
+        mask = self._causal_mask(T, S, q.device).view(1, T, S)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        weights = F.softmax(scores.float(), dim=-1).type_as(q)
+        return torch.matmul(weights, memory)
 
-        if mode in ('regional_topk', 'regional_shared_topk') or self.moe_activation_passes > 1:
-            return self._apply_regional_moe_sparsity(
-                activated, x, scores, raw_scores, shared, routed_count, topk,
-                routed_scores, routed_raw_scores)
+    def _retrieval_context(self, q, k, v, T):
+        S = k.size(1)
+        topk = min(self.context_retrieval_topk, S)
+        scores = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(k.size(-1))
+        mask = self._causal_mask(T, S, q.device).view(1, T, S)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        vals, idx = torch.topk(scores, topk, dim=-1)
+        weights = F.softmax(vals.float(), dim=-1).type_as(q)
+        gather_idx = idx.unsqueeze(-1).expand(-1, -1, -1, v.size(-1))
+        gathered = v.unsqueeze(1).expand(-1, T, -1, -1).gather(2, gather_idx)
+        return (weights.unsqueeze(-1) * gathered).sum(dim=2)
 
-        if mode == 'hash':
-            pos = torch.arange(T, device=activated.device).view(1, T, 1)
-            offsets = torch.arange(topk, device=activated.device).view(1, 1, topk)
-            idx = (pos + offsets + self.layer_id) % routed_count
-            idx = idx.expand(B, -1, -1)
-        elif mode == 'expert_choice':
-            mean_scores = routed_scores.mean(dim=(0, 1), keepdim=True)
-            idx = torch.topk(mean_scores.expand(B, T, -1), topk, dim=-1).indices
-        else:
-            idx = torch.topk(routed_scores, topk, dim=-1).indices
+    def _expert_memory_context(self, q, activated):
+        memory = self.context_expert_memory
+        E, M, D = memory.shape
+        scores = torch.einsum('btd,emd->btem', q, memory) / math.sqrt(D)
+        slot_weights = F.softmax(scores.float().flatten(-2), dim=-1).type_as(q)
+        slot_values = memory.reshape(E * M, D)
+        context = torch.matmul(slot_weights, slot_values)
 
-        expert_mask = torch.zeros_like(scores)
-        expert_mask[:, :, shared:].scatter_(-1, idx, 1.0)
-        if shared > 0:
-            expert_mask[:, :, :shared] = 1.0
+        if self.moe_num_experts > 1 and self.moe_expert_size * self.moe_num_experts == self.d_model:
+            expert_scores = activated.detach().view(
+                activated.size(0), activated.size(1),
+                self.moe_num_experts, self.moe_expert_size).abs().mean(dim=-1)
+            expert_weights = F.softmax(expert_scores.float(), dim=-1).type_as(q)
+            expert_values = memory.mean(dim=1)
+            context = 0.5 * context + 0.5 * torch.matmul(expert_weights, expert_values)
+        return context
 
-        if self.training and self.moe_expert_dropout > 0:
-            keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
-            if shared > 0:
-                keep[:, :, :shared] = True
-            expert_mask = expert_mask * keep.type_as(expert_mask)
-
-        active_cells = expert_mask.sum(dim=-1, keepdim=True).clamp(min=1) * expert_size
-        mask = expert_mask.unsqueeze(-1).expand_as(x).reshape_as(activated)
-        if self.cell_sparsity_rescale:
-            mask = mask * (self.d_model / active_cells)
-        self._update_moe_aux_loss(routed_raw_scores)
-        return activated * mask
-
-    def _effective_moe_topk(self, routed_count):
-        target = min(self.moe_topk_experts, routed_count)
-        warmup_steps = max(0, int(getattr(self.config, 'moe_topk_warmup_steps', 0)))
-        if warmup_steps <= 0:
-            return target
-        current_step = max(0, int(getattr(self.config, 'global_step', 0)))
-        progress = min(1.0, current_step / max(1, warmup_steps))
-        warm_topk = int(math.ceil(target + (routed_count - target) * (1.0 - progress)))
-        return min(max(target, warm_topk), routed_count)
-
-    def _apply_regional_moe_sparsity(
-        self, activated, x, scores, raw_scores, shared, routed_count, topk,
-        routed_scores, routed_raw_scores,
-    ):
-        max_distinct_passes = max(1, math.ceil(routed_count / max(1, topk)))
-        passes = min(max(1, self.moe_activation_passes), max_distinct_passes)
-        pass_outputs = []
-        pass_masks = []
-        selected = torch.zeros_like(routed_scores, dtype=torch.bool)
-
-        for _ in range(passes):
-            masked_scores = routed_scores.masked_fill(selected, float("-inf"))
-            idx = torch.topk(masked_scores, topk, dim=-1).indices
-            routed_mask = torch.zeros_like(routed_scores)
-            routed_mask.scatter_(-1, idx, 1.0)
-            selected = selected | routed_mask.bool()
-
-            expert_mask = torch.zeros_like(scores)
-            expert_mask[:, :, shared:] = routed_mask
-            if shared > 0:
-                expert_mask[:, :, :shared] = 1.0
-
-            if self.training and self.moe_expert_dropout > 0:
-                keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
-                if shared > 0:
-                    keep[:, :, :shared] = True
-                expert_mask = expert_mask * keep.type_as(expert_mask)
-
-            active_cells = expert_mask.sum(dim=-1, keepdim=True).clamp(min=1) * self.moe_expert_size
-            mask = expert_mask.unsqueeze(-1).expand_as(x).reshape_as(activated)
-            if self.cell_sparsity_rescale:
-                mask = mask * (self.d_model / active_cells)
-            pass_outputs.append(activated * mask)
-            pass_masks.append(expert_mask[:, :, shared:])
-
-        self._update_moe_aux_loss(routed_raw_scores)
-        self._update_region_diversity_loss(pass_masks)
-        return torch.stack(pass_outputs, dim=0).mean(dim=0)
-
-    def _update_region_diversity_loss(self, pass_masks):
-        if self.moe_region_diversity_weight <= 0 or len(pass_masks) <= 1:
-            return
-        overlaps = []
-        for i in range(len(pass_masks)):
-            for j in range(i + 1, len(pass_masks)):
-                overlaps.append((pass_masks[i] * pass_masks[j]).sum(dim=-1).mean())
-        if not overlaps:
-            return
-        diversity_loss = torch.stack(overlaps).mean() / max(1, self.moe_topk_experts)
-        aux = self.moe_region_diversity_weight * diversity_loss
-        self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
-
-    def _update_moe_aux_loss(self, routed_scores):
-        if (
-            self.moe_load_balance_weight <= 0
-            and self.moe_router_entropy_weight <= 0
-            and self.moe_router_z_loss_weight <= 0
-        ):
-            return
-        if routed_scores.size(-1) <= 1:
-            return
-        probs = F.softmax(routed_scores.float(), dim=-1)
-        aux = routed_scores.new_zeros(())
-        if self.moe_load_balance_weight > 0:
-            load = probs.mean(dim=(0, 1))
-            target = torch.full_like(load, 1.0 / load.numel())
-            balance_loss = ((load - target) ** 2).mean() * load.numel()
-            aux = aux + self.moe_load_balance_weight * balance_loss
-        if self.moe_router_entropy_weight > 0:
-            entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(dim=-1).mean()
-            norm_entropy = entropy / math.log(probs.size(-1))
-            aux = aux - self.moe_router_entropy_weight * norm_entropy
-        if self.moe_router_z_loss_weight > 0:
-            z_loss = torch.logsumexp(routed_scores.float(), dim=-1).pow(2).mean()
-            aux = aux + self.moe_router_z_loss_weight * z_loss
-        self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
-
-    def _use_group_sparse_backend(self):
-        if self.moe_routing_mode not in ('regional_topk', 'regional_shared_topk'):
-            return False
-        if self.moe_dispatch_mode == 'dense_mask':
-            return False
-        return self.group_synapses is not None and self.group_trace_processors is not None
-
-    def _route_experts(self, scores, shared, routed_count, topk, selected=None):
-        routed_scores = scores[:, :, shared:]
-        if selected is not None:
-            routed_scores = routed_scores.masked_fill(selected, float("-inf"))
-        idx = torch.topk(routed_scores, topk, dim=-1).indices
-        expert_mask = torch.zeros_like(scores)
-        expert_mask[:, :, shared:].scatter_(-1, idx, 1.0)
-        if shared > 0:
-            expert_mask[:, :, :shared] = 1.0
-        if self.training and self.moe_expert_dropout > 0:
-            keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
-            if shared > 0:
-                keep[:, :, :shared] = True
-            expert_mask = expert_mask * keep.type_as(expert_mask)
-        if self.moe_dispatch_mode == 'capacity_drop' or self.moe_drop_tokens:
-            expert_mask = self._apply_expert_capacity(expert_mask, scores, shared)
-        return expert_mask, idx
-
-    def _apply_expert_capacity(self, expert_mask, scores, shared=0):
-        B, T, E = expert_mask.shape
-        active_per_token = expert_mask.sum(dim=-1).float().mean().clamp(min=1.0)
-        capacity = int(math.ceil(self.moe_capacity_factor * B * T * active_per_token / E))
-        capacity = max(1, capacity)
-        flat_mask = expert_mask.reshape(B * T, E)
-        flat_scores = scores.reshape(B * T, E)
-        kept = torch.zeros_like(flat_mask)
-        for expert in range(E):
-            if expert < shared:
-                kept[:, expert] = flat_mask[:, expert]
-                continue
-            active = flat_mask[:, expert].bool()
-            if not active.any():
-                continue
-            active_idx = active.nonzero(as_tuple=False).squeeze(-1)
-            if active_idx.numel() > capacity:
-                expert_scores = flat_scores[active_idx, expert]
-                active_idx = active_idx[torch.topk(expert_scores, capacity).indices]
-            kept[active_idx, expert] = 1.0
-        return kept.view_as(expert_mask)
-
-    def _compute_dense_pre_mask_activation(
-        self, attn, activated, state_trace, prev_sync_o_activated,
-    ):
-        B, T, _ = activated.shape
-        device = activated.device
-        pre_syn_parts = [attn, activated]
-        if self.self_cond:
-            if prev_sync_o_activated is not None:
-                pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
-            else:
-                pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
-        pre_syn = torch.cat(pre_syn_parts, dim=-1)
-        state = self.synapses(pre_syn)
-        new_trace = torch.cat(
-            [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
-        return self.trace_processor(new_trace), new_trace
-
-    def _run_group_sparse_regional_tick(
-        self, attn, activated, state_trace, prev_sync_o_activated,
-    ):
-        B, T, _ = activated.shape
-        expert_size = self.moe_expert_size
-        num_experts = self.moe_num_experts
-        shared = min(self.moe_shared_experts, num_experts)
-        routed_count = max(num_experts - shared, 1)
-        topk = self._effective_moe_topk(routed_count)
-        max_distinct_passes = max(1, math.ceil(routed_count / max(1, topk)))
-        passes = min(max(1, self.moe_activation_passes), max_distinct_passes)
-        selected = torch.zeros(
-            B, T, routed_count, dtype=torch.bool, device=activated.device)
-        pass_masks = []
-
-        routing_activated, _ = self._compute_dense_pre_mask_activation(
-            attn, activated, state_trace, prev_sync_o_activated)
-        routing_x = routing_activated.view(B, T, num_experts, expert_size)
-        raw_scores = routing_x.abs().mean(dim=-1)
-        routing_scores = raw_scores.detach()
-
-        flat_attn = attn.reshape(B * T, self.d_input)
-        base_flat_active = activated.reshape(B * T, self.d_model)
-        base_flat_trace = state_trace.reshape(
-            B * T, self.d_model, self.memory_length)
-        flat_self = None
-        if self.self_cond:
-            if prev_sync_o_activated is None:
-                flat_self = torch.zeros(
-                    B * T, self.d_model, device=activated.device, dtype=activated.dtype)
-            else:
-                flat_self = self.self_cond_proj(
-                    prev_sync_o_activated).reshape(B * T, self.d_model)
-
-        pass_outputs = []
-        merged_trace = base_flat_trace.clone()
-
-        for _ in range(passes):
-            expert_mask, _ = self._route_experts(
-                routing_scores, shared, routed_count, topk, selected)
-            selected = selected | expert_mask[:, :, shared:].bool()
-            pass_masks.append(expert_mask[:, :, shared:])
-            flat_mask = expert_mask.reshape(B * T, num_experts).bool()
-
-            flat_active = base_flat_active.clone()
-            flat_trace = base_flat_trace.clone()
-
-            for expert in range(num_experts):
-                token_idx = flat_mask[:, expert].nonzero(as_tuple=False).squeeze(-1)
-                if token_idx.numel() == 0:
-                    continue
-                start = expert * expert_size
-                width = expert_size
-                mem_len = self.memory_length
-                gate_scale = flat_active.new_ones(())
-                synapse_module = self.group_synapses[expert]
-                trace_module = self.group_trace_processors[expert]
-                if self._differentiated_cells_enabled():
-                    width, width_scale = self._select_diff_level(
-                        self.diff_width_logits, self.diff_cell_widths, expert)
-                    mem_len, mem_scale = self._select_diff_level(
-                        self.diff_memory_logits, self.diff_cell_memory_lengths, expert)
-                    gate_scale = width_scale.to(flat_active.dtype) * mem_scale.to(flat_active.dtype)
-                    synapse_module = self.diff_group_synapses[expert][str(width)]
-                    trace_module = self.diff_group_trace_processors[expert][f"{width}x{mem_len}"]
-                end = start + width
-                parts = [
-                    flat_attn[token_idx],
-                    flat_active[token_idx, start:end],
-                ]
-                if self.self_cond:
-                    parts.append(flat_self[token_idx, start:end])
-                pre_syn = torch.cat(parts, dim=-1)
-                state = synapse_module(pre_syn)
-                prev_trace = flat_trace[token_idx, start:end, -mem_len:]
-                new_trace = torch.cat(
-                    [prev_trace[:, :, 1:], state.unsqueeze(-1)], dim=-1)
-                group_active = trace_module(
-                    new_trace.unsqueeze(1)).squeeze(1)
-                flat_trace[token_idx, start:end, -mem_len:] = new_trace
-                flat_active[token_idx, start:end] = group_active * gate_scale
-                merged_trace[token_idx, start:end, -mem_len:] = new_trace
-
-            pass_x = flat_active.view(B, T, num_experts, expert_size)
-            active_cells = expert_mask.sum(dim=-1, keepdim=True).clamp(min=1) * expert_size
-            mask = expert_mask.unsqueeze(-1).to(pass_x.dtype)
-            if self.cell_sparsity_rescale:
-                mask = mask * (self.d_model / active_cells.unsqueeze(-1))
-            pass_outputs.append((pass_x * mask).reshape(B, T, self.d_model))
-
-        self._update_moe_aux_loss(raw_scores[:, :, shared:])
-        self._update_region_diversity_loss(pass_masks)
-        self._update_diff_cell_aux_loss()
-        activated = torch.stack(pass_outputs, dim=0).mean(dim=0)
-        state_trace = merged_trace.view(B, T, self.d_model, self.memory_length)
-        return activated, state_trace
+    def _context_reading(self, q, k, v, sync_a, activated, egram_state):
+        if not self.context_reading_enabled:
+            return q.new_zeros(q.shape), egram_state
+        T = q.size(1)
+        source_values = []
+        for name in self.context_source_names:
+            if name == 'local':
+                source_values.append(self._local_context(v, T))
+            elif name == 'compressed':
+                source_values.append(self._compressed_context(q, v, T))
+            elif name == 'retrieval':
+                source_values.append(self._retrieval_context(q, k, v, T))
+            elif name == 'expert':
+                source_values.append(self._expert_memory_context(q, activated))
+            elif name == 'egram':
+                draft = self.context_egram_proj(activated)
+                if egram_state is None:
+                    egram_state = draft
+                else:
+                    egram_state = self.context_egram_decay * egram_state + \
+                        (1.0 - self.context_egram_decay) * draft
+                source_values.append(egram_state)
+        stacked = torch.stack(source_values, dim=-2)
+        gates = F.softmax(self.context_source_gate(sync_a).float(), dim=-1).type_as(q)
+        context = (stacked * gates.unsqueeze(-1)).sum(dim=-2)
+        return torch.sigmoid(self.context_fusion_gate).type_as(q) * context, egram_state
 
     def forward(self, x, pos_emb=None, past_kv=None, use_cache=False, track=False,
                 num_iters=None, return_all_ticks=False,
                 prev_activated=None, prev_trace=None,
-                halt_lm_head=None, enable_tick_halt=False):
+                halt_lm_head=None, enable_tick_halt=False, draft_lm_head=None):
         B, T, _ = x.shape
         device = x.device
         self.moe_aux_loss = None
@@ -728,9 +564,18 @@ class CTMBlock(nn.Module):
 
         num_iters = num_iters if num_iters is not None else self.iterations
         all_tick_outs = [] if (track or return_all_ticks) else None
+        all_draft_slot_logits = [] if (
+            return_all_ticks and self.draft_slot_head is not None) else None
         prev_sync_o_activated = None
         last_sync_o = None
         self.last_executed_ticks = 0
+        egram_state = None
+        allow_halt_break = (
+            enable_tick_halt
+            and not self.training
+            and halt_lm_head is not None
+            and self.config.tick_halt_mode != 'none'
+        )
 
         for tick in range(num_iters):
             sync_a, alpha_a, beta_a = self._compute_synch(
@@ -748,8 +593,10 @@ class CTMBlock(nn.Module):
                 attn_out = F.scaled_dot_product_attention(
                     q_mh, k_mh, v_mh)
 
+            context_extra, egram_state = self._context_reading(
+                q, k, v, sync_a, activated, egram_state)
             attn = self.attn_drop(
-                self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1)))
+                self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1) + context_extra))
 
             if self._use_group_sparse_backend():
                 activated, state_trace = self._run_group_sparse_regional_tick(
@@ -782,6 +629,9 @@ class CTMBlock(nn.Module):
             self.last_executed_ticks = tick + 1
             if all_tick_outs is not None:
                 all_tick_outs.append(tick_out)
+            if all_draft_slot_logits is not None:
+                _, slot_logits = self.draft_slot_head(tick_out, lm_head=draft_lm_head)
+                all_draft_slot_logits.append(slot_logits)
 
             if track:
                 tracking['pre_activations'].append(state[0].detach().cpu().numpy())
@@ -789,12 +639,7 @@ class CTMBlock(nn.Module):
                 tracking['sync_action'].append(sync_a[0].detach().cpu().numpy())
                 tracking['state_trace'].append(state_trace[0].detach().cpu().numpy())
 
-            if (
-                enable_tick_halt
-                and halt_lm_head is not None
-                and self.config.tick_halt_mode != 'none'
-                and tick + 1 < num_iters
-            ):
+            if allow_halt_break and tick + 1 < num_iters:
                 with torch.no_grad():
                     logits = halt_lm_head(tick_out.detach())
                     probs = F.softmax(logits, dim=-1)
@@ -811,6 +656,8 @@ class CTMBlock(nn.Module):
         extras = {}
         if all_tick_outs is not None:
             extras['tick_outputs'] = torch.stack(all_tick_outs, dim=-1)
+        if all_draft_slot_logits is not None:
+            extras['draft_slot_logits'] = torch.stack(all_draft_slot_logits, dim=-1)
         if track:
             for k_arr in ['pre_activations', 'post_activations', 'sync_action', 'state_trace']:
                 tracking[k_arr] = np.array(tracking[k_arr])
@@ -837,7 +684,7 @@ class CTMModel(nn.Module):
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, track=False,
                 num_iters=None, return_all_ticks=False,
-                halt_lm_head=None, enable_tick_halt=False):
+                halt_lm_head=None, enable_tick_halt=False, draft_lm_head=None):
         B, T = input_ids.shape
         if past_key_values is None:
             past_key_values = [None] * len(self.layers)
@@ -846,6 +693,7 @@ class CTMModel(nn.Module):
         presents = []
         tracking_all = {}
         last_tick_outs = None
+        last_draft_slot_logits = None
         executed_ticks = []
 
         prev_activated = None
@@ -860,6 +708,7 @@ class CTMModel(nn.Module):
                 prev_trace=prev_trace if self.config.cross_layer_state else None,
                 halt_lm_head=halt_lm_head if is_last else None,
                 enable_tick_halt=enable_tick_halt and is_last,
+                draft_lm_head=draft_lm_head if is_last else None,
             )
 
             if track and not is_last:
@@ -873,6 +722,7 @@ class CTMModel(nn.Module):
                     tracking_all[f'layer_{layer.layer_id}'] = extras.get('tracking', {})
                 if return_all_ticks:
                     last_tick_outs = extras.get('tick_outputs')
+                    last_draft_slot_logits = extras.get('draft_slot_logits')
             else:
                 result = layer(h, **layer_kwargs)
                 if len(result) == 3:
@@ -893,6 +743,7 @@ class CTMModel(nn.Module):
         outputs = [h, presents]
         if return_all_ticks:
             outputs.append(last_tick_outs)
+            outputs.append(last_draft_slot_logits)
         if track:
             outputs.append(tracking_all)
         if enable_tick_halt:
@@ -955,6 +806,23 @@ class CTMForCausalLM(nn.Module):
             if horizon > 0 and horizon not in horizons:
                 horizons.append(horizon)
         return horizons
+
+    def _draft_mtp_horizons(self):
+        horizons = self._mtp_horizons()
+        if getattr(self.config, 'draft_mode', 'none') == 'none':
+            return horizons
+        block = max(1, int(getattr(self.config, 'draft_block_size', 1)))
+        return [h for h in horizons if h > block]
+
+    def _draft_slot_tick_loss(self, slot_logits, labels):
+        block = slot_logits.size(2)
+        losses = []
+        for slot in range(block):
+            horizon = slot + 1
+            slot_loss, _ = self._per_sample_lm_loss(
+                slot_logits[:, :, slot, :], labels, horizon=horizon)
+            losses.append(slot_loss)
+        return torch.stack(losses, dim=1).mean(dim=1)
 
     def _fast_output_ticks(self):
         ticks = _parse_int_list(getattr(self.config, 'fast_output_ticks', '1,4'))
@@ -1089,7 +957,7 @@ class CTMForCausalLM(nn.Module):
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
                 num_iters=None):
-        enable_halt = self.config.tick_halt_mode != 'none'
+        enable_halt = self.config.tick_halt_mode != 'none' and not self.training
         result = self.model(
             input_ids, past_key_values, use_cache, track=False, num_iters=num_iters,
             halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
@@ -1107,40 +975,60 @@ class CTMForCausalLM(nn.Module):
 
     def forward_train(self, input_ids, labels, num_iters=None):
         B = input_ids.size(0)
-        enable_halt = self.config.tick_halt_mode != 'none'
         result = self.model(
             input_ids, track=False, num_iters=num_iters, return_all_ticks=True,
-            halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
+            halt_lm_head=self.lm_head, enable_tick_halt=False,
+            draft_lm_head=self.lm_head)
         h, tick_outs = result[0], result[2]
+        draft_slot_logits = result[3] if len(result) > 3 else None
         num_ticks = tick_outs.size(-1)
 
         final_logits = self.lm_head(h)
         final_loss = self._lm_loss_from_logits(final_logits, labels)
 
+        draft_enabled = getattr(self.config, 'draft_mode', 'none') != 'none'
+        draft_block = max(1, int(getattr(self.config, 'draft_block_size', 1)))
+        draft_weight = float(getattr(self.config, 'draft_loss_weight', 0.0))
+        mtp_horizons = self._draft_mtp_horizons()
+
         losses = []
         next_losses = []
         certainties = []
-        mtp_horizons = self._mtp_horizons()
         for t in range(num_ticks):
             logits_t = self.lm_head(tick_outs[..., t])
-            if mtp_horizons:
-                horizon_losses = []
-                label_mask = None
-                for horizon in mtp_horizons:
-                    horizon_loss, horizon_mask = self._per_sample_lm_loss(
-                        logits_t, labels, horizon=horizon)
-                    horizon_losses.append(horizon_loss)
-                    if horizon == 1 or label_mask is None:
-                        label_mask = horizon_mask
-                per_sample_loss = torch.stack(horizon_losses, dim=1).mean(dim=1)
-            else:
-                horizon = self._tick_horizon(t, num_ticks)
-                per_sample_loss, label_mask = self._per_sample_lm_loss(
-                    logits_t, labels, horizon=horizon)
-            losses.append(per_sample_loss)
+            tick_components = []
 
             next_loss, next_mask = self._per_sample_lm_loss(
                 logits_t, labels, horizon=1)
+            tick_components.append(next_loss)
+
+            if mtp_horizons:
+                mtp_losses = []
+                for horizon in mtp_horizons:
+                    horizon_loss, _ = self._per_sample_lm_loss(
+                        logits_t, labels, horizon=horizon)
+                    mtp_losses.append(horizon_loss)
+                tick_components.append(torch.stack(mtp_losses, dim=1).mean(dim=1))
+            else:
+                elf_h = self._tick_horizon(t, num_ticks)
+                if self.config.elf_horizon_mode != 'none':
+                    if not (draft_enabled and elf_h <= draft_block):
+                        elf_loss, _ = self._per_sample_lm_loss(
+                            logits_t, labels, horizon=elf_h)
+                        tick_components.append(elf_loss)
+                elif elf_h > 1 and not (draft_enabled and elf_h <= draft_block):
+                    horizon_loss, _ = self._per_sample_lm_loss(
+                        logits_t, labels, horizon=elf_h)
+                    tick_components.append(horizon_loss)
+
+            if draft_slot_logits is not None and draft_weight > 0:
+                slot_logits_t = draft_slot_logits[..., :, :, :, t]
+                draft_loss = self._draft_slot_tick_loss(slot_logits_t, labels)
+                tick_components.append(draft_weight * draft_loss)
+
+            per_sample_loss = torch.stack(tick_components, dim=1).mean(dim=1)
+            losses.append(per_sample_loss)
+
             next_losses.append(next_loss)
             certainties.append(self._per_sample_entropy(logits_t, next_mask, horizon=1))
 

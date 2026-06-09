@@ -165,6 +165,7 @@ def current_moe_aux_loss(model):
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
                 tb_writer, swanlab, start_step=0, rank=0):
     model.train()
+    raw_model = model.module if hasattr(model, 'module') else model
     epoch_start = time.time()
     total_loss = 0.0
     total_steps = 0
@@ -186,7 +187,19 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
         with autocast_ctx:
             loss, losses_per_tick, certainties = raw_model.forward_train(
                 input_ids, labels, num_iters=args.iterations)
-            loss = loss / args.accumulation_steps
+
+        if not torch.isfinite(loss):
+            if rank == 0:
+                Logger(
+                    f'Non-finite loss at epoch {epoch + 1} step {step}: {loss.item()}; skipping step')
+                write_failure_report(
+                    args,
+                    RuntimeError(f'non-finite loss at global_step {global_step}'),
+                    rank=rank)
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
@@ -220,6 +233,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 losses_tick_mean = []
                 certainties_tick_mean = []
                 effective_tick_mean = -1.0
+            executed_ticks_last_layer = getattr(
+                raw_model.model.layers[-1], 'last_executed_ticks', tick_count)
             elapsed = time.time() - epoch_start
             interval_elapsed = time.time() - interval_start
             steps_done = step - start_step
@@ -238,7 +253,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
                 f'loss:{avg_loss:.4f} lr:{lr:.2e} | '
                 f'best_tick:{best_tick_mean:.1f} conf_tick:{conf_tick_mean:.1f} | '
-                f'eff_tick:{effective_tick_mean:.1f} | '
+                f'eff_tick:{effective_tick_mean:.1f} exec_tick:{executed_ticks_last_layer} | '
                 f'tok/s:{tokens_per_sec:.0f} mem:{peak_mem_mb:.0f}MB | '
                 f'elapsed:{format_time(elapsed)} epoch_eta:{format_time(epoch_eta)} | '
                 f'total:{format_time(elapsed + global_eta)}({pct:.1f}%)'
@@ -250,6 +265,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'conf_tick': conf_tick_mean,
                 'tick_count': tick_count,
                 'effective_tick': effective_tick_mean,
+                'executed_ticks_last_layer': executed_ticks_last_layer,
                 'active_cell_fraction': active_cell_fraction(args),
                 'moe_aux_loss': moe_aux_loss,
                 'tokens_per_sec': tokens_per_sec,
@@ -277,6 +293,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'conf_tick': conf_tick_mean,
                     'tick_count': tick_count,
                     'effective_tick': effective_tick_mean,
+                    'executed_ticks_last_layer': executed_ticks_last_layer,
                     'active_cell_fraction': active_cell_fraction(args),
                     'moe_aux_loss': moe_aux_loss,
                     'losses_per_tick': json.dumps(losses_tick_mean),
@@ -344,6 +361,19 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'async_fast_band': args.async_fast_band,
                     'async_fast_output_weight': args.async_fast_output_weight,
                     'async_stale_band_weight': args.async_stale_band_weight,
+                    'context_reading_mode': args.context_reading_mode,
+                    'context_reading_sources': args.context_reading_sources,
+                    'context_reading_gate_init': args.context_reading_gate_init,
+                    'context_local_window': args.context_local_window,
+                    'context_compressed_stride': args.context_compressed_stride,
+                    'context_retrieval_topk': args.context_retrieval_topk,
+                    'context_expert_memory_slots': args.context_expert_memory_slots,
+                    'context_egram_decay': args.context_egram_decay,
+                    'draft_mode': args.draft_mode,
+                    'draft_block_size': args.draft_block_size,
+                    'draft_head_mode': args.draft_head_mode,
+                    'draft_loss_weight': args.draft_loss_weight,
+                    'draft_slot_attention': args.draft_slot_attention,
                     'self_cond': args.self_cond,
                     'cross_layer_state': args.cross_layer_state,
                     'max_seq_len': args.max_seq_len,
@@ -475,6 +505,24 @@ if __name__ == '__main__':
     parser.add_argument('--ttt_layer', type=int, default=0, choices=[0, 1])
     parser.add_argument('--ttt_hidden_mult', type=int, default=2)
     parser.add_argument('--ttt_gate_init', type=float, default=-2.0)
+    parser.add_argument('--context_reading_mode', type=str, default='none',
+                        choices=['none', 'fusion'])
+    parser.add_argument('--context_reading_sources', type=str,
+                        default='local,compressed,retrieval,expert,egram')
+    parser.add_argument('--context_reading_gate_init', type=float, default=-2.0)
+    parser.add_argument('--context_local_window', type=int, default=32)
+    parser.add_argument('--context_compressed_stride', type=int, default=16)
+    parser.add_argument('--context_retrieval_topk', type=int, default=8)
+    parser.add_argument('--context_expert_memory_slots', type=int, default=4)
+    parser.add_argument('--context_egram_decay', type=float, default=0.75)
+    parser.add_argument('--draft_mode', type=str, default='none',
+                        choices=['none', 'parallel', 'revise'])
+    parser.add_argument('--draft_block_size', type=int, default=4)
+    parser.add_argument('--draft_head_mode', type=str, default='shared',
+                        choices=['shared', 'slot_adapter', 'slot_head'])
+    parser.add_argument('--draft_loss_weight', type=float, default=0.0)
+    parser.add_argument('--draft_slot_attention', type=str, default='causal_slots',
+                        choices=['causal_slots', 'block_bidir'])
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--data_path', type=str,
                         default='dataset_data/sft_t2a_mini.parquet')
@@ -587,8 +635,25 @@ if __name__ == '__main__':
         ttt_layer=bool(args.ttt_layer),
         ttt_hidden_mult=args.ttt_hidden_mult,
         ttt_gate_init=args.ttt_gate_init,
+        context_reading_mode=args.context_reading_mode,
+        context_reading_sources=args.context_reading_sources,
+        context_reading_gate_init=args.context_reading_gate_init,
+        context_local_window=args.context_local_window,
+        context_compressed_stride=args.context_compressed_stride,
+        context_retrieval_topk=args.context_retrieval_topk,
+        context_expert_memory_slots=args.context_expert_memory_slots,
+        context_egram_decay=args.context_egram_decay,
+        draft_mode=args.draft_mode,
+        draft_block_size=args.draft_block_size,
+        draft_head_mode=args.draft_head_mode,
+        draft_loss_weight=args.draft_loss_weight,
+        draft_slot_attention=args.draft_slot_attention,
     )
     if rank == 0:
+        if args.moe_dispatch_mode in ('block_sparse', 'capacity_drop'):
+            Logger(
+                f'WARNING: moe_dispatch_mode={args.moe_dispatch_mode} is experimental; '
+                'prefer dense_mask until parity tests pass.')
         Logger(f'Config: {config}')
         Logger(f'Experiment: {args.experiment_name}')
         Logger(f'Metrics CSV: {args.metrics_path}')
