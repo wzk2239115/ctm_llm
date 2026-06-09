@@ -63,8 +63,8 @@ def test_forward_shape():
     ids = torch.randint(0, cfg.vocab_size, (B, T))
     result = model.model(
         ids, return_all_ticks=True, draft_lm_head=model.lm_head)
-    tick_outs = result[2]
-    draft_logits = result[3]
+    tick_outs = result.tick_outputs
+    draft_logits = result.draft_slot_logits
     assert tick_outs.shape[:3] == (B, T, cfg.hidden_size)
     assert draft_logits.shape[:4] == (B, T, cfg.draft_block_size, cfg.vocab_size)
     print(f"tick_outs={tuple(tick_outs.shape)} draft_logits={tuple(draft_logits.shape)}")
@@ -79,7 +79,7 @@ def test_draft_offset_alignment():
     labels = ids.clone()
     result = model.model(
         ids, return_all_ticks=True, draft_lm_head=model.lm_head)
-    draft_logits = result[3]
+    draft_logits = result.draft_slot_logits
     slot_logits_t = draft_logits[..., :, :, :, 0]
     for slot in range(cfg.draft_block_size):
         horizon = slot + 1

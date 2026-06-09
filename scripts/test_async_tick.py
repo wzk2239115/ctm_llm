@@ -54,11 +54,11 @@ def test_forward_runs():
     x = torch.randn(2, 16, cfg.hidden_size)
     pos = torch.arange(16).unsqueeze(0).expand(2, -1)
     pos_emb = torch.randn(16, cfg.d_input)
-    out, _, extras = block(
+    result = block(
         x, pos_emb=pos_emb, track=False, return_all_ticks=True, num_iters=8)
-    assert out.shape == x.shape
-    assert extras["tick_outputs"].shape[-1] == 8
-    print("forward ok:", out.shape, extras["tick_outputs"].shape)
+    assert result.hidden.shape == x.shape
+    assert result.extras["tick_outputs"].shape[-1] == 8
+    print("forward ok:", result.hidden.shape, result.extras["tick_outputs"].shape)
 
 
 def test_local_ticks_diverge():
@@ -80,9 +80,9 @@ def test_fast_band_moves_every_tick():
     block = AsyncCTMBlock(0, cfg)
     x = torch.randn(1, 8, cfg.hidden_size)
     pos_emb = torch.randn(8, cfg.d_input)
-    _, _, extras = block(
+    result = block(
         x, pos_emb=pos_emb, return_all_ticks=True, num_iters=4)
-    tick_outs = extras["tick_outputs"]
+    tick_outs = result.extras["tick_outputs"]
     diffs = [
         (tick_outs[..., t] - tick_outs[..., t - 1]).abs().mean().item()
         for t in range(1, 4)

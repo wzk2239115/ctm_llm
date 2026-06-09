@@ -63,10 +63,10 @@ class RegionalMoEMixin:
 
     def _effective_moe_topk(self, routed_count):
         target = min(self.moe_topk_experts, routed_count)
-        warmup_steps = max(0, int(getattr(self.config, 'moe_topk_warmup_steps', 0)))
+        warmup_steps = max(0, int(self.config.moe_topk_warmup_steps))
         if warmup_steps <= 0:
             return target
-        current_step = max(0, int(getattr(self.config, 'global_step', 0)))
+        current_step = max(0, int(self.config.global_step))
         progress = min(1.0, current_step / max(1, warmup_steps))
         warm_topk = int(math.ceil(target + (routed_count - target) * (1.0 - progress)))
         return min(max(target, warm_topk), routed_count)

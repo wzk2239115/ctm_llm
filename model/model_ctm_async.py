@@ -1,4 +1,4 @@
-"""Async-first CTM backend copied from model_ctm_llm.py.
+"""Async-first CTM backend.
 
 Each clock band owns its own local tick counter, cell slice, trace carry rules,
 and output projection. Fast bands (period=1) fire every global tick and anchor
@@ -12,26 +12,10 @@ import torch.nn.functional as F
 import numpy as np
 
 from model.config import CTMLLMConfig
+from model.building_blocks import RMSNorm, FeedForward, _parse_int_list, BlockOutput, ModelOutput
 from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze, TTTMLP
-
-
-def _parse_int_list(raw, *, max_value=None):
-    values = []
-    for item in str(raw or "").replace(";", ",").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            value = int(item)
-        except ValueError:
-            continue
-        if value <= 0:
-            continue
-        if max_value is not None:
-            value = min(value, max_value)
-        if value not in values:
-            values.append(value)
-    return sorted(values)
+from model.moe_regional import RegionalMoEMixin
+from model.base_causal_lm import BaseCTMForCausalLM
 
 
 class AsyncClockBand:
@@ -95,15 +79,15 @@ class AsyncClockEngine(nn.Module):
 
     def __init__(self, block, config):
         super().__init__()
-        periods = _parse_int_list(getattr(config, 'async_tick_periods', '1,2,4,8'))
-        phases = _parse_int_list(getattr(config, 'async_tick_phases', ''))
+        periods = _parse_int_list(config.async_tick_periods)
+        phases = _parse_int_list(config.async_tick_phases)
         if not periods:
             periods = [1]
         self.num_bands = len(periods)
         self.fast_band = min(
-            max(0, int(getattr(config, 'async_fast_band', 0))),
+            max(0, int(config.async_fast_band)),
             self.num_bands - 1)
-        stale = float(getattr(config, 'async_stale_band_weight', 0.35))
+        stale = float(config.async_stale_band_weight)
         while len(phases) < self.num_bands:
             phases.append(0)
         phases = phases[:self.num_bands]
@@ -138,7 +122,7 @@ class AsyncClockEngine(nn.Module):
         ])
         self.fuse_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.global_output_proj = block.output_proj
-        self.fast_output_weight = float(getattr(config, 'async_fast_output_weight', 0.0))
+        self.fast_output_weight = float(config.async_fast_output_weight)
 
     def reset_runtime(self):
         for band in self.bands:
@@ -157,10 +141,12 @@ class AsyncClockEngine(nn.Module):
         for band in self.bands:
             if band.fires(global_tick):
                 continue
-            activated[:, :, band.d_start:band.d_end] = (
-                activated_prev[:, :, band.d_start:band.d_end])
-            state_trace[:, :, band.d_start:band.d_end, :] = (
-                trace_prev[:, :, band.d_start:band.d_end, :])
+            mask_a = torch.zeros(activated.shape[-1], device=activated.device, dtype=torch.bool)
+            mask_a[band.d_start:band.d_end] = True
+            activated = torch.where(mask_a.view(1, 1, -1), activated_prev, activated)
+            mask_t = torch.zeros(state_trace.shape[-2], device=state_trace.device, dtype=torch.bool)
+            mask_t[band.d_start:band.d_end] = True
+            state_trace = torch.where(mask_t.view(1, 1, -1, 1), trace_prev, state_trace)
         return activated, state_trace
 
     def emit_tick_output(self, block, activated, alpha_o, beta_o, r_o, global_tick):
@@ -191,30 +177,7 @@ class AsyncClockEngine(nn.Module):
         return [band.local_tick for band in self.bands]
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        normed = x.float() * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight * normed).type_as(x)
-
-
-class FeedForward(nn.Module):
-    def __init__(self, hidden_size, intermediate_ratio=4):
-        super().__init__()
-        intermediate = math.ceil(hidden_size * intermediate_ratio / 64) * 64
-        self.gate_proj = nn.Linear(hidden_size, intermediate, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate, bias=False)
-        self.down_proj = nn.Linear(intermediate, hidden_size, bias=False)
-
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-class AsyncCTMBlock(nn.Module):
+class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
     def __init__(self, layer_id: int, config: CTMLLMConfig):
         super().__init__()
         self.layer_id = layer_id
@@ -230,46 +193,46 @@ class AsyncCTMBlock(nn.Module):
         self.cell_sparsity_mode = config.cell_sparsity_mode
         self.cell_topk = min(max(1, int(config.cell_topk)), config.d_model)
         self.cell_sparsity_rescale = bool(config.cell_sparsity_rescale)
-        self.moe_routing_mode = getattr(config, 'moe_routing_mode', 'none')
-        self.moe_num_experts = max(1, int(getattr(config, 'moe_num_experts', 1)))
-        self.moe_topk_experts = max(1, int(getattr(config, 'moe_topk_experts', 1)))
-        self.moe_shared_experts = max(0, int(getattr(config, 'moe_shared_experts', 0)))
-        self.moe_expert_size = int(getattr(config, 'moe_expert_size', 0))
+        self.moe_routing_mode = config.moe_routing_mode
+        self.moe_num_experts = max(1, int(config.moe_num_experts))
+        self.moe_topk_experts = max(1, int(config.moe_topk_experts))
+        self.moe_shared_experts = max(0, int(config.moe_shared_experts))
+        self.moe_expert_size = int(config.moe_expert_size)
         if self.moe_expert_size <= 0 and self.moe_num_experts > 0:
             self.moe_expert_size = config.d_model // self.moe_num_experts
-        self.moe_expert_dropout = float(getattr(config, 'moe_expert_dropout', 0.0))
+        self.moe_expert_dropout = float(config.moe_expert_dropout)
         self.moe_activation_passes = max(1, int(
-            getattr(config, 'moe_activation_passes', 1)))
+            config.moe_activation_passes))
         self.moe_region_diversity_weight = float(
-            getattr(config, 'moe_region_diversity_weight', 0.0))
+            config.moe_region_diversity_weight)
         self.moe_load_balance_weight = float(
-            getattr(config, 'moe_load_balance_weight', 0.0))
+            config.moe_load_balance_weight)
         self.moe_router_entropy_weight = float(
-            getattr(config, 'moe_router_entropy_weight', 0.0))
+            config.moe_router_entropy_weight)
         self.moe_router_z_loss_weight = float(
-            getattr(config, 'moe_router_z_loss_weight', 0.0))
-        self.moe_dispatch_mode = getattr(config, 'moe_dispatch_mode', 'dense_mask')
-        self.moe_capacity_factor = float(getattr(config, 'moe_capacity_factor', 1.0))
-        self.moe_drop_tokens = bool(getattr(config, 'moe_drop_tokens', False))
+            config.moe_router_z_loss_weight)
+        self.moe_dispatch_mode = config.moe_dispatch_mode
+        self.moe_capacity_factor = float(config.moe_capacity_factor)
+        self.moe_drop_tokens = bool(config.moe_drop_tokens)
         self.moe_aux_loss_free_bias = bool(
-            getattr(config, 'moe_aux_loss_free_bias', False))
+            config.moe_aux_loss_free_bias)
         self.moe_aux_loss = None
         self.last_executed_ticks = 0
         self.last_async_bands_fired = 0
         self.last_async_local_ticks = []
-        self.diff_cell_mode = getattr(config, 'diff_cell_mode', 'none')
+        self.diff_cell_mode = config.diff_cell_mode
         self.diff_cell_temperature = float(
-            getattr(config, 'diff_cell_temperature', 1.0))
+            config.diff_cell_temperature)
         self.diff_cell_capacity_weight = float(
-            getattr(config, 'diff_cell_capacity_weight', 0.0))
+            config.diff_cell_capacity_weight)
         self.diff_cell_memory_weight = float(
-            getattr(config, 'diff_cell_memory_weight', 0.0))
+            config.diff_cell_memory_weight)
         self.diff_cell_diversity_weight = float(
-            getattr(config, 'diff_cell_diversity_weight', 0.0))
+            config.diff_cell_diversity_weight)
         self.diff_cell_widths = _parse_int_list(
-            getattr(config, 'diff_cell_widths', ''), max_value=self.moe_expert_size)
+            config.diff_cell_widths, max_value=self.moe_expert_size)
         self.diff_cell_memory_lengths = _parse_int_list(
-            getattr(config, 'diff_cell_memory_lengths', ''), max_value=config.memory_length)
+            config.diff_cell_memory_lengths, max_value=config.memory_length)
         if self.moe_expert_size > 0 and self.moe_expert_size not in self.diff_cell_widths:
             self.diff_cell_widths.append(self.moe_expert_size)
             self.diff_cell_widths = sorted(set(self.diff_cell_widths))
@@ -545,211 +508,6 @@ class AsyncCTMBlock(nn.Module):
             mask = mask * (self.d_model / self.cell_topk)
         return activated * mask
 
-    def _apply_moe_group_sparsity(self, activated):
-        expert_size = self.moe_expert_size
-        num_experts = self.moe_num_experts
-        if expert_size <= 0 or num_experts <= 0:
-            return None
-        if expert_size * num_experts != self.d_model:
-            return None
-
-        B, T, _ = activated.shape
-        x = activated.view(B, T, num_experts, expert_size)
-        raw_scores = x.abs().mean(dim=-1)
-        scores = raw_scores.detach()
-
-        shared = min(self.moe_shared_experts, num_experts)
-        routed_count = max(num_experts - shared, 1)
-        topk = self._effective_moe_topk(routed_count)
-        routed_scores = scores[:, :, shared:]
-        routed_raw_scores = raw_scores[:, :, shared:]
-        mode = self.moe_routing_mode
-
-        if mode in ('regional_topk', 'regional_shared_topk') or self.moe_activation_passes > 1:
-            return self._apply_regional_moe_sparsity(
-                activated, x, scores, raw_scores, shared, routed_count, topk,
-                routed_scores, routed_raw_scores)
-
-        if mode == 'hash':
-            pos = torch.arange(T, device=activated.device).view(1, T, 1)
-            offsets = torch.arange(topk, device=activated.device).view(1, 1, topk)
-            idx = (pos + offsets + self.layer_id) % routed_count
-            idx = idx.expand(B, -1, -1)
-        elif mode == 'expert_choice':
-            mean_scores = routed_scores.mean(dim=(0, 1), keepdim=True)
-            idx = torch.topk(mean_scores.expand(B, T, -1), topk, dim=-1).indices
-        else:
-            idx = torch.topk(routed_scores, topk, dim=-1).indices
-
-        expert_mask = torch.zeros_like(scores)
-        expert_mask[:, :, shared:].scatter_(-1, idx, 1.0)
-        if shared > 0:
-            expert_mask[:, :, :shared] = 1.0
-
-        if self.training and self.moe_expert_dropout > 0:
-            keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
-            if shared > 0:
-                keep[:, :, :shared] = True
-            expert_mask = expert_mask * keep.type_as(expert_mask)
-
-        active_cells = expert_mask.sum(dim=-1, keepdim=True).clamp(min=1) * expert_size
-        mask = expert_mask.unsqueeze(-1).expand_as(x).reshape_as(activated)
-        if self.cell_sparsity_rescale:
-            mask = mask * (self.d_model / active_cells)
-        self._update_moe_aux_loss(routed_raw_scores)
-        return activated * mask
-
-    def _effective_moe_topk(self, routed_count):
-        target = min(self.moe_topk_experts, routed_count)
-        warmup_steps = max(0, int(getattr(self.config, 'moe_topk_warmup_steps', 0)))
-        if warmup_steps <= 0:
-            return target
-        current_step = max(0, int(getattr(self.config, 'global_step', 0)))
-        progress = min(1.0, current_step / max(1, warmup_steps))
-        warm_topk = int(math.ceil(target + (routed_count - target) * (1.0 - progress)))
-        return min(max(target, warm_topk), routed_count)
-
-    def _apply_regional_moe_sparsity(
-        self, activated, x, scores, raw_scores, shared, routed_count, topk,
-        routed_scores, routed_raw_scores,
-    ):
-        max_distinct_passes = max(1, math.ceil(routed_count / max(1, topk)))
-        passes = min(max(1, self.moe_activation_passes), max_distinct_passes)
-        pass_outputs = []
-        pass_masks = []
-        selected = torch.zeros_like(routed_scores, dtype=torch.bool)
-
-        for _ in range(passes):
-            masked_scores = routed_scores.masked_fill(selected, float("-inf"))
-            idx = torch.topk(masked_scores, topk, dim=-1).indices
-            routed_mask = torch.zeros_like(routed_scores)
-            routed_mask.scatter_(-1, idx, 1.0)
-            selected = selected | routed_mask.bool()
-
-            expert_mask = torch.zeros_like(scores)
-            expert_mask[:, :, shared:] = routed_mask
-            if shared > 0:
-                expert_mask[:, :, :shared] = 1.0
-
-            if self.training and self.moe_expert_dropout > 0:
-                keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
-                if shared > 0:
-                    keep[:, :, :shared] = True
-                expert_mask = expert_mask * keep.type_as(expert_mask)
-
-            active_cells = expert_mask.sum(dim=-1, keepdim=True).clamp(min=1) * self.moe_expert_size
-            mask = expert_mask.unsqueeze(-1).expand_as(x).reshape_as(activated)
-            if self.cell_sparsity_rescale:
-                mask = mask * (self.d_model / active_cells)
-            pass_outputs.append(activated * mask)
-            pass_masks.append(expert_mask[:, :, shared:])
-
-        self._update_moe_aux_loss(routed_raw_scores)
-        self._update_region_diversity_loss(pass_masks)
-        return torch.stack(pass_outputs, dim=0).mean(dim=0)
-
-    def _update_region_diversity_loss(self, pass_masks):
-        if self.moe_region_diversity_weight <= 0 or len(pass_masks) <= 1:
-            return
-        overlaps = []
-        for i in range(len(pass_masks)):
-            for j in range(i + 1, len(pass_masks)):
-                overlaps.append((pass_masks[i] * pass_masks[j]).sum(dim=-1).mean())
-        if not overlaps:
-            return
-        diversity_loss = torch.stack(overlaps).mean() / max(1, self.moe_topk_experts)
-        aux = self.moe_region_diversity_weight * diversity_loss
-        self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
-
-    def _update_moe_aux_loss(self, routed_scores):
-        if (
-            self.moe_load_balance_weight <= 0
-            and self.moe_router_entropy_weight <= 0
-            and self.moe_router_z_loss_weight <= 0
-        ):
-            return
-        if routed_scores.size(-1) <= 1:
-            return
-        probs = F.softmax(routed_scores.float(), dim=-1)
-        aux = routed_scores.new_zeros(())
-        if self.moe_load_balance_weight > 0:
-            load = probs.mean(dim=(0, 1))
-            target = torch.full_like(load, 1.0 / load.numel())
-            balance_loss = ((load - target) ** 2).mean() * load.numel()
-            aux = aux + self.moe_load_balance_weight * balance_loss
-        if self.moe_router_entropy_weight > 0:
-            entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(dim=-1).mean()
-            norm_entropy = entropy / math.log(probs.size(-1))
-            aux = aux - self.moe_router_entropy_weight * norm_entropy
-        if self.moe_router_z_loss_weight > 0:
-            z_loss = torch.logsumexp(routed_scores.float(), dim=-1).pow(2).mean()
-            aux = aux + self.moe_router_z_loss_weight * z_loss
-        self.moe_aux_loss = aux if self.moe_aux_loss is None else self.moe_aux_loss + aux
-
-    def _use_group_sparse_backend(self):
-        if self.moe_routing_mode not in ('regional_topk', 'regional_shared_topk'):
-            return False
-        if self.moe_dispatch_mode == 'dense_mask':
-            return False
-        return self.group_synapses is not None and self.group_trace_processors is not None
-
-    def _route_experts(self, scores, shared, routed_count, topk, selected=None):
-        routed_scores = scores[:, :, shared:]
-        if selected is not None:
-            routed_scores = routed_scores.masked_fill(selected, float("-inf"))
-        idx = torch.topk(routed_scores, topk, dim=-1).indices
-        expert_mask = torch.zeros_like(scores)
-        expert_mask[:, :, shared:].scatter_(-1, idx, 1.0)
-        if shared > 0:
-            expert_mask[:, :, :shared] = 1.0
-        if self.training and self.moe_expert_dropout > 0:
-            keep = torch.rand_like(expert_mask) >= self.moe_expert_dropout
-            if shared > 0:
-                keep[:, :, :shared] = True
-            expert_mask = expert_mask * keep.type_as(expert_mask)
-        if self.moe_dispatch_mode == 'capacity_drop' or self.moe_drop_tokens:
-            expert_mask = self._apply_expert_capacity(expert_mask, scores, shared)
-        return expert_mask, idx
-
-    def _apply_expert_capacity(self, expert_mask, scores, shared=0):
-        B, T, E = expert_mask.shape
-        active_per_token = expert_mask.sum(dim=-1).float().mean().clamp(min=1.0)
-        capacity = int(math.ceil(self.moe_capacity_factor * B * T * active_per_token / E))
-        capacity = max(1, capacity)
-        flat_mask = expert_mask.reshape(B * T, E)
-        flat_scores = scores.reshape(B * T, E)
-        kept = torch.zeros_like(flat_mask)
-        for expert in range(E):
-            if expert < shared:
-                kept[:, expert] = flat_mask[:, expert]
-                continue
-            active = flat_mask[:, expert].bool()
-            if not active.any():
-                continue
-            active_idx = active.nonzero(as_tuple=False).squeeze(-1)
-            if active_idx.numel() > capacity:
-                expert_scores = flat_scores[active_idx, expert]
-                active_idx = active_idx[torch.topk(expert_scores, capacity).indices]
-            kept[active_idx, expert] = 1.0
-        return kept.view_as(expert_mask)
-
-    def _compute_dense_pre_mask_activation(
-        self, attn, activated, state_trace, prev_sync_o_activated,
-    ):
-        B, T, _ = activated.shape
-        device = activated.device
-        pre_syn_parts = [attn, activated]
-        if self.self_cond:
-            if prev_sync_o_activated is not None:
-                pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
-            else:
-                pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
-        pre_syn = torch.cat(pre_syn_parts, dim=-1)
-        state = self.synapses(pre_syn)
-        new_trace = torch.cat(
-            [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
-        return self.trace_processor(new_trace), new_trace
-
     def _run_group_sparse_regional_tick(
         self, attn, activated, state_trace, prev_sync_o_activated, global_tick=0,
     ):
@@ -1008,9 +766,7 @@ class AsyncCTMBlock(nn.Module):
         extras['final_activated'] = activated
         extras['final_trace'] = state_trace
 
-        if extras:
-            return x, present_kv, extras
-        return x, present_kv
+        return BlockOutput(hidden=x, present_kv=present_kv, extras=extras)
 
 
 class AsyncCTMModel(nn.Module):
@@ -1053,22 +809,22 @@ class AsyncCTMModel(nn.Module):
 
             if track and not is_last:
                 result = layer(h, track=True, return_all_ticks=False, **layer_kwargs)
-                h, present, extras = result
-                tracking_all[f'layer_{layer.layer_id}'] = extras['tracking']
+                h = result.hidden
+                present = result.present_kv
+                tracking_all[f'layer_{layer.layer_id}'] = result.extras['tracking']
             elif is_last and (track or return_all_ticks):
                 result = layer(h, track=track, return_all_ticks=True, **layer_kwargs)
-                h, present, extras = result
+                h = result.hidden
+                present = result.present_kv
                 if track:
-                    tracking_all[f'layer_{layer.layer_id}'] = extras.get('tracking', {})
+                    tracking_all[f'layer_{layer.layer_id}'] = result.extras.get('tracking', {})
                 if return_all_ticks:
-                    last_tick_outs = extras.get('tick_outputs')
+                    last_tick_outs = result.extras.get('tick_outputs')
             else:
                 result = layer(h, **layer_kwargs)
-                if len(result) == 3:
-                    h, present, extras = result
-                else:
-                    h, present = result
-                    extras = {}
+                h = result.hidden
+                present = result.present_kv
+                extras = result.extras
 
             if self.config.cross_layer_state and isinstance(extras, dict):
                 prev_activated = extras.get('final_activated', prev_activated)
@@ -1079,20 +835,16 @@ class AsyncCTMModel(nn.Module):
 
         h = self.norm(h)
 
-        outputs = [h, presents]
-        if return_all_ticks:
-            outputs.append(last_tick_outs)
-        if track:
-            outputs.append(tracking_all)
-        if enable_tick_halt:
-            outputs.append(executed_ticks)
-
-        if len(outputs) == 2:
-            return tuple(outputs)
-        return tuple(outputs)
+        return ModelOutput(
+            hidden=h,
+            past_key_values=presents,
+            tick_outputs=last_tick_outs if return_all_ticks else None,
+            tracking=tracking_all if track else None,
+            executed_ticks=executed_ticks if enable_tick_halt else None,
+        )
 
 
-class AsyncCTMForCausalLM(nn.Module):
+class AsyncCTMForCausalLM(BaseCTMForCausalLM):
     def __init__(self, config: CTMLLMConfig):
         super().__init__()
         self.config = config
@@ -1107,182 +859,13 @@ class AsyncCTMForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def _moe_aux_loss(self):
-        aux = None
-        for layer in self.model.layers:
-            value = getattr(layer, 'moe_aux_loss', None)
-            if value is None:
-                continue
-            aux = value if aux is None else aux + value
-        return aux
-
-    def _tick_horizon(self, tick, num_ticks):
-        mode = self.config.elf_horizon_mode
-        max_horizon = max(1, int(self.config.elf_max_horizon))
-        if mode == 'none':
-            return 1
-        if mode == 'linear':
-            return min(tick + 1, max_horizon)
-        if mode == 'pow2':
-            return min(2 ** tick, max_horizon)
-        raise ValueError(f"Unknown elf_horizon_mode: {mode}")
-
-    def _mtp_horizons(self):
-        mode = getattr(self.config, 'moe_mtp_mode', 'none')
-        raw = str(getattr(self.config, 'moe_mtp_horizons', '') or '')
-        if mode == 'none' or not raw.strip():
-            return []
-        horizons = []
-        for item in raw.split(','):
-            item = item.strip()
-            if not item:
-                continue
-            try:
-                horizon = int(item)
-            except ValueError:
-                continue
-            if horizon > 0 and horizon not in horizons:
-                horizons.append(horizon)
-        return horizons
-
-    def _fast_output_ticks(self):
-        ticks = _parse_int_list(getattr(self.config, 'fast_output_ticks', '1,4'))
-        return [tick for tick in ticks if tick > 0]
-
-    def _reflex_logits(self, input_ids):
-        h = self.model.embed_tokens(input_ids)
-        h = h + self.reflex_adapter(h)
-        return self.lm_head(self.reflex_norm(h))
-
-    @staticmethod
-    def _lm_loss_from_logits(logits, labels):
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        return F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1), ignore_index=-100)
-
-    @staticmethod
-    def _distill_loss(student_logits, teacher_logits, labels):
-        if labels.size(1) <= 1:
-            return student_logits.new_zeros(())
-        student = student_logits[..., :-1, :].float()
-        teacher = teacher_logits[..., :-1, :].detach().float()
-        mask = labels[..., 1:] != -100
-        if not mask.any():
-            return student_logits.new_zeros(())
-        log_p = F.log_softmax(student, dim=-1)
-        q = F.softmax(teacher, dim=-1)
-        kl = F.kl_div(log_p, q, reduction='none').sum(dim=-1)
-        return (kl * mask).sum() / mask.sum().clamp(min=1)
-
-    def _fast_slow_output_loss(self, input_ids, labels, tick_outs, final_logits):
-        mode = getattr(self.config, 'fast_output_mode', 'none')
-        if mode == 'none':
-            return final_logits.new_zeros(())
-        aux = final_logits.new_zeros(())
-        distill_weight = float(getattr(self.config, 'fast_output_distill_weight', 0.0))
-        fast_weight = float(getattr(self.config, 'fast_output_weight', 0.0))
-        habit_weight = float(getattr(self.config, 'habit_output_weight', 0.0))
-        if fast_weight > 0:
-            reflex_logits = self._reflex_logits(input_ids)
-            aux = aux + fast_weight * self._lm_loss_from_logits(reflex_logits, labels)
-            if distill_weight > 0:
-                aux = aux + fast_weight * distill_weight * self._distill_loss(
-                    reflex_logits, final_logits, labels)
-        if habit_weight > 0 and tick_outs is not None:
-            num_ticks = tick_outs.size(-1)
-            tick_losses = []
-            distill_losses = []
-            for tick in self._fast_output_ticks():
-                idx = min(max(tick - 1, 0), num_ticks - 1)
-                logits_t = self.lm_head(tick_outs[..., idx])
-                tick_losses.append(self._lm_loss_from_logits(logits_t, labels))
-                if distill_weight > 0:
-                    distill_losses.append(self._distill_loss(logits_t, final_logits, labels))
-            if tick_losses:
-                aux = aux + habit_weight * torch.stack(tick_losses).mean()
-            if distill_losses:
-                aux = aux + habit_weight * distill_weight * torch.stack(distill_losses).mean()
-        return aux
-
-    @staticmethod
-    def _per_sample_lm_loss(logits, labels, horizon):
-        B = labels.size(0)
-        if labels.size(1) <= horizon:
-            return logits.new_zeros(B), logits.new_zeros(B, 0, dtype=torch.bool)
-        shift_logits = logits[..., :-horizon, :].contiguous()
-        shift_labels = labels[..., horizon:].contiguous()
-        label_mask = shift_labels != -100
-        per_token_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1), ignore_index=-100, reduction='none')
-        per_token_loss = per_token_loss.view(B, -1)
-        per_sample_loss = (
-            per_token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
-        return per_sample_loss, label_mask
-
-    @staticmethod
-    def _per_sample_entropy(logits, label_mask, horizon):
-        if label_mask.numel() == 0:
-            return logits.new_zeros(logits.size(0))
-        valid_logits = logits[..., :-horizon, :]
-        probs = F.softmax(valid_logits, dim=-1)
-        entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-        norm_ent = entropy / math.log(logits.size(-1))
-        return (norm_ent * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
-
-    def _combine_tick_losses(self, losses, certainties):
-        mode = self.config.tick_loss_mode
-        if self.config.tick_halt_mode != 'none':
-            tick_loss, _ = self._halt_weighted_tick_loss(losses, certainties)
-            return tick_loss
-        if mode == 'min_conf':
-            confidence = 1 - certainties
-            loss_min = losses.min(dim=1).values.mean()
-            best_conf_tick = confidence.argmax(dim=1)
-            batch_idx = torch.arange(losses.size(0), device=losses.device)
-            loss_conf = losses[batch_idx, best_conf_tick].mean()
-            return (loss_min + loss_conf) / 2.0
-        if mode == 'mean':
-            return losses.mean()
-        if mode == 'last':
-            return losses[:, -1].mean()
-        raise ValueError(f"Unknown tick_loss_mode: {mode}")
-
-    def _halt_weighted_tick_loss(self, losses, certainties):
-        mode = self.config.tick_halt_mode
-        confidence = 1 - certainties
-        if mode == 'confidence':
-            temp = max(float(self.config.tick_halt_temperature), 1e-4)
-            weights = torch.softmax(confidence / temp, dim=1)
-        elif mode == 'threshold':
-            threshold = float(self.config.tick_halt_threshold)
-            hit = confidence >= threshold
-            any_hit = hit.any(dim=1)
-            first_hit = hit.float().argmax(dim=1)
-            last_tick = torch.full_like(first_hit, losses.size(1) - 1)
-            selected = torch.where(any_hit, first_hit, last_tick)
-            weights = F.one_hot(selected, num_classes=losses.size(1)).type_as(losses)
-        else:
-            raise ValueError(f"Unknown tick_halt_mode: {mode}")
-
-        tick_loss = (losses * weights).sum(dim=1).mean()
-        if self.config.tick_compute_weight > 0:
-            tick_ids = torch.arange(1, losses.size(1) + 1, device=losses.device,
-                                    dtype=losses.dtype)
-            expected_tick = (weights * tick_ids.view(1, -1)).sum(dim=1)
-            compute_penalty = expected_tick.mean() / losses.size(1)
-            tick_loss = tick_loss + self.config.tick_compute_weight * compute_penalty
-        return tick_loss, weights
-
     def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
                 num_iters=None):
         enable_halt = self.config.tick_halt_mode != 'none'
         result = self.model(
             input_ids, past_key_values, use_cache, track=False, num_iters=num_iters,
             halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
-        h, past_key_values = result[0], result[1]
+        h, past_key_values = result.hidden, result.past_key_values
         logits = self.lm_head(h)
         loss = None
         if labels is not None:
@@ -1300,7 +883,8 @@ class AsyncCTMForCausalLM(nn.Module):
         result = self.model(
             input_ids, track=False, num_iters=num_iters, return_all_ticks=True,
             halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
-        h, tick_outs = result[0], result[2]
+        h = result.hidden
+        tick_outs = result.tick_outputs
         num_ticks = tick_outs.size(-1)
 
         final_logits = self.lm_head(h)
@@ -1342,8 +926,9 @@ class AsyncCTMForCausalLM(nn.Module):
             margin = float(self.config.tick_improve_margin)
             improve_loss = F.relu(next_losses[:, 1:] - next_losses[:, :-1] + margin).mean()
             tick_loss = tick_loss + self.config.tick_improve_weight * improve_loss
-        slow_weight = float(getattr(self.config, 'slow_output_weight', 0.0))
-        loss = (0.5 + slow_weight) * final_loss + 0.5 * tick_loss
+        slow_weight = float(self.config.slow_output_weight)
+        base_w = float(self.config.tick_loss_base_weight)
+        loss = (base_w + slow_weight) * final_loss + base_w * tick_loss
         fast_slow_aux = self._fast_slow_output_loss(
             input_ids, labels, tick_outs, final_logits)
         loss = loss + fast_slow_aux
@@ -1352,72 +937,3 @@ class AsyncCTMForCausalLM(nn.Module):
             loss = loss + moe_aux_loss
 
         return loss, losses, certainties
-
-    @torch.inference_mode()
-    def forward_track(self, input_ids, num_iters=None):
-        result = self.model(input_ids, track=True, num_iters=num_iters,
-                            return_all_ticks=False)
-        if len(result) == 3:
-            h, _, tracking = result
-        else:
-            h, _, _, tracking = result
-        logits = self.lm_head(h)
-        probs = torch.softmax(logits, dim=-1)
-        return tracking, logits, probs
-
-    @torch.inference_mode()
-    def generate(self, input_ids, max_new_tokens=512, temperature=0.85,
-                 top_p=0.85, top_k=50, eos_token_id=2, use_cache=True,
-                 repetition_penalty=1.0, num_iters=None):
-        past_kv = None
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
-
-        for _ in range(max_new_tokens):
-            inp = input_ids if past_kv is None else input_ids[:, -1:]
-            out = self.forward(inp, past_key_values=past_kv, use_cache=use_cache, num_iters=num_iters)
-            token_logits = out['logits'][:, -1, :] / temperature
-
-            if repetition_penalty != 1.0:
-                for i in range(input_ids.shape[0]):
-                    seen = torch.unique(input_ids[i])
-                    score = token_logits[i, seen]
-                    token_logits[i, seen] = torch.where(
-                        score > 0, score / repetition_penalty, score * repetition_penalty)
-
-            if top_k > 0:
-                top_k_eff = min(top_k, token_logits.size(-1))
-                topk_val = torch.topk(token_logits, top_k_eff)[0][..., -1, None]
-                token_logits[token_logits < topk_val] = float('-inf')
-
-            if top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(token_logits, descending=True)
-                cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                mask = cum_probs > top_p
-                mask[..., 1:] = mask[..., :-1].clone()
-                mask[..., 0] = False
-                token_logits[mask.scatter(1, sorted_idx, mask)] = float('-inf')
-
-            probs = torch.softmax(token_logits, dim=-1)
-            new_tokens = torch.multinomial(probs, num_samples=1)
-
-            if eos_token_id is not None:
-                new_tokens = torch.where(
-                    finished.unsqueeze(-1),
-                    new_tokens.new_full(new_tokens.shape, eos_token_id),
-                    new_tokens)
-
-            input_ids = torch.cat([input_ids, new_tokens], dim=-1)
-            past_kv = out['past_key_values'] if use_cache else None
-
-            if eos_token_id is not None:
-                finished |= new_tokens.squeeze(1).eq(eos_token_id)
-                if finished.all():
-                    break
-
-        return input_ids
-
-    def compute_certainties(self, logits_seq):
-        probs = F.softmax(logits_seq, dim=-1)
-        ent = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-        norm_ent = ent / math.log(logits_seq.size(-1))
-        return norm_ent

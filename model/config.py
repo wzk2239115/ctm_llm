@@ -68,6 +68,7 @@ class CTMLLMConfig:
         self.fast_output_weight = kwargs.get('fast_output_weight', 0.0)
         self.habit_output_weight = kwargs.get('habit_output_weight', 0.0)
         self.slow_output_weight = kwargs.get('slow_output_weight', 0.0)
+        self.tick_loss_base_weight = kwargs.get('tick_loss_base_weight', 0.5)
         self.fast_output_ticks = kwargs.get('fast_output_ticks', '1,4')
         self.fast_output_distill_weight = kwargs.get('fast_output_distill_weight', 0.0)
 

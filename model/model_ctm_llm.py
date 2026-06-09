@@ -7,60 +7,11 @@ import torch.nn.functional as F
 import numpy as np
 
 from model.config import CTMLLMConfig
+from model.building_blocks import RMSNorm, FeedForward, _parse_int_list, _parse_name_list, BlockOutput, ModelOutput
 from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze, TTTMLP
 from model.draft_modules import DraftSlotHead
 from model.moe_regional import RegionalMoEMixin
-
-
-def _parse_int_list(raw, *, max_value=None):
-    values = []
-    for item in str(raw or "").replace(";", ",").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            value = int(item)
-        except ValueError:
-            continue
-        if value <= 0:
-            continue
-        if max_value is not None:
-            value = min(value, max_value)
-        if value not in values:
-            values.append(value)
-    return sorted(values)
-
-
-def _parse_name_list(raw):
-    values = []
-    for item in str(raw or "").replace(";", ",").split(","):
-        item = item.strip().lower()
-        if item and item not in values:
-            values.append(item)
-    return values
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        normed = x.float() * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight * normed).type_as(x)
-
-
-class FeedForward(nn.Module):
-    def __init__(self, hidden_size, intermediate_ratio=4):
-        super().__init__()
-        intermediate = math.ceil(hidden_size * intermediate_ratio / 64) * 64
-        self.gate_proj = nn.Linear(hidden_size, intermediate, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate, bias=False)
-        self.down_proj = nn.Linear(intermediate, hidden_size, bias=False)
-
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+from model.base_causal_lm import BaseCTMForCausalLM
 
 
 class DINOProjectionHead(nn.Module):
@@ -96,50 +47,11 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         self.cell_sparsity_mode = config.cell_sparsity_mode
         self.cell_topk = min(max(1, int(config.cell_topk)), config.d_model)
         self.cell_sparsity_rescale = bool(config.cell_sparsity_rescale)
-        self.moe_routing_mode = getattr(config, 'moe_routing_mode', 'none')
-        self.moe_num_experts = max(1, int(getattr(config, 'moe_num_experts', 1)))
-        self.moe_topk_experts = max(1, int(getattr(config, 'moe_topk_experts', 1)))
-        self.moe_shared_experts = max(0, int(getattr(config, 'moe_shared_experts', 0)))
-        self.moe_expert_size = int(getattr(config, 'moe_expert_size', 0))
-        if self.moe_expert_size <= 0 and self.moe_num_experts > 0:
-            self.moe_expert_size = config.d_model // self.moe_num_experts
-        self.moe_expert_dropout = float(getattr(config, 'moe_expert_dropout', 0.0))
-        self.moe_activation_passes = max(1, int(
-            getattr(config, 'moe_activation_passes', 1)))
-        self.moe_region_diversity_weight = float(
-            getattr(config, 'moe_region_diversity_weight', 0.0))
-        self.moe_load_balance_weight = float(
-            getattr(config, 'moe_load_balance_weight', 0.0))
-        self.moe_router_entropy_weight = float(
-            getattr(config, 'moe_router_entropy_weight', 0.0))
-        self.moe_router_z_loss_weight = float(
-            getattr(config, 'moe_router_z_loss_weight', 0.0))
-        self.moe_dispatch_mode = getattr(config, 'moe_dispatch_mode', 'dense_mask')
-        self.moe_capacity_factor = float(getattr(config, 'moe_capacity_factor', 1.0))
-        self.moe_drop_tokens = bool(getattr(config, 'moe_drop_tokens', False))
-        self.moe_aux_loss_free_bias = bool(
-            getattr(config, 'moe_aux_loss_free_bias', False))
         self.moe_aux_loss = None
         self.last_executed_ticks = 0
-        self.diff_cell_mode = getattr(config, 'diff_cell_mode', 'none')
-        self.diff_cell_temperature = float(
-            getattr(config, 'diff_cell_temperature', 1.0))
-        self.diff_cell_capacity_weight = float(
-            getattr(config, 'diff_cell_capacity_weight', 0.0))
-        self.diff_cell_memory_weight = float(
-            getattr(config, 'diff_cell_memory_weight', 0.0))
-        self.diff_cell_diversity_weight = float(
-            getattr(config, 'diff_cell_diversity_weight', 0.0))
-        self.diff_cell_widths = _parse_int_list(
-            getattr(config, 'diff_cell_widths', ''), max_value=self.moe_expert_size)
-        self.diff_cell_memory_lengths = _parse_int_list(
-            getattr(config, 'diff_cell_memory_lengths', ''), max_value=config.memory_length)
-        if self.moe_expert_size > 0 and self.moe_expert_size not in self.diff_cell_widths:
-            self.diff_cell_widths.append(self.moe_expert_size)
-            self.diff_cell_widths = sorted(set(self.diff_cell_widths))
-        if config.memory_length not in self.diff_cell_memory_lengths:
-            self.diff_cell_memory_lengths.append(config.memory_length)
-            self.diff_cell_memory_lengths = sorted(set(self.diff_cell_memory_lengths))
+
+        self._init_moe_params(config)
+        self._init_diff_cell_params(config)
 
         self.input_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -153,6 +65,70 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         self.o_proj = nn.Linear(config.d_input, config.d_input, bias=False)
         self.attn_drop = nn.Dropout(config.dropout)
 
+        self._init_synapse(config)
+        self._init_trace_and_groups(config)
+        self._init_ttt(config)
+        self._init_context_reading(config)
+
+        self.start_activated_state = nn.Parameter(
+            torch.zeros(config.d_model).uniform_(
+                -math.sqrt(1 / config.d_model), math.sqrt(1 / config.d_model)))
+        self.start_trace = nn.Parameter(
+            torch.zeros(config.d_model, config.memory_length).uniform_(
+                -math.sqrt(1 / (config.d_model + config.memory_length)),
+                math.sqrt(1 / (config.d_model + config.memory_length))))
+
+        self._init_synch(config)
+
+        self.output_proj = nn.Linear(self.synch_repr_out, config.hidden_size, bias=False)
+
+        self.draft_mode = config.draft_mode
+        self.draft_slot_head = None
+        if self.draft_mode != 'none':
+            self.draft_slot_head = DraftSlotHead(
+                config, config.hidden_size, config.vocab_size)
+
+        self.post_ctm_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config.hidden_size)
+        self.resid_drop = nn.Dropout(config.dropout)
+
+    def _init_moe_params(self, config):
+        self.moe_routing_mode = config.moe_routing_mode
+        self.moe_num_experts = max(1, int(config.moe_num_experts))
+        self.moe_topk_experts = max(1, int(config.moe_topk_experts))
+        self.moe_shared_experts = max(0, int(config.moe_shared_experts))
+        self.moe_expert_size = int(config.moe_expert_size)
+        if self.moe_expert_size <= 0 and self.moe_num_experts > 0:
+            self.moe_expert_size = config.d_model // self.moe_num_experts
+        self.moe_expert_dropout = float(config.moe_expert_dropout)
+        self.moe_activation_passes = max(1, int(config.moe_activation_passes))
+        self.moe_region_diversity_weight = float(config.moe_region_diversity_weight)
+        self.moe_load_balance_weight = float(config.moe_load_balance_weight)
+        self.moe_router_entropy_weight = float(config.moe_router_entropy_weight)
+        self.moe_router_z_loss_weight = float(config.moe_router_z_loss_weight)
+        self.moe_dispatch_mode = config.moe_dispatch_mode
+        self.moe_capacity_factor = float(config.moe_capacity_factor)
+        self.moe_drop_tokens = bool(config.moe_drop_tokens)
+        self.moe_aux_loss_free_bias = bool(config.moe_aux_loss_free_bias)
+
+    def _init_diff_cell_params(self, config):
+        self.diff_cell_mode = config.diff_cell_mode
+        self.diff_cell_temperature = float(config.diff_cell_temperature)
+        self.diff_cell_capacity_weight = float(config.diff_cell_capacity_weight)
+        self.diff_cell_memory_weight = float(config.diff_cell_memory_weight)
+        self.diff_cell_diversity_weight = float(config.diff_cell_diversity_weight)
+        self.diff_cell_widths = _parse_int_list(
+            config.diff_cell_widths, max_value=self.moe_expert_size)
+        self.diff_cell_memory_lengths = _parse_int_list(
+            config.diff_cell_memory_lengths, max_value=config.memory_length)
+        if self.moe_expert_size > 0 and self.moe_expert_size not in self.diff_cell_widths:
+            self.diff_cell_widths.append(self.moe_expert_size)
+            self.diff_cell_widths = sorted(set(self.diff_cell_widths))
+        if config.memory_length not in self.diff_cell_memory_lengths:
+            self.diff_cell_memory_lengths.append(config.memory_length)
+            self.diff_cell_memory_lengths = sorted(set(self.diff_cell_memory_lengths))
+
+    def _init_synapse(self, config):
         synapse_in = config.d_input + config.d_model
         if config.self_cond:
             synapse_in += config.d_model
@@ -168,6 +144,7 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
             self.synapses = SynapseUNET(
                 synapse_in, config.d_model, config.synapse_depth, dropout=config.dropout)
 
+    def _init_trace_and_groups(self, config):
         self.trace_processor = self._build_nlms(config)
         self.group_synapses = None
         self.group_trace_processors = None
@@ -186,6 +163,8 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
             ])
             if self._differentiated_cells_enabled():
                 self._init_differentiated_cells(config)
+
+    def _init_ttt(self, config):
         self.ttt_layer = None
         if config.ttt_layer:
             self.ttt_layer = TTTMLP(
@@ -195,31 +174,27 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
                 dropout=config.dropout,
             )
 
-        self.context_reading_mode = getattr(config, 'context_reading_mode', 'none')
+    def _init_context_reading(self, config):
+        self.context_reading_mode = config.context_reading_mode
         self.context_source_names = [
-            name for name in _parse_name_list(getattr(
-                config, 'context_reading_sources',
-                'local,compressed,retrieval,expert,egram'))
+            name for name in _parse_name_list(config.context_reading_sources)
             if name in ('local', 'compressed', 'retrieval', 'expert', 'egram')
         ]
         self.context_reading_enabled = (
             self.context_reading_mode != 'none' and len(self.context_source_names) > 0)
         self.context_source_to_idx = {
             name: idx for idx, name in enumerate(self.context_source_names)}
-        self.context_local_window = max(1, int(getattr(config, 'context_local_window', 32)))
-        self.context_compressed_stride = max(
-            1, int(getattr(config, 'context_compressed_stride', 16)))
-        self.context_retrieval_topk = max(
-            1, int(getattr(config, 'context_retrieval_topk', 8)))
-        self.context_expert_memory_slots = max(
-            1, int(getattr(config, 'context_expert_memory_slots', 4)))
+        self.context_local_window = max(1, int(config.context_local_window))
+        self.context_compressed_stride = max(1, int(config.context_compressed_stride))
+        self.context_retrieval_topk = max(1, int(config.context_retrieval_topk))
+        self.context_expert_memory_slots = max(1, int(config.context_expert_memory_slots))
         self.context_egram_decay = min(
-            max(float(getattr(config, 'context_egram_decay', 0.75)), 0.0), 0.99)
+            max(float(config.context_egram_decay), 0.0), 0.99)
         if self.context_reading_enabled:
             self.context_source_gate = nn.Linear(
                 self.synch_repr_action, len(self.context_source_names), bias=False)
             self.context_fusion_gate = nn.Parameter(torch.tensor(
-                float(getattr(config, 'context_reading_gate_init', -2.0))))
+                float(config.context_reading_gate_init)))
             self.context_egram_proj = nn.Sequential(
                 nn.LayerNorm(config.d_model),
                 nn.Linear(config.d_model, config.d_input, bias=False),
@@ -229,28 +204,6 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
                 num_memory_experts, self.context_expert_memory_slots, config.d_input))
             nn.init.normal_(self.context_expert_memory, mean=0.0,
                             std=1.0 / math.sqrt(config.d_input))
-
-        self.start_activated_state = nn.Parameter(
-            torch.zeros(config.d_model).uniform_(
-                -math.sqrt(1 / config.d_model), math.sqrt(1 / config.d_model)))
-        self.start_trace = nn.Parameter(
-            torch.zeros(config.d_model, config.memory_length).uniform_(
-                -math.sqrt(1 / (config.d_model + config.memory_length)),
-                math.sqrt(1 / (config.d_model + config.memory_length))))
-
-        self._init_synch(config)
-
-        self.output_proj = nn.Linear(self.synch_repr_out, config.hidden_size, bias=False)
-
-        self.draft_mode = getattr(config, 'draft_mode', 'none')
-        self.draft_slot_head = None
-        if self.draft_mode != 'none':
-            self.draft_slot_head = DraftSlotHead(
-                config, config.hidden_size, config.vocab_size)
-
-        self.post_ctm_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config.hidden_size)
-        self.resid_drop = nn.Dropout(config.dropout)
 
     def _calc_sizes(self, config):
         if config.neuron_select_type == 'random-pairing':
@@ -685,9 +638,7 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         extras['final_activated'] = activated
         extras['final_trace'] = state_trace
 
-        if extras:
-            return x, present_kv, extras
-        return x, present_kv
+        return BlockOutput(hidden=x, present_kv=present_kv, extras=extras)
 
 
 class CTMModel(nn.Module):
@@ -732,23 +683,23 @@ class CTMModel(nn.Module):
 
             if track and not is_last:
                 result = layer(h, track=True, return_all_ticks=False, **layer_kwargs)
-                h, present, extras = result
-                tracking_all[f'layer_{layer.layer_id}'] = extras['tracking']
+                h = result.hidden
+                present = result.present_kv
+                tracking_all[f'layer_{layer.layer_id}'] = result.extras['tracking']
             elif is_last and (track or return_all_ticks):
                 result = layer(h, track=track, return_all_ticks=True, **layer_kwargs)
-                h, present, extras = result
+                h = result.hidden
+                present = result.present_kv
                 if track:
-                    tracking_all[f'layer_{layer.layer_id}'] = extras.get('tracking', {})
+                    tracking_all[f'layer_{layer.layer_id}'] = result.extras.get('tracking', {})
                 if return_all_ticks:
-                    last_tick_outs = extras.get('tick_outputs')
-                    last_draft_slot_logits = extras.get('draft_slot_logits')
+                    last_tick_outs = result.extras.get('tick_outputs')
+                    last_draft_slot_logits = result.extras.get('draft_slot_logits')
             else:
                 result = layer(h, **layer_kwargs)
-                if len(result) == 3:
-                    h, present, extras = result
-                else:
-                    h, present = result
-                    extras = {}
+                h = result.hidden
+                present = result.present_kv
+                extras = result.extras
 
             if self.config.cross_layer_state and isinstance(extras, dict):
                 prev_activated = extras.get('final_activated', prev_activated)
@@ -759,21 +710,17 @@ class CTMModel(nn.Module):
 
         h = self.norm(h)
 
-        outputs = [h, presents]
-        if return_all_ticks:
-            outputs.append(last_tick_outs)
-            outputs.append(last_draft_slot_logits)
-        if track:
-            outputs.append(tracking_all)
-        if enable_tick_halt:
-            outputs.append(executed_ticks)
-
-        if len(outputs) == 2:
-            return tuple(outputs)
-        return tuple(outputs)
+        return ModelOutput(
+            hidden=h,
+            past_key_values=presents,
+            tick_outputs=last_tick_outs if return_all_ticks else None,
+            draft_slot_logits=last_draft_slot_logits if return_all_ticks else None,
+            tracking=tracking_all if track else None,
+            executed_ticks=executed_ticks if enable_tick_halt else None,
+        )
 
 
-class CTMForCausalLM(nn.Module):
+class CTMForCausalLM(BaseCTMForCausalLM):
     def __init__(self, config: CTMLLMConfig):
         super().__init__()
         self.config = config
@@ -787,7 +734,7 @@ class CTMForCausalLM(nn.Module):
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-        self.dino_enabled = float(getattr(config, 'dino_self_supervised_weight', 0.0)) > 0
+        self.dino_enabled = float(config.dino_self_supervised_weight) > 0
         self.dino_student_head = None
         self.dino_teacher_model = None
         self.dino_teacher_head = None
@@ -816,49 +763,11 @@ class CTMForCausalLM(nn.Module):
         else:
             self.register_buffer('dino_center', torch.zeros(1, 1, 1), persistent=False)
 
-    def _moe_aux_loss(self):
-        aux = None
-        for layer in self.model.layers:
-            value = getattr(layer, 'moe_aux_loss', None)
-            if value is None:
-                continue
-            aux = value if aux is None else aux + value
-        return aux
-
-    def _tick_horizon(self, tick, num_ticks):
-        mode = self.config.elf_horizon_mode
-        max_horizon = max(1, int(self.config.elf_max_horizon))
-        if mode == 'none':
-            return 1
-        if mode == 'linear':
-            return min(tick + 1, max_horizon)
-        if mode == 'pow2':
-            return min(2 ** tick, max_horizon)
-        raise ValueError(f"Unknown elf_horizon_mode: {mode}")
-
-    def _mtp_horizons(self):
-        mode = getattr(self.config, 'moe_mtp_mode', 'none')
-        raw = str(getattr(self.config, 'moe_mtp_horizons', '') or '')
-        if mode == 'none' or not raw.strip():
-            return []
-        horizons = []
-        for item in raw.split(','):
-            item = item.strip()
-            if not item:
-                continue
-            try:
-                horizon = int(item)
-            except ValueError:
-                continue
-            if horizon > 0 and horizon not in horizons:
-                horizons.append(horizon)
-        return horizons
-
     def _draft_mtp_horizons(self):
         horizons = self._mtp_horizons()
-        if getattr(self.config, 'draft_mode', 'none') == 'none':
+        if self.config.draft_mode == 'none':
             return horizons
-        block = max(1, int(getattr(self.config, 'draft_block_size', 1)))
+        block = max(1, int(self.config.draft_block_size))
         return [h for h in horizons if h > block]
 
     def _draft_slot_tick_loss(self, slot_logits, labels):
@@ -871,41 +780,10 @@ class CTMForCausalLM(nn.Module):
             losses.append(slot_loss)
         return torch.stack(losses, dim=1).mean(dim=1)
 
-    def _fast_output_ticks(self):
-        ticks = _parse_int_list(getattr(self.config, 'fast_output_ticks', '1,4'))
-        return [tick for tick in ticks if tick > 0]
-
-    def _reflex_logits(self, input_ids):
-        h = self.model.embed_tokens(input_ids)
-        h = h + self.reflex_adapter(h)
-        return self.lm_head(self.reflex_norm(h))
-
-    @staticmethod
-    def _lm_loss_from_logits(logits, labels):
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        return F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1), ignore_index=-100)
-
-    @staticmethod
-    def _distill_loss(student_logits, teacher_logits, labels):
-        if labels.size(1) <= 1:
-            return student_logits.new_zeros(())
-        student = student_logits[..., :-1, :].float()
-        teacher = teacher_logits[..., :-1, :].detach().float()
-        mask = labels[..., 1:] != -100
-        if not mask.any():
-            return student_logits.new_zeros(())
-        log_p = F.log_softmax(student, dim=-1)
-        q = F.softmax(teacher, dim=-1)
-        kl = F.kl_div(log_p, q, reduction='none').sum(dim=-1)
-        return (kl * mask).sum() / mask.sum().clamp(min=1)
-
     def update_dino_teacher(self):
         if not self.dino_enabled:
             return
-        momentum = float(getattr(self.config, 'dino_teacher_momentum', 0.996))
+        momentum = float(self.config.dino_teacher_momentum)
         with torch.no_grad():
             for student, teacher in zip(
                 self.model.parameters(), self.dino_teacher_model.parameters()
@@ -925,7 +803,7 @@ class CTMForCausalLM(nn.Module):
         self.dino_teacher_head.eval()
 
     def _dino_token_mask(self, input_ids, labels):
-        pad_id = int(getattr(self.config, 'dino_pad_token_id', 0))
+        pad_id = int(self.config.dino_pad_token_id)
         mask = input_ids != pad_id
         if labels is not None:
             mask = mask | (labels != -100)
@@ -942,7 +820,7 @@ class CTMForCausalLM(nn.Module):
         student_temp = max(float(self.config.dino_student_temperature), 1e-4)
         teacher_temp = max(float(self.config.dino_teacher_temperature), 1e-4)
         center_momentum = float(self.config.dino_center_momentum)
-        teacher_freq = max(1, int(getattr(self.config, 'dino_teacher_update_freq', 4)))
+        teacher_freq = max(1, int(self.config.dino_teacher_update_freq))
 
         student_logits = self.dino_student_head(student_hidden.float())
 
@@ -955,7 +833,7 @@ class CTMForCausalLM(nn.Module):
                 teacher_hidden = self.dino_teacher_model(
                     input_ids, use_cache=False, track=False, num_iters=teacher_ticks,
                     return_all_ticks=False,
-                )[0]
+                ).hidden
                 teacher_logits = self.dino_teacher_head(teacher_hidden.float())
                 batch_center = teacher_logits[token_mask].mean(dim=0, keepdim=True).view(1, 1, -1)
                 if dist.is_available() and dist.is_initialized():
@@ -977,113 +855,13 @@ class CTMForCausalLM(nn.Module):
         per_token_loss = -(teacher_probs.detach() * student_log_probs).sum(dim=-1)
         return per_token_loss[token_mask].mean()
 
-    def _fast_slow_output_loss(self, input_ids, labels, tick_outs, final_logits):
-        mode = getattr(self.config, 'fast_output_mode', 'none')
-        if mode == 'none':
-            return final_logits.new_zeros(())
-        aux = final_logits.new_zeros(())
-        distill_weight = float(getattr(self.config, 'fast_output_distill_weight', 0.0))
-        fast_weight = float(getattr(self.config, 'fast_output_weight', 0.0))
-        habit_weight = float(getattr(self.config, 'habit_output_weight', 0.0))
-        if fast_weight > 0:
-            reflex_logits = self._reflex_logits(input_ids)
-            aux = aux + fast_weight * self._lm_loss_from_logits(reflex_logits, labels)
-            if distill_weight > 0:
-                aux = aux + fast_weight * distill_weight * self._distill_loss(
-                    reflex_logits, final_logits, labels)
-        if habit_weight > 0 and tick_outs is not None:
-            num_ticks = tick_outs.size(-1)
-            tick_losses = []
-            distill_losses = []
-            for tick in self._fast_output_ticks():
-                idx = min(max(tick - 1, 0), num_ticks - 1)
-                logits_t = self.lm_head(tick_outs[..., idx])
-                tick_losses.append(self._lm_loss_from_logits(logits_t, labels))
-                if distill_weight > 0:
-                    distill_losses.append(self._distill_loss(logits_t, final_logits, labels))
-            if tick_losses:
-                aux = aux + habit_weight * torch.stack(tick_losses).mean()
-            if distill_losses:
-                aux = aux + habit_weight * distill_weight * torch.stack(distill_losses).mean()
-        return aux
-
-    @staticmethod
-    def _per_sample_lm_loss(logits, labels, horizon):
-        B = labels.size(0)
-        if labels.size(1) <= horizon:
-            return logits.new_zeros(B), logits.new_zeros(B, 0, dtype=torch.bool)
-        shift_logits = logits[..., :-horizon, :].contiguous()
-        shift_labels = labels[..., horizon:].contiguous()
-        label_mask = shift_labels != -100
-        per_token_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1), ignore_index=-100, reduction='none')
-        per_token_loss = per_token_loss.view(B, -1)
-        per_sample_loss = (
-            per_token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
-        return per_sample_loss, label_mask
-
-    @staticmethod
-    def _per_sample_entropy(logits, label_mask, horizon):
-        if label_mask.numel() == 0:
-            return logits.new_zeros(logits.size(0))
-        valid_logits = logits[..., :-horizon, :]
-        probs = F.softmax(valid_logits, dim=-1)
-        entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-        norm_ent = entropy / math.log(logits.size(-1))
-        return (norm_ent * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
-
-    def _combine_tick_losses(self, losses, certainties):
-        mode = self.config.tick_loss_mode
-        if self.config.tick_halt_mode != 'none':
-            tick_loss, _ = self._halt_weighted_tick_loss(losses, certainties)
-            return tick_loss
-        if mode == 'min_conf':
-            confidence = 1 - certainties
-            loss_min = losses.min(dim=1).values.mean()
-            best_conf_tick = confidence.argmax(dim=1)
-            batch_idx = torch.arange(losses.size(0), device=losses.device)
-            loss_conf = losses[batch_idx, best_conf_tick].mean()
-            return (loss_min + loss_conf) / 2.0
-        if mode == 'mean':
-            return losses.mean()
-        if mode == 'last':
-            return losses[:, -1].mean()
-        raise ValueError(f"Unknown tick_loss_mode: {mode}")
-
-    def _halt_weighted_tick_loss(self, losses, certainties):
-        mode = self.config.tick_halt_mode
-        confidence = 1 - certainties
-        if mode == 'confidence':
-            temp = max(float(self.config.tick_halt_temperature), 1e-4)
-            weights = torch.softmax(confidence / temp, dim=1)
-        elif mode == 'threshold':
-            threshold = float(self.config.tick_halt_threshold)
-            hit = confidence >= threshold
-            any_hit = hit.any(dim=1)
-            first_hit = hit.float().argmax(dim=1)
-            last_tick = torch.full_like(first_hit, losses.size(1) - 1)
-            selected = torch.where(any_hit, first_hit, last_tick)
-            weights = F.one_hot(selected, num_classes=losses.size(1)).type_as(losses)
-        else:
-            raise ValueError(f"Unknown tick_halt_mode: {mode}")
-
-        tick_loss = (losses * weights).sum(dim=1).mean()
-        if self.config.tick_compute_weight > 0:
-            tick_ids = torch.arange(1, losses.size(1) + 1, device=losses.device,
-                                    dtype=losses.dtype)
-            expected_tick = (weights * tick_ids.view(1, -1)).sum(dim=1)
-            compute_penalty = expected_tick.mean() / losses.size(1)
-            tick_loss = tick_loss + self.config.tick_compute_weight * compute_penalty
-        return tick_loss, weights
-
     def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
                 num_iters=None):
         enable_halt = self.config.tick_halt_mode != 'none' and not self.training
         result = self.model(
             input_ids, past_key_values, use_cache, track=False, num_iters=num_iters,
             halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
-        h, past_key_values = result[0], result[1]
+        h, past_key_values = result.hidden, result.past_key_values
         logits = self.lm_head(h)
         loss = None
         if labels is not None:
@@ -1101,16 +879,17 @@ class CTMForCausalLM(nn.Module):
             input_ids, track=False, num_iters=num_iters, return_all_ticks=True,
             halt_lm_head=self.lm_head, enable_tick_halt=False,
             draft_lm_head=self.lm_head)
-        h, tick_outs = result[0], result[2]
-        draft_slot_logits = result[3] if len(result) > 3 else None
+        h = result.hidden
+        tick_outs = result.tick_outputs
+        draft_slot_logits = result.draft_slot_logits
         num_ticks = tick_outs.size(-1)
 
         final_logits = self.lm_head(h)
         final_loss = self._lm_loss_from_logits(final_logits, labels)
 
-        draft_enabled = getattr(self.config, 'draft_mode', 'none') != 'none'
-        draft_block = max(1, int(getattr(self.config, 'draft_block_size', 1)))
-        draft_weight = float(getattr(self.config, 'draft_loss_weight', 0.0))
+        draft_enabled = self.config.draft_mode != 'none'
+        draft_block = max(1, int(self.config.draft_block_size))
+        draft_weight = float(self.config.draft_loss_weight)
         mtp_horizons = self._draft_mtp_horizons()
 
         losses = []
@@ -1163,20 +942,21 @@ class CTMForCausalLM(nn.Module):
             margin = float(self.config.tick_improve_margin)
             improve_loss = F.relu(next_losses[:, 1:] - next_losses[:, :-1] + margin).mean()
             tick_loss = tick_loss + self.config.tick_improve_weight * improve_loss
-        slow_weight = float(getattr(self.config, 'slow_output_weight', 0.0))
-        loss = (0.5 + slow_weight) * final_loss + 0.5 * tick_loss
+        slow_weight = float(self.config.slow_output_weight)
+        base_w = float(self.config.tick_loss_base_weight)
+        loss = (base_w + slow_weight) * final_loss + base_w * tick_loss
         fast_slow_aux = self._fast_slow_output_loss(
             input_ids, labels, tick_outs, final_logits)
         loss = loss + fast_slow_aux
-        dino_weight = float(getattr(self.config, 'dino_self_supervised_weight', 0.0))
+        dino_weight = float(self.config.dino_self_supervised_weight)
         if dino_weight > 0:
-            student_ticks = int(getattr(self.config, 'dino_student_ticks', 1))
+            student_ticks = int(self.config.dino_student_ticks)
             if student_ticks > 0 and student_ticks < (num_iters or 2):
                 with torch.no_grad():
                     student_h = self.model(
                         input_ids, track=False, num_iters=student_ticks,
                         return_all_ticks=False,
-                    )[0]
+                    ).hidden
             else:
                 student_h = h.detach()
             dino_loss = self._dino_self_supervised_loss(
@@ -1191,79 +971,10 @@ class CTMForCausalLM(nn.Module):
 
         return loss, losses, certainties
 
-    @torch.inference_mode()
-    def forward_track(self, input_ids, num_iters=None):
-        result = self.model(input_ids, track=True, num_iters=num_iters,
-                            return_all_ticks=False)
-        if len(result) == 3:
-            h, _, tracking = result
-        else:
-            h, _, _, tracking = result
-        logits = self.lm_head(h)
-        probs = torch.softmax(logits, dim=-1)
-        return tracking, logits, probs
-
-    @torch.inference_mode()
-    def generate(self, input_ids, max_new_tokens=512, temperature=0.85,
-                 top_p=0.85, top_k=50, eos_token_id=2, use_cache=True,
-                 repetition_penalty=1.0, num_iters=None):
-        past_kv = None
-        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
-
-        for _ in range(max_new_tokens):
-            inp = input_ids if past_kv is None else input_ids[:, -1:]
-            out = self.forward(inp, past_key_values=past_kv, use_cache=use_cache, num_iters=num_iters)
-            token_logits = out['logits'][:, -1, :] / temperature
-
-            if repetition_penalty != 1.0:
-                for i in range(input_ids.shape[0]):
-                    seen = torch.unique(input_ids[i])
-                    score = token_logits[i, seen]
-                    token_logits[i, seen] = torch.where(
-                        score > 0, score / repetition_penalty, score * repetition_penalty)
-
-            if top_k > 0:
-                top_k_eff = min(top_k, token_logits.size(-1))
-                topk_val = torch.topk(token_logits, top_k_eff)[0][..., -1, None]
-                token_logits[token_logits < topk_val] = float('-inf')
-
-            if top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(token_logits, descending=True)
-                cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                mask = cum_probs > top_p
-                mask[..., 1:] = mask[..., :-1].clone()
-                mask[..., 0] = False
-                token_logits[mask.scatter(1, sorted_idx, mask)] = float('-inf')
-
-            probs = torch.softmax(token_logits, dim=-1)
-            new_tokens = torch.multinomial(probs, num_samples=1)
-
-            if eos_token_id is not None:
-                new_tokens = torch.where(
-                    finished.unsqueeze(-1),
-                    new_tokens.new_full(new_tokens.shape, eos_token_id),
-                    new_tokens)
-
-            input_ids = torch.cat([input_ids, new_tokens], dim=-1)
-            past_kv = out['past_key_values'] if use_cache else None
-
-            if eos_token_id is not None:
-                finished |= new_tokens.squeeze(1).eq(eos_token_id)
-                if finished.all():
-                    break
-
-        return input_ids
-
-    def compute_certainties(self, logits_seq):
-        probs = F.softmax(logits_seq, dim=-1)
-        ent = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-        norm_ent = ent / math.log(logits_seq.size(-1))
-        return norm_ent
-
 
 def build_ctm_for_causal_lm(config: CTMLLMConfig):
     """Return sync CTM by default; async backend when banded clocks are enabled."""
-    if getattr(config, 'async_tick_mode', 'none') == 'banded':
+    if config.async_tick_mode == 'banded':
         from model.model_ctm_async import AsyncCTMForCausalLM
         return AsyncCTMForCausalLM(config)
     return CTMForCausalLM(config)
