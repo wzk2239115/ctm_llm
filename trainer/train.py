@@ -162,6 +162,10 @@ def current_moe_aux_loss(model):
     return float(value.detach().float().item())
 
 
+def current_dino_loss(model):
+    return float(getattr(model, 'last_dino_loss', 0.0))
+
+
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
                 tb_writer, swanlab, start_step=0, rank=0):
     model.train()
@@ -210,6 +214,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if hasattr(raw_model, 'update_dino_teacher'):
+                raw_model.update_dino_teacher()
 
         total_loss += loss.item() * args.accumulation_steps
         total_steps += 1
@@ -248,10 +254,11 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             pct = global_done / total_global * 100
             peak_mem_mb = cuda_memory_mb(args.device)
             moe_aux_loss = current_moe_aux_loss(raw_model)
+            dino_loss = current_dino_loss(raw_model)
 
             Logger(
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
-                f'loss:{avg_loss:.4f} lr:{lr:.2e} | '
+                f'loss:{avg_loss:.4f} dino:{dino_loss:.4f} lr:{lr:.2e} | '
                 f'best_tick:{best_tick_mean:.1f} conf_tick:{conf_tick_mean:.1f} | '
                 f'eff_tick:{effective_tick_mean:.1f} exec_tick:{executed_ticks_last_layer} | '
                 f'tok/s:{tokens_per_sec:.0f} mem:{peak_mem_mb:.0f}MB | '
@@ -268,6 +275,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'executed_ticks_last_layer': executed_ticks_last_layer,
                 'active_cell_fraction': active_cell_fraction(args),
                 'moe_aux_loss': moe_aux_loss,
+                'dino_loss': dino_loss,
                 'tokens_per_sec': tokens_per_sec,
                 'steps_per_sec': steps_per_sec,
                 'peak_memory_mb': peak_mem_mb,
@@ -296,6 +304,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'executed_ticks_last_layer': executed_ticks_last_layer,
                     'active_cell_fraction': active_cell_fraction(args),
                     'moe_aux_loss': moe_aux_loss,
+                    'dino_loss': dino_loss,
                     'losses_per_tick': json.dumps(losses_tick_mean),
                     'certainties_per_tick': json.dumps(certainties_tick_mean),
                     'tokens': total_tokens,
@@ -355,6 +364,15 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'slow_output_weight': args.slow_output_weight,
                     'fast_output_ticks': args.fast_output_ticks,
                     'fast_output_distill_weight': args.fast_output_distill_weight,
+                    'dino_self_supervised_weight': args.dino_self_supervised_weight,
+                    'dino_out_dim': args.dino_out_dim,
+                    'dino_hidden_dim': args.dino_hidden_dim,
+                    'dino_bottleneck_dim': args.dino_bottleneck_dim,
+                    'dino_student_temperature': args.dino_student_temperature,
+                    'dino_teacher_temperature': args.dino_teacher_temperature,
+                    'dino_center_momentum': args.dino_center_momentum,
+                    'dino_teacher_momentum': args.dino_teacher_momentum,
+                    'dino_pad_token_id': args.dino_pad_token_id,
                     'async_tick_mode': args.async_tick_mode,
                     'async_tick_periods': args.async_tick_periods,
                     'async_tick_phases': args.async_tick_phases,
@@ -495,6 +513,15 @@ if __name__ == '__main__':
     parser.add_argument('--slow_output_weight', type=float, default=0.0)
     parser.add_argument('--fast_output_ticks', type=str, default='1,4')
     parser.add_argument('--fast_output_distill_weight', type=float, default=0.0)
+    parser.add_argument('--dino_self_supervised_weight', type=float, default=0.0)
+    parser.add_argument('--dino_out_dim', type=int, default=4096)
+    parser.add_argument('--dino_hidden_dim', type=int, default=2048)
+    parser.add_argument('--dino_bottleneck_dim', type=int, default=256)
+    parser.add_argument('--dino_student_temperature', type=float, default=0.10)
+    parser.add_argument('--dino_teacher_temperature', type=float, default=0.04)
+    parser.add_argument('--dino_center_momentum', type=float, default=0.90)
+    parser.add_argument('--dino_teacher_momentum', type=float, default=0.996)
+    parser.add_argument('--dino_pad_token_id', type=int, default=0)
     parser.add_argument('--async_tick_mode', type=str, default='none',
                         choices=['none', 'banded'])
     parser.add_argument('--async_tick_periods', type=str, default='1,2,4,8')
@@ -626,6 +653,15 @@ if __name__ == '__main__':
         slow_output_weight=args.slow_output_weight,
         fast_output_ticks=args.fast_output_ticks,
         fast_output_distill_weight=args.fast_output_distill_weight,
+        dino_self_supervised_weight=args.dino_self_supervised_weight,
+        dino_out_dim=args.dino_out_dim,
+        dino_hidden_dim=args.dino_hidden_dim,
+        dino_bottleneck_dim=args.dino_bottleneck_dim,
+        dino_student_temperature=args.dino_student_temperature,
+        dino_teacher_temperature=args.dino_teacher_temperature,
+        dino_center_momentum=args.dino_center_momentum,
+        dino_teacher_momentum=args.dino_teacher_momentum,
+        dino_pad_token_id=args.dino_pad_token_id,
         async_tick_mode=args.async_tick_mode,
         async_tick_periods=args.async_tick_periods,
         async_tick_phases=args.async_tick_phases,
@@ -713,9 +749,15 @@ if __name__ == '__main__':
             if os.path.exists(resume_path):
                 start_epoch, start_step = load_checkpoint(
                     resume_path, model, optimizer, scaler, args.device)
+                raw = raw_model._orig_mod if hasattr(raw_model, '_orig_mod') else raw_model
+                if hasattr(raw, 'reset_dino_teacher'):
+                    raw.reset_dino_teacher()
             else:
                 state = torch.load(weight_path, map_location=args.device, weights_only=False)
                 model.load_state_dict(state, strict=False)
+                raw = raw_model._orig_mod if hasattr(raw_model, '_orig_mod') else raw_model
+                if hasattr(raw, 'reset_dino_teacher'):
+                    raw.reset_dino_teacher()
                 if rank == 0:
                     Logger(f'Loaded weights: {weight_path}')
 
