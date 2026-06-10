@@ -1140,9 +1140,11 @@ def effective_probe_budget_min(args):
 
 
 def prepare_probe_run_args(args):
-    batch_sizes = sorted(set(args.batch_sizes), reverse=True)
-    if args.fallback_batch_size is None:
-        args.fallback_batch_size = min(batch_sizes)
+    batch_sizes = getattr(args, "batch_sizes", None)
+    if batch_sizes:
+        batch_sizes = sorted(set(batch_sizes), reverse=True)
+        if getattr(args, "fallback_batch_size", None) is None:
+            args.fallback_batch_size = min(batch_sizes)
     if args.cmd in ("probe-and-run", "quick-probe") and args.master_addr is None:
         args.master_addr = "11.131.210.78"
     if args.cmd in ("probe-and-run", "quick-probe") and args.port is None:
