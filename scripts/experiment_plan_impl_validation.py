@@ -1157,7 +1157,8 @@ def print_execution_plan(args, base_plan, *, mode, probe_targets=None, profile=N
     pending_runs = total - len(done)
     qp_count = count_quick_probe_metrics(args.metrics_dir)
     has_profile = bool(args.batch_profile and os.path.exists(args.batch_profile))
-    has_quick = bool(args.quick_output and os.path.exists(args.quick_output))
+    quick_output = getattr(args, "quick_output", None)
+    has_quick = bool(quick_output and os.path.exists(quick_output))
     budget_min = effective_probe_budget_min(args)
     probe_targets = probe_targets or []
     profile = profile or {}
@@ -1174,7 +1175,7 @@ def print_execution_plan(args, base_plan, *, mode, probe_targets=None, profile=N
     print(f"formal_runs_pending={pending_runs} already_completed={len(done)}", flush=True)
     print(f"existing_qp_metrics={qp_count}", flush=True)
     print(f"batch_profile={args.batch_profile} exists={has_profile}", flush=True)
-    print(f"quick_profile={args.quick_output} exists={has_quick}", flush=True)
+    print(f"quick_profile={quick_output} exists={has_quick}", flush=True)
     if mode != "run-only":
         print(f"probe_targets={len(probe_targets)} max_probe_experiments={args.max_probe_experiments}", flush=True)
         print(f"max_probe_attempts={args.max_probe_attempts} probe_time_budget_min={budget_min or 'unlimited'}", flush=True)
@@ -1187,7 +1188,7 @@ def print_execution_plan(args, base_plan, *, mode, probe_targets=None, profile=N
         )
     if mode == "run-only":
         print("TIP: use run-only when batch_profile already exists to avoid repeating probe.", flush=True)
-    elif has_profile and not args.force_probe:
+    elif has_profile and not getattr(args, "force_probe", False):
         print("TIP: batch_profile exists; default is run-only unless --force_probe.", flush=True)
     elif qp_count >= max(32, total // 2):
         print(
@@ -2764,6 +2765,10 @@ def parse_args():
     p.add_argument("--node_groups", nargs="*", default=None)
     p.add_argument("--gpus_per_lane", type=int, default=2)
     p.add_argument("--gpus_per_node", type=int, default=8)
+    p.add_argument("--tail_full_nodes", action=argparse.BooleanOptionalAction, default=True,
+                   help="When few jobs remain, schedule each on a full node instead of a GPU lane.")
+    p.add_argument("--tail_full_nodes_threshold", type=int, default=None,
+                   help="Switch to full-node scheduling when queue+running <= this; default=number of physical nodes.")
     p.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     p.set_defaults(func=run_only)
 
