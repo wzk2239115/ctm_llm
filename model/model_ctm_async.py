@@ -738,16 +738,15 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
 
             if (
                 enable_tick_halt
+                and not self.training
                 and halt_lm_head is not None
                 and self.config.tick_halt_mode != 'none'
                 and tick + 1 < num_iters
             ):
                 with torch.no_grad():
                     logits = halt_lm_head(tick_out.detach())
-                    probs = F.softmax(logits, dim=-1)
-                    entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-                    confidence = 1 - entropy / math.log(logits.size(-1))
-                    if confidence.mean() >= float(self.config.tick_halt_threshold):
+                    if BaseCTMForCausalLM._halt_confidence_mean(logits) >= float(
+                            self.config.tick_halt_threshold):
                         break
 
         ctm_out = all_tick_outs[-1] if all_tick_outs is not None else \
@@ -861,7 +860,7 @@ class AsyncCTMForCausalLM(BaseCTMForCausalLM):
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
                 num_iters=None):
-        enable_halt = self.config.tick_halt_mode != 'none'
+        enable_halt = self.config.tick_halt_mode != 'none' and not self.training
         result = self.model(
             input_ids, past_key_values, use_cache, track=False, num_iters=num_iters,
             halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
@@ -879,10 +878,9 @@ class AsyncCTMForCausalLM(BaseCTMForCausalLM):
 
     def forward_train(self, input_ids, labels, num_iters=None):
         B = input_ids.size(0)
-        enable_halt = self.config.tick_halt_mode != 'none'
         result = self.model(
             input_ids, track=False, num_iters=num_iters, return_all_ticks=True,
-            halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
+            halt_lm_head=self.lm_head, enable_tick_halt=False)
         h = result.hidden
         tick_outs = result.tick_outputs
         num_ticks = tick_outs.size(-1)

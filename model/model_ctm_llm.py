@@ -614,10 +614,8 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
             if allow_halt_break and tick + 1 < num_iters:
                 with torch.no_grad():
                     logits = halt_lm_head(tick_out.detach())
-                    probs = F.softmax(logits, dim=-1)
-                    entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-                    confidence = 1 - entropy / math.log(logits.size(-1))
-                    if confidence.mean() >= float(self.config.tick_halt_threshold):
+                    if BaseCTMForCausalLM._halt_confidence_mean(logits) >= float(
+                            self.config.tick_halt_threshold):
                         break
 
         ctm_out = all_tick_outs[-1] if all_tick_outs is not None else \

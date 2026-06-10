@@ -72,10 +72,19 @@ class BaseCTMForCausalLM(nn.Module):
         mask = labels[..., 1:] != -100
         if not mask.any():
             return student_logits.new_zeros(())
-        log_p = F.log_softmax(student, dim=-1)
-        q = F.softmax(teacher, dim=-1)
-        kl = F.kl_div(log_p, q, reduction='none').sum(dim=-1)
-        return (kl * mask).sum() / mask.sum().clamp(min=1)
+        kl_sum = student.new_zeros(())
+        valid = mask.sum().clamp(min=1)
+        chunk = 64
+        for start in range(0, student.size(1), chunk):
+            end = min(start + chunk, student.size(1))
+            chunk_mask = mask[:, start:end]
+            if not chunk_mask.any():
+                continue
+            log_p = F.log_softmax(student[:, start:end, :], dim=-1)
+            q = F.softmax(teacher[:, start:end, :], dim=-1)
+            kl = F.kl_div(log_p, q, reduction='none').sum(dim=-1)
+            kl_sum = kl_sum + (kl * chunk_mask).sum()
+        return kl_sum / valid
 
     def _fast_slow_output_loss(self, input_ids, labels, tick_outs, final_logits):
         mode = self.config.fast_output_mode
@@ -123,15 +132,41 @@ class BaseCTMForCausalLM(nn.Module):
             per_token_loss * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
         return per_sample_loss, label_mask
 
+    _ENTROPY_CHUNK = 128
+
     @staticmethod
+    @torch.no_grad()
+    def _halt_confidence_mean(logits):
+        """Mean 1-normalized_entropy over all tokens; used for infer-time tick halt."""
+        vocab_log = math.log(logits.size(-1))
+        conf_parts = []
+        chunk = BaseCTMForCausalLM._ENTROPY_CHUNK
+        for start in range(0, logits.size(1), chunk):
+            end = min(start + chunk, logits.size(1))
+            chunk_logits = logits[:, start:end, :]
+            probs = F.softmax(chunk_logits, dim=-1)
+            entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
+            conf_parts.append(1 - entropy / vocab_log)
+        return torch.cat(conf_parts, dim=1).mean()
+
+    @staticmethod
+    @torch.no_grad()
     def _per_sample_entropy(logits, label_mask, horizon):
+        """Normalized token entropy for tick selection; no grad (argmax-only use)."""
         if label_mask.numel() == 0:
             return logits.new_zeros(logits.size(0))
         valid_logits = logits[..., :-horizon, :]
-        probs = F.softmax(valid_logits, dim=-1)
-        entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
-        norm_ent = entropy / math.log(logits.size(-1))
-        return (norm_ent * label_mask).sum(dim=1) / label_mask.sum(dim=1).clamp(min=1)
+        vocab_log = math.log(logits.size(-1))
+        ent_sums = logits.new_zeros(logits.size(0))
+        chunk = BaseCTMForCausalLM._ENTROPY_CHUNK
+        for start in range(0, valid_logits.size(1), chunk):
+            end = min(start + chunk, valid_logits.size(1))
+            chunk_logits = valid_logits[:, start:end, :]
+            probs = F.softmax(chunk_logits, dim=-1)
+            entropy = -(probs * torch.log(probs.clamp(min=1e-12))).sum(-1)
+            ent_sums += (entropy * label_mask[:, start:end]).sum(dim=1)
+        norm_ent = ent_sums / label_mask.sum(dim=1).clamp(min=1) / vocab_log
+        return norm_ent
 
     def _combine_tick_losses(self, losses, certainties):
         mode = self.config.tick_loss_mode

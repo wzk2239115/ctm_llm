@@ -43,7 +43,15 @@ DRAFT_STAGES = (
 DRAFT_PREFIXES = tuple(f"{stage}_" for stage in DRAFT_STAGES if stage != "all")
 
 
-def bs_for(d_model, *, draft=False, async_tick=False):
+def bs_for(
+    d_model,
+    *,
+    draft=False,
+    async_tick=False,
+    iterations=4,
+    elf_horizon=4,
+    fastslow=False,
+):
     if d_model <= 512:
         batch = 10
     elif d_model <= 1024:
@@ -54,9 +62,18 @@ def bs_for(d_model, *, draft=False, async_tick=False):
         batch = 4
     if draft:
         batch = max(2, batch - 2)
+    if async_tick:
+        batch = max(2, batch - 2)
+        if iterations >= 16 or fastslow:
+            batch = max(2, batch - 2)
+    if iterations >= 8:
+        batch = max(2, batch - 2)
+    if elf_horizon >= 8:
+        batch = max(2, batch - 2)
     if async_tick and d_model >= 1024:
         batch = max(2, batch - 1)
-    return batch
+    floor = 4 if d_model <= 512 else (3 if d_model <= 1024 else 2)
+    return max(floor, batch)
 
 
 def regional(
@@ -80,6 +97,11 @@ def regional(
     if diversity is None:
         diversity = 1e-3 if activation_passes >= 3 else 0.0
     if batch_size is None:
+        fastslow = (
+            kwargs.get("fast_output_mode", "none") != "none"
+            or float(kwargs.get("habit_output_weight", 0.0)) > 0
+            or float(kwargs.get("slow_output_weight", 0.0)) > 0
+        )
         batch_size = bs_for(
             d_model,
             draft=(
@@ -87,6 +109,9 @@ def regional(
                 or kwargs.get("residual_compute_mode", "none") != "none"
             ),
             async_tick=kwargs.get("async_tick_mode", "none") != "none",
+            iterations=iterations,
+            elf_horizon=int(kwargs.get("elf_max_horizon", 4)),
+            fastslow=fastslow,
         )
     base.add_regional_experiment(
         plan,
@@ -269,7 +294,6 @@ def build_plan(stage, plan_size="full"):
             tick_halt_threshold=0.30,
             tick_compute_weight=2e-3,
             max_steps=3500,
-            batch_size=6,
         )
 
     if stage in ("dr01", "all"):
@@ -334,7 +358,6 @@ def build_plan(stage, plan_size="full"):
                 moe_mtp_mode="mtp_1_2_4",
                 moe_mtp_horizons="1,2,4",
                 max_steps=3500,
-                batch_size=6,
             )
 
     if stage in ("dr02", "all"):

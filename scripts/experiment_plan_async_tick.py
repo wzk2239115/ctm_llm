@@ -42,7 +42,16 @@ DIFF_COMMON = dict(
 )
 
 
-def bs_for(d_model, *, halt=False, fastslow=False):
+def bs_for(
+    d_model,
+    *,
+    halt=False,
+    fastslow=False,
+    async_tick=False,
+    iterations=4,
+    elf_horizon=4,
+    mtp=False,
+):
     if d_model <= 512:
         batch = 12
     elif d_model <= 768:
@@ -53,7 +62,20 @@ def bs_for(d_model, *, halt=False, fastslow=False):
         batch = 6
     else:
         batch = 4
-    return batch
+    if halt:
+        batch = max(2, batch - 2)
+    if fastslow or async_tick:
+        batch = max(2, batch - 2)
+    if mtp:
+        batch = max(2, batch - 1)
+    if iterations >= 8:
+        batch = max(2, batch - 2)
+    if iterations >= 16 and (fastslow or async_tick or mtp):
+        batch = max(2, batch - 2)
+    if elf_horizon >= 8:
+        batch = max(2, batch - 2)
+    floor = 4 if d_model <= 512 else (3 if d_model <= 1024 else 2)
+    return max(floor, batch)
 
 
 def regional(
@@ -76,6 +98,24 @@ def regional(
 ):
     d_model = num_experts * expert_size
     halt = halt_mode != "none"
+    fastslow = (
+        kwargs.get("fast_output_mode", "none") != "none"
+        or float(kwargs.get("habit_output_weight", 0.0)) > 0
+        or float(kwargs.get("slow_output_weight", 0.0)) > 0
+    )
+    async_tick = kwargs.get("async_tick_mode", "none") != "none"
+    mtp = (mtp_mode or kwargs.get("moe_mtp_mode", "none")) not in ("none", "")
+    batch_size = kwargs.pop("batch_size", None)
+    if batch_size is None:
+        batch_size = bs_for(
+            d_model,
+            halt=halt,
+            fastslow=fastslow,
+            async_tick=async_tick,
+            iterations=iterations,
+            elf_horizon=int(kwargs.get("elf_max_horizon", 4)),
+            mtp=mtp,
+        )
     base.add_regional_experiment(
         plan,
         name,
@@ -95,7 +135,7 @@ def regional(
         moe_mtp_mode=mtp_mode,
         moe_mtp_horizons=mtp_horizons,
         max_steps=max_steps,
-        batch_size=kwargs.pop("batch_size", bs_for(d_model, halt=halt)),
+        batch_size=batch_size,
         **kwargs,
     )
 
@@ -134,8 +174,6 @@ def fastslow(
         mtp_mode="mtp_1_2_4",
         mtp_horizons="1,2,4",
         max_steps=max_steps,
-        batch_size=kwargs.pop(
-            "batch_size", bs_for(num_experts * expert_size, fastslow=True)),
         **kwargs,
     )
 
@@ -475,7 +513,6 @@ def build_plan(stage, plan_size="full"):
                     tick_improve_weight=0.03 if iters >= 8 else 0.01,
                     memory_length=memory_length,
                     max_steps=4500,
-                    batch_size=bs_for(num_experts * expert_size, halt=True, fastslow=True),
                 )
                 if use_diff:
                     kwargs.update(
@@ -625,7 +662,6 @@ def build_plan(stage, plan_size="full"):
                 mtp_mode="mtp_1_2_4",
                 mtp_horizons="1,2,4",
                 max_steps=4500,
-                batch_size=6,
             )
 
         regional(
@@ -654,7 +690,6 @@ def build_plan(stage, plan_size="full"):
             mtp_mode="mtp_1_2_4",
             mtp_horizons="1,2,4",
             max_steps=5000,
-            batch_size=6,
             **DIFF_COMMON,
         )
 
