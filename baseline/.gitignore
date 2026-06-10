@@ -17,6 +17,7 @@ data/*
 !data/custom_datasets.py
 !data/mazes/
 !data/MNIST/
+!data/imagenet/
 examples/*
 !examples/01_mnist.ipynb
 !examples/02_inference.ipynb
