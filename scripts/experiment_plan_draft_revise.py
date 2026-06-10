@@ -41,6 +41,8 @@ DRAFT_STAGES = (
     "all",
 )
 DRAFT_PREFIXES = tuple(f"{stage}_" for stage in DRAFT_STAGES if stage != "all")
+# Match experiment_plan_impl_validation regional default (iv01+ backend runs).
+DEFAULT_MAX_STEPS = 1000
 
 
 def bs_for(
@@ -83,7 +85,7 @@ def regional(
     *,
     num_experts=16,
     expert_size=32,
-    max_steps=3500,
+    max_steps=DEFAULT_MAX_STEPS,
     iterations=8,
     activation_passes=4,
     topk_experts=1,
@@ -261,7 +263,6 @@ def build_plan(stage, plan_size="full"):
             expert_size=32,
             iterations=4,
             activation_passes=4,
-            max_steps=2500,
         )
         regional(
             plan,
@@ -271,7 +272,6 @@ def build_plan(stage, plan_size="full"):
             expert_size=64,
             iterations=4,
             activation_passes=4,
-            max_steps=2500,
         )
         regional(
             plan,
@@ -293,7 +293,6 @@ def build_plan(stage, plan_size="full"):
             tick_halt_mode="threshold",
             tick_halt_threshold=0.30,
             tick_compute_weight=2e-3,
-            max_steps=3500,
         )
 
     if stage in ("dr01", "all"):
@@ -307,7 +306,6 @@ def build_plan(stage, plan_size="full"):
             activation_passes=4,
             moe_mtp_mode="mtp_1_2_4",
             moe_mtp_horizons="1,2,4",
-            max_steps=3000,
         )
         regional(
             plan,
@@ -319,7 +317,6 @@ def build_plan(stage, plan_size="full"):
             activation_passes=4,
             elf_horizon_mode="linear",
             elf_max_horizon=4,
-            max_steps=3000,
         )
         regional(
             plan,
@@ -332,7 +329,6 @@ def build_plan(stage, plan_size="full"):
             elf_horizon_mode="linear",
             elf_max_horizon=8,
             tick_improve_weight=0.05,
-            max_steps=3000,
         )
         if base.include_plan_size(plan_size, "full"):
             regional(
@@ -357,7 +353,6 @@ def build_plan(stage, plan_size="full"):
                 tick_compute_weight=2e-3,
                 moe_mtp_mode="mtp_1_2_4",
                 moe_mtp_horizons="1,2,4",
-                max_steps=3500,
             )
 
     if stage in ("dr02", "all"):
@@ -377,7 +372,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=3500,
                     **draft_args(mode="parallel", block=block, head=head, loss=0.2),
                 )
 
@@ -397,7 +391,6 @@ def build_plan(stage, plan_size="full"):
                 elf_horizon_mode="linear",
                 elf_max_horizon=4,
                 tick_improve_weight=0.05,
-                max_steps=3500,
                 **draft_args(mode="parallel", block=4, head=head, loss=0.2),
             )
 
@@ -411,7 +404,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=8,
                 activation_passes=4,
-                max_steps=4000,
                 **draft_args(
                     mode="revise",
                     block=4,
@@ -431,7 +423,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=4000,
                     **draft_args(
                         mode="revise",
                         block=8,
@@ -453,7 +444,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=8,
                 activation_passes=4,
-                max_steps=4000,
                 **draft_args(
                     mode="revise",
                     block=4,
@@ -475,7 +465,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=4500,
                     **draft_args(
                         mode="revise",
                         block=8,
@@ -500,7 +489,6 @@ def build_plan(stage, plan_size="full"):
                     iterations=8,
                     activation_passes=4,
                     memory_length=8,
-                    max_steps=4500,
                     **draft_args(
                         mode="revise",
                         block=4,
@@ -524,7 +512,6 @@ def build_plan(stage, plan_size="full"):
                     iterations=8,
                     activation_passes=4,
                     memory_length=10,
-                    max_steps=5000,
                     **draft_args(
                         mode="revise",
                         block=block,
@@ -539,12 +526,12 @@ def build_plan(stage, plan_size="full"):
 
     if stage in ("dr06", "all"):
         combos = [
-            ("b4", 4, 8, "1,2,4,8", 0.20, 3500),
-            ("b8", 8, 12, "1,2,4,8", 0.20, 4500),
+            ("b4", 4, 8, "1,2,4,8", 0.20),
+            ("b8", 8, 12, "1,2,4,8", 0.20),
         ]
         if base.include_plan_size(plan_size, "wide"):
-            combos.append(("b12", 12, 16, "1,4,8,16", 0.25, 5500))
-        for tag, block, ticks, periods, fast_w, steps in combos:
+            combos.append(("b12", 12, 16, "1,4,8,16", 0.25))
+        for tag, block, ticks, periods, fast_w in combos:
             regional(
                 plan,
                 f"dr06_full_async_sparse_revise_{tag}_d512",
@@ -565,7 +552,6 @@ def build_plan(stage, plan_size="full"):
                 tick_halt_mode="threshold",
                 tick_halt_threshold=0.30,
                 tick_compute_weight=2e-3,
-                max_steps=steps,
                 batch_size=5 if block >= 8 else 6,
                 **draft_args(
                     mode="revise",
@@ -594,7 +580,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=8,
                 activation_passes=4,
-                max_steps=4000,
                 **speed_args(decays=decays, weight=0.05),
             )
         for weight in ([0.02, 0.05] if plan_size == "core" else [0.01, 0.03, 0.07, 0.12]):
@@ -606,7 +591,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=8,
                 activation_passes=4,
-                max_steps=4000,
                 **speed_args(weight=weight),
             )
         if base.include_plan_size(plan_size, "full"):
@@ -623,7 +607,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=4000,
                     **speed_args(center=center, teacher_temp=teacher_temp),
                 )
             regional(
@@ -646,7 +629,6 @@ def build_plan(stage, plan_size="full"):
                 tick_halt_mode="threshold",
                 tick_halt_threshold=0.30,
                 tick_compute_weight=2e-3,
-                max_steps=5000,
                 batch_size=5,
                 **draft_args(
                     mode="revise",
@@ -680,7 +662,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=8,
                 activation_passes=4,
-                max_steps=3500,
                 **residual_args(
                     mode="observe",
                     synapse=synapse,
@@ -701,7 +682,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=3500,
                     **residual_args(
                         mode="observe",
                         synapse="dense_delta",
@@ -729,7 +709,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=8,
                 activation_passes=4,
-                max_steps=4000,
                 **residual_args(
                     mode="block_skip",
                     synapse="block_delta_skip",
@@ -753,7 +732,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=4000,
                     **residual_args(
                         mode="block_skip",
                         synapse="block_delta_skip",
@@ -780,7 +758,6 @@ def build_plan(stage, plan_size="full"):
                     iterations=8,
                     activation_passes=4,
                     memory_length=10,
-                    max_steps=4500,
                     **residual_args(
                         mode="nlm_recursive",
                         synapse="block_delta_skip",
@@ -804,7 +781,6 @@ def build_plan(stage, plan_size="full"):
                     iterations=8,
                     activation_passes=4,
                     memory_length=memory_length,
-                    max_steps=5000,
                     **residual_args(
                         mode="nlm_recursive",
                         synapse="block_delta_skip",
@@ -832,7 +808,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=12,
                 activation_passes=4,
-                max_steps=5000,
                 **residual_args(
                     mode="tick_controller",
                     synapse="block_delta_skip",
@@ -858,7 +833,6 @@ def build_plan(stage, plan_size="full"):
                 async_tick_mode="banded",
                 async_tick_periods="1,2,4,8",
                 async_fast_output_weight=0.20,
-                max_steps=5000,
                 batch_size=5,
                 **residual_args(
                     mode="speed_cells",
@@ -893,7 +867,6 @@ def build_plan(stage, plan_size="full"):
                 slow_output_weight=0.10,
                 fast_output_ticks="1,4,8,12,16",
                 fast_output_distill_weight=0.10,
-                max_steps=6000,
                 batch_size=4,
                 **draft_args(
                     mode="revise",
@@ -940,7 +913,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=8,
                 activation_passes=4,
-                max_steps=4000,
                 **objective_args(mode=mode, denoise=denoise, ce=ce),
             )
         if base.include_plan_size(plan_size, "full"):
@@ -953,7 +925,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=4000,
                     **objective_args(
                         mode="hybrid_flow_ce",
                         denoise=denoise,
@@ -969,7 +940,6 @@ def build_plan(stage, plan_size="full"):
                     expert_size=32,
                     iterations=8,
                     activation_passes=4,
-                    max_steps=4000,
                     **objective_args(
                         mode="hybrid_flow_ce",
                         denoise=0.5,
@@ -985,7 +955,6 @@ def build_plan(stage, plan_size="full"):
                 expert_size=32,
                 iterations=12,
                 activation_passes=4,
-                max_steps=5000,
                 batch_size=5,
                 **objective_args(
                     mode="hybrid_flow_ce",
