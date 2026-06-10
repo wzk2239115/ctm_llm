@@ -980,10 +980,15 @@ def build_plan(stage, plan_size="full"):
     return base.validate_plan(plan)
 
 
-base.configure_plan_defaults(metrics_prefix="draft_revise", dispatch_block_sparse=False)
+base.configure_plan_defaults(
+    metrics_prefix="draft_revise",
+    dispatch_block_sparse=False,
+    build_plan=build_plan,
+    stages=DRAFT_STAGES,
+    prefixes=DRAFT_PREFIXES,
+)
 base.REGIONAL_STAGES = DRAFT_STAGES
 base.REGIONAL_PREFIXES = DRAFT_PREFIXES
-base.build_plan = build_plan
 
 
 def normalize_default_outputs(args):
