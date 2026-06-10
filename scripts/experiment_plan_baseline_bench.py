@@ -11,14 +11,20 @@ Usage (on compute machine, 8×H100):
     # Dry-run: print plan only
     python scripts/experiment_plan_baseline_bench.py plan
 
-    # Submit to cluster pool
-    python scripts/experiment_plan_baseline_bench.py submit
+    # Write CSV
+    python scripts/experiment_plan_baseline_bench.py csv
 
-    # Run a single experiment by name
-    python scripts/experiment_plan_baseline_bench.py run bl00_parity_ctm_paper
+    # Run a single experiment by name (locally)
+    python scripts/experiment_plan_baseline_bench.py run --name bl00_parity_ctm_paper
 
-    # Run all in a stage
-    python scripts/experiment_plan_baseline_bench.py run-stage bl00
+    # Submit all to cluster pool (sequentially)
+    python scripts/experiment_plan_baseline_bench.py submit --stage bl00
+
+    # Submit all stages to cluster pool
+    python scripts/experiment_plan_baseline_bench.py submit --stage all
+
+    # Run a full stage sequentially on this machine
+    python scripts/experiment_plan_baseline_bench.py run-stage --stage bl00
 
 Output:
     scripts/runs/baseline_bench/{name}.log
@@ -26,18 +32,22 @@ Output:
 """
 
 import csv
+import json
 import os
+import shlex
 import subprocess
 import sys
-import argparse
-import json
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 RUNS_DIR = SCRIPTS / "runs" / "baseline_bench"
 METRICS_DIR = SCRIPTS / "runs" / "metrics"
+DEFAULT_CONFIG = "infra/envs/smoke_baseline.env"
+DEFAULT_MASTER_ADDR = "11.131.210.78"
+DEFAULT_PORT = 8765
 
 STAGES = (
     "bl00", "bl01", "bl02", "bl03", "bl04", "bl05", "bl06",
@@ -49,24 +59,29 @@ METRICS_PREFIX = "baseline_bench"
 
 # ─── helpers ───────────────────────────────────────────────────────────
 
-def _p(train_script, extra_args=None):
-    cmd = ["python", "-m", train_script]
+def _p(train_module, extra_args=None):
+    """Build a command string: <module> --flag1 val1 --flag2 val2 ...
+    
+    For direct execution: python -m <result>
+    For pool submission: <result> (run_via_pool.sh adds python -m)
+    """
+    parts = [train_module]
     if extra_args:
         for k, v in extra_args.items():
             if v is None:
                 continue
             if isinstance(v, bool):
                 if v:
-                    cmd.append(f"--{k}")
+                    parts.append(f"--{k}")
                 else:
-                    cmd.append(f"--no-{k}")
+                    parts.append(f"--no-{k}")
             elif isinstance(v, list):
-                cmd.append(f"--{k}")
-                cmd.extend(str(x) for x in v)
+                parts.append(f"--{k}")
+                parts.extend(str(x) for x in v)
             else:
-                cmd.append(f"--{k}")
-                cmd.append(str(v))
-    return " ".join(cmd)
+                parts.append(f"--{k}")
+                parts.append(str(v))
+    return " ".join(parts)
 
 
 def exp(name, question, command, tags=None):
@@ -1015,11 +1030,84 @@ def print_plan_summary(plan):
 
 # ─── CLI ────────────────────────────────────────────────────────────────
 
+def submit_to_pool(exp, config, master_addr=None, port=None):
+    """Submit a baseline experiment to the cluster pool.
+    
+    The pool worker runs: bash scripts/train_cluster.sh --config <config> <extra_args>
+    With smoke_baseline.env, TRAIN_ENTRY=scripts/run_via_pool.sh, which executes
+    `python -m $TRAIN_ARGS`. So extra_args is the task module + flags.
+    """
+    node_addrs = exp.get("node_addrs") or []
+    payload = {
+        "config": config,
+        "extra_args": exp["command"],
+        "node_addrs": node_addrs,
+    }
+    base = f"http://{master_addr}:{port}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{base}/submit",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        resp = opener.open(req, timeout=10)
+        result = json.loads(resp.read())
+        return result.get("task") or result
+    except Exception as e:
+        print(f"[submit] error: {e}")
+        return None
+
+
+def wait_until_idle(master_addr, port, task_id, poll_interval=30.0):
+    """Poll pool until the task is completed or failed."""
+    base = f"http://{master_addr}:{port}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    final = {"completed", "failed", "cancelled"}
+    while True:
+        try:
+            resp = opener.open(f"{base}/status", timeout=10)
+            status = json.loads(resp.read())
+            tasks = status.get("tasks", [])
+            for t in tasks:
+                if t["task_id"] == task_id and t["status"] in final:
+                    print(f"  [pool] task {task_id} → {t['status']}")
+                    return t["status"]
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+
+def run_submit(args):
+    """Submit experiments to the cluster pool, one at a time (sequential)."""
+    plan = build_plan(args.stage)
+    if not plan:
+        print("No experiments to submit.")
+        return
+    print(f"Submitting {len(plan)} experiments to pool at {args.master_addr}:{args.port}")
+    for i, e in enumerate(plan):
+        print(f"\n[{i+1}/{len(plan)}] {e['name']}")
+        print(f"  {e['question']}")
+        task = submit_to_pool(e, args.config, args.master_addr, args.port)
+        if task and "task_id" in task:
+            tid = task["task_id"]
+            print(f"  submitted as {tid}, waiting...")
+            wait_until_idle(args.master_addr, args.port, tid, args.poll_interval)
+        else:
+            print(f"  WARNING: submit failed, skipping")
+            continue
+    print(f"\nAll {len(plan)} experiments submitted and completed.")
+
+
 def main():
+    import argparse
     parser = argparse.ArgumentParser(description="Baseline CTM Benchmark")
-    parser.add_argument("action", choices=["plan", "csv", "run", "run-stage", "count"],
-                        help="Action: plan=print, csv=write CSV, run=execute one, "
-                             "run-stage=execute stage, count=show totals")
+    parser.add_argument("action",
+                        choices=["plan", "csv", "run", "run-stage", "count", "submit", "commands"],
+                        help="Action: plan=print summary, csv=write CSV, run=execute one, "
+                             "run-stage=execute stage sequentially, submit=submit to pool, "
+                             "commands=print all commands, count=show totals")
     parser.add_argument("--name", type=str, help="Experiment name (for 'run')")
     parser.add_argument("--stage", type=str, default="all",
                         help="Stage to build (default: all)")
@@ -1027,6 +1115,11 @@ def main():
                         choices=["core", "full", "wide"])
     parser.add_argument("--output", type=str,
                         default=str(RUNS_DIR / "baseline_bench_plan.csv"))
+    parser.add_argument("--config", type=str, default=DEFAULT_CONFIG,
+                        help="Cluster env file for pool submit")
+    parser.add_argument("--master_addr", type=str, default=DEFAULT_MASTER_ADDR)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--poll_interval", type=float, default=30.0)
     args = parser.parse_args()
 
     plan = build_plan(args.stage, args.plan_size)
@@ -1048,6 +1141,11 @@ def main():
         for s, exps in sorted(stages.items()):
             print(f"  {s}: {len(exps)}")
 
+    elif args.action == "commands":
+        for e in plan:
+            print(f"\n# {e['name']}: {e['question']}")
+            print(e["command"])
+
     elif args.action == "run":
         if not args.name:
             print("Error: --name required for 'run'")
@@ -1061,13 +1159,13 @@ def main():
             print(f"Error: experiment '{args.name}' not found")
             sys.exit(1)
         print(f"Running: {target['name']}")
-        print(f"Command: {target['command']}")
-        os.system(target["command"])
+        print(f"Command: python -m {target['command']}")
+        sys.exit(os.system(f"python -m {target['command']}"))
 
     elif args.action == "run-stage":
-        stage = args.stage if args.stage != "all" else args.name
+        stage = args.stage
         if not stage or stage == "all":
-            print("Error: specify --stage for run-stage")
+            print("Error: specify --stage for run-stage (not 'all')")
             sys.exit(1)
         stage_exps = [e for e in plan if e["name"].startswith(stage + "_")]
         if not stage_exps:
@@ -1080,11 +1178,14 @@ def main():
             print(f"  [{e['name']}] → {log_path}")
             with open(log_path, "w") as log_f:
                 proc = subprocess.run(
-                    e["command"], shell=True, cwd=str(ROOT),
+                    f"python -m {e['command']}", shell=True, cwd=str(ROOT),
                     stdout=log_f, stderr=subprocess.STDOUT,
                 )
             status = "OK" if proc.returncode == 0 else f"FAIL({proc.returncode})"
             print(f"  [{e['name']}] {status}")
+
+    elif args.action == "submit":
+        run_submit(args)
 
 
 if __name__ == "__main__":
