@@ -10,6 +10,7 @@ from model.residual_compute import (
     run_block_delta_synapse,
     run_grouped_block_delta_synapse,
 )
+from model.nlm_recursive import apply_recursive_nlm
 
 
 class RegionalMoEMixin:
@@ -17,21 +18,56 @@ class RegionalMoEMixin:
 
     def _init_residual_skip_tracking(self):
         self._residual_synapse_cache = {}
+        self._residual_nlm_cache = None
         self._residual_skip_total = 0.0
         self._residual_skip_count = 0
+        self._residual_nlm_fast_total = 0.0
+        self._residual_nlm_fast_count = 0
         self.last_residual_skip_ratio = 0.0
+        self.last_nlm_fast_ratio = 0.0
 
     def _accumulate_residual_skip(self, skip_ratio):
         self._residual_skip_total += float(skip_ratio)
         self._residual_skip_count += 1
 
+    def _accumulate_nlm_fast(self, fast_ratio):
+        self._residual_nlm_fast_total += float(fast_ratio)
+        self._residual_nlm_fast_count += 1
+
     def _consume_residual_skip_ratio(self):
         if self._residual_skip_count <= 0:
-            return 0.0
-        ratio = self._residual_skip_total / self._residual_skip_count
+            skip_ratio = 0.0
+        else:
+            skip_ratio = self._residual_skip_total / self._residual_skip_count
         self._residual_skip_total = 0.0
         self._residual_skip_count = 0
-        return ratio
+        return skip_ratio
+
+    def _consume_nlm_fast_ratio(self):
+        if self._residual_nlm_fast_count <= 0:
+            fast_ratio = 0.0
+        else:
+            fast_ratio = self._residual_nlm_fast_total / self._residual_nlm_fast_count
+        self._residual_nlm_fast_total = 0.0
+        self._residual_nlm_fast_count = 0
+        return fast_ratio
+
+    def _apply_trace_nlm(self, trace_module, state_trace, tick_idx, cache_key='default'):
+        cache_map = self._residual_nlm_cache
+        if cache_map is None:
+            cache_map = {}
+        cache_entry = cache_map.get(cache_key)
+        activated, new_entry, fast_ratio = apply_recursive_nlm(
+            trace_module,
+            state_trace,
+            cache_entry,
+            self.config,
+            tick_idx,
+        )
+        cache_map[cache_key] = new_entry
+        self._residual_nlm_cache = cache_map
+        self._accumulate_nlm_fast(fast_ratio)
+        return activated
 
     def _apply_moe_group_sparsity(self, activated):
         expert_size = self.moe_expert_size
@@ -249,7 +285,8 @@ class RegionalMoEMixin:
             state = self.synapses(pre_syn)
         new_trace = torch.cat(
             [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
-        return self.trace_processor(new_trace), new_trace
+        return self._apply_trace_nlm(
+            self.trace_processor, new_trace, tick_idx, cache_key=f'layer{self.layer_id}:route'), new_trace
 
     def _run_group_sparse_regional_tick(
         self, attn, activated, state_trace, prev_sync_o_activated, tick_idx=0,
@@ -378,8 +415,12 @@ class RegionalMoEMixin:
                 prev_trace = flat_trace[token_idx, start:end, -mem_len:]
                 new_trace = torch.cat(
                     [prev_trace[:, :, 1:], state.unsqueeze(-1)], dim=-1)
-                group_active = trace_module(
-                    new_trace.unsqueeze(1)).squeeze(1)
+                group_active = self._apply_trace_nlm(
+                    trace_module,
+                    new_trace.unsqueeze(1),
+                    tick_idx,
+                    cache_key=block['key'],
+                ).squeeze(1)
                 flat_trace[token_idx, start:end, -mem_len:] = new_trace
                 flat_active[token_idx, start:end] = group_active * gate_scale
                 merged_trace[token_idx, start:end, -mem_len:] = new_trace

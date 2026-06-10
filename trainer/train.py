@@ -178,6 +178,10 @@ def current_residual_skip_ratio(model):
     return float(getattr(model, 'last_residual_skip_ratio', 0.0))
 
 
+def current_nlm_fast_ratio(model):
+    return float(getattr(model, 'last_nlm_fast_ratio', 0.0))
+
+
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
                 tb_writer, swanlab, start_step=0, rank=0):
     model.train()
@@ -272,6 +276,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             speed_loss = current_speed_loss(raw_model)
             residual_delta_l1 = current_residual_delta_l1(raw_model)
             residual_skip_ratio = current_residual_skip_ratio(raw_model)
+            nlm_fast_ratio = current_nlm_fast_ratio(raw_model)
 
             Logger(
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
@@ -296,6 +301,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'speed_loss': speed_loss,
                 'residual_delta_l1': residual_delta_l1,
                 'residual_skip_ratio': residual_skip_ratio,
+                'nlm_fast_ratio': nlm_fast_ratio,
                 'tokens_per_sec': tokens_per_sec,
                 'steps_per_sec': steps_per_sec,
                 'peak_memory_mb': peak_mem_mb,
@@ -328,6 +334,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'speed_loss': speed_loss,
                     'residual_delta_l1': residual_delta_l1,
                     'residual_skip_ratio': residual_skip_ratio,
+                    'nlm_fast_ratio': nlm_fast_ratio,
                     'losses_per_tick': json.dumps(losses_tick_mean),
                     'certainties_per_tick': json.dumps(certainties_tick_mean),
                     'tokens': total_tokens,

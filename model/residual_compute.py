@@ -15,9 +15,10 @@ def residual_enabled(config: CTMLLMConfig):
 
 
 def block_skip_enabled(config: CTMLLMConfig):
-    return (
-        config.residual_compute_mode in ('block_skip', 'gate', 'skip')
-        and config.residual_synapse_mode in ('block_delta_skip', 'sparse_delta')
+    if config.residual_synapse_mode not in ('block_delta_skip', 'sparse_delta'):
+        return False
+    return config.residual_compute_mode in (
+        'block_skip', 'gate', 'skip', 'nlm_recursive',
     )
 
 
@@ -127,7 +128,13 @@ def run_grouped_block_delta_synapse(pre_syn, synapse_module, cache, config, tick
     return merged, cache, skip_ratio
 
 
-def compute_residual_metrics(tick_outs, final_hidden, config: CTMLLMConfig, skip_ratio=0.0):
+def compute_residual_metrics(
+    tick_outs,
+    final_hidden,
+    config: CTMLLMConfig,
+    skip_ratio=0.0,
+    nlm_fast_ratio=0.0,
+):
     """Track tick deltas and optional regularizers for residual-compute runs."""
     zero = tick_outs.new_zeros(()) if tick_outs is not None else final_hidden.new_zeros(())
     metric = float(skip_ratio)
@@ -140,7 +147,11 @@ def compute_residual_metrics(tick_outs, final_hidden, config: CTMLLMConfig, skip
         if final_hidden is not None and tick_outs.size(-1) >= 1:
             hidden_delta_l1 = (final_hidden - tick_outs[..., -1]).abs().mean()
         delta_l1 = 0.5 * (tick_delta_l1 + hidden_delta_l1)
-        metric = 0.5 * (float(delta_l1.detach().float().item()) + float(skip_ratio))
+        metric = 0.5 * (
+            float(delta_l1.detach().float().item())
+            + float(skip_ratio)
+            + float(nlm_fast_ratio)
+        )
 
     penalty = zero
     delta_weight = float(config.residual_delta_l1_weight)
@@ -152,8 +163,11 @@ def compute_residual_metrics(tick_outs, final_hidden, config: CTMLLMConfig, skip
         ref = tick_outs if tick_outs is not None else final_hidden
         if ref is None:
             return penalty, metric
-        if block_skip_enabled(config):
-            executed_ratio = max(0.0, 1.0 - float(skip_ratio))
+        executed_ratio = max(
+            0.0,
+            1.0 - 0.5 * float(skip_ratio) - 0.5 * float(nlm_fast_ratio),
+        )
+        if block_skip_enabled(config) or config.residual_compute_mode == 'nlm_recursive':
             penalty = penalty + compute_weight * ref.new_tensor(executed_ratio)
         else:
             penalty = penalty + compute_weight * delta_l1

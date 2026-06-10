@@ -113,10 +113,40 @@ def test_block_skip_finite():
     )
 
 
+def test_nlm_recursive_finite():
+    cfg = base_config(
+        memory_length=10,
+        iterations=8,
+        residual_compute_mode="nlm_recursive",
+        residual_synapse_mode="block_delta_skip",
+        residual_nlm_mode="recursive_fast",
+        residual_full_refresh_interval=4,
+        residual_compute_weight=0.015,
+        residual_delta_l1_weight=1e-4,
+        moe_routing_mode="regional_shared_topk",
+        moe_num_experts=16,
+        moe_expert_size=32,
+        moe_activation_passes=4,
+        moe_dispatch_mode="dense_mask",
+    )
+    model = CTMForCausalLM(cfg)
+    model.train()
+    ids = torch.randint(0, cfg.vocab_size, (2, 12))
+    loss, _, _ = model.forward_train(ids, ids, num_iters=cfg.iterations)
+    assert torch.isfinite(loss)
+    assert model.last_nlm_fast_ratio > 0.0
+    loss.backward()
+    print(
+        f"nlm recursive smoke loss={loss.item():.4f} "
+        f"fast={model.last_nlm_fast_ratio:.3f} skip={model.last_residual_skip_ratio:.3f}"
+    )
+
+
 def main():
     test_speed_spectrum_finite()
     test_residual_observe_finite()
     test_block_skip_finite()
+    test_nlm_recursive_finite()
     print("speed/residual smoke tests passed")
 
 

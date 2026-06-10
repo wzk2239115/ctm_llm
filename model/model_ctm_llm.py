@@ -604,7 +604,12 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
                 state_trace = torch.cat(
                     [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
 
-                activated = self.trace_processor(state_trace)
+                activated = self._apply_trace_nlm(
+                    self.trace_processor,
+                    state_trace,
+                    tick,
+                    cache_key=f'layer{self.layer_id}:dense',
+                )
             if self.ttt_layer is not None:
                 activated = activated + self.ttt_layer(activated)
             if not self._use_group_sparse_backend():
@@ -653,6 +658,7 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         extras['final_activated'] = activated
         extras['final_trace'] = state_trace
         self.last_residual_skip_ratio = self._consume_residual_skip_ratio()
+        self.last_nlm_fast_ratio = self._consume_nlm_fast_ratio()
 
         return BlockOutput(hidden=x, present_kv=present_kv, extras=extras)
 
@@ -671,6 +677,15 @@ class CTMModel(nn.Module):
     def consume_residual_skip_ratio(self):
         ratios = [
             float(getattr(layer, 'last_residual_skip_ratio', 0.0))
+            for layer in self.layers
+        ]
+        if not ratios:
+            return 0.0
+        return sum(ratios) / len(ratios)
+
+    def consume_nlm_fast_ratio(self):
+        ratios = [
+            float(getattr(layer, 'last_nlm_fast_ratio', 0.0))
             for layer in self.layers
         ]
         if not ratios:
@@ -796,6 +811,7 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         self.last_speed_loss = 0.0
         self.last_residual_delta_l1 = 0.0
         self.last_residual_skip_ratio = 0.0
+        self.last_nlm_fast_ratio = 0.0
         if self.speed_enabled:
             self.speed_spectrum = SpeedSpectrumDistiller(
                 config, self.model, config.hidden_size, DINOProjectionHead)
@@ -1102,14 +1118,20 @@ class CTMForCausalLM(BaseCTMForCausalLM):
 
         if residual_enabled(self.config):
             skip_ratio = self.model.consume_residual_skip_ratio()
+            nlm_fast_ratio = self.model.consume_nlm_fast_ratio()
             residual_penalty, delta_l1 = compute_residual_metrics(
-                tick_outs, h, self.config, skip_ratio=skip_ratio)
+                tick_outs, h, self.config,
+                skip_ratio=skip_ratio,
+                nlm_fast_ratio=nlm_fast_ratio,
+            )
             self.last_residual_delta_l1 = delta_l1
             self.last_residual_skip_ratio = skip_ratio
+            self.last_nlm_fast_ratio = nlm_fast_ratio
             loss = loss + residual_penalty
         else:
             self.last_residual_delta_l1 = 0.0
             self.last_residual_skip_ratio = 0.0
+            self.last_nlm_fast_ratio = 0.0
 
         moe_aux_loss = self._moe_aux_loss()
         if moe_aux_loss is not None:
