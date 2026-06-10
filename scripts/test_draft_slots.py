@@ -135,10 +135,30 @@ def test_training_runs_all_ticks_with_halt():
     print(f"train executed_ticks={executed} infer executed_ticks={infer_executed}")
 
 
+def test_revise_mode_finite_train_loss():
+    cfg = draft_config(
+        draft_mode="revise",
+        draft_loss_weight=0.15,
+        draft_revise_weight=0.20,
+        draft_corrupt_prob=0.30,
+        draft_commit_loss_weight=0.05,
+        draft_commit_threshold=0.50,
+    )
+    model = CTMForCausalLM(cfg)
+    model.train()
+    ids = torch.randint(0, cfg.vocab_size, (2, 12))
+    labels = ids.clone()
+    loss, _, _ = model.forward_train(ids, labels)
+    assert torch.isfinite(loss)
+    loss.backward()
+    print(f"revise-mode smoke loss={loss.item():.4f}")
+
+
 def main():
     test_forward_shape()
     test_draft_offset_alignment()
     test_finite_train_loss()
+    test_revise_mode_finite_train_loss()
     test_training_runs_all_ticks_with_halt()
     print("draft slot smoke tests passed")
 

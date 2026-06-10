@@ -394,6 +394,13 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'draft_head_mode': args.draft_head_mode,
                     'draft_loss_weight': args.draft_loss_weight,
                     'draft_slot_attention': args.draft_slot_attention,
+                    'draft_revise_weight': args.draft_revise_weight,
+                    'draft_corrupt_prob': args.draft_corrupt_prob,
+                    'draft_commit_loss_weight': args.draft_commit_loss_weight,
+                    'draft_num_revise': args.draft_num_revise,
+                    'draft_memory_carry': args.draft_memory_carry,
+                    'draft_curriculum': args.draft_curriculum,
+                    'draft_commit_threshold': args.draft_commit_threshold,
                     'self_cond': args.self_cond,
                     'cross_layer_state': args.cross_layer_state,
                     'max_seq_len': args.max_seq_len,
@@ -555,6 +562,14 @@ if __name__ == '__main__':
     parser.add_argument('--draft_loss_weight', type=float, default=0.0)
     parser.add_argument('--draft_slot_attention', type=str, default='causal_slots',
                         choices=['causal_slots', 'block_bidir'])
+    parser.add_argument('--draft_revise_weight', type=float, default=0.0)
+    parser.add_argument('--draft_corrupt_prob', type=float, default=0.0)
+    parser.add_argument('--draft_commit_loss_weight', type=float, default=0.0)
+    parser.add_argument('--draft_num_revise', type=int, default=1)
+    parser.add_argument('--draft_memory_carry', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--draft_curriculum', type=str, default='none',
+                        choices=['none', 'linear'])
+    parser.add_argument('--draft_commit_threshold', type=float, default=0.65)
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--data_path', type=str,
                         default='dataset_data/sft_t2a_mini.parquet')
@@ -691,6 +706,13 @@ if __name__ == '__main__':
         draft_head_mode=args.draft_head_mode,
         draft_loss_weight=args.draft_loss_weight,
         draft_slot_attention=args.draft_slot_attention,
+        draft_revise_weight=args.draft_revise_weight,
+        draft_corrupt_prob=args.draft_corrupt_prob,
+        draft_commit_loss_weight=args.draft_commit_loss_weight,
+        draft_num_revise=args.draft_num_revise,
+        draft_memory_carry=args.draft_memory_carry,
+        draft_curriculum=args.draft_curriculum,
+        draft_commit_threshold=args.draft_commit_threshold,
     )
     if rank == 0:
         if args.moe_dispatch_mode in ('block_sparse', 'capacity_drop'):

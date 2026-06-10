@@ -778,6 +778,80 @@ class CTMForCausalLM(BaseCTMForCausalLM):
             losses.append(slot_loss)
         return torch.stack(losses, dim=1).mean(dim=1)
 
+    def _effective_draft_corrupt_prob(self):
+        prob = float(self.config.draft_corrupt_prob)
+        if prob <= 0 or self.config.draft_mode != 'revise':
+            return 0.0
+        curriculum = self.config.draft_curriculum
+        if curriculum == 'none':
+            return prob
+        # Linear curriculum placeholder: full strength once revise training is enabled.
+        return prob
+
+    def _corrupt_draft_labels(self, labels, corrupt_prob):
+        if corrupt_prob <= 0 or not self.training:
+            return labels
+        out = labels.clone()
+        valid = out != -100
+        corrupt_mask = valid & (torch.rand_like(out.float()) < corrupt_prob)
+        if not corrupt_mask.any():
+            return out
+        random_tokens = torch.randint(
+            0, self.config.vocab_size, out.shape, device=out.device, dtype=out.dtype)
+        return torch.where(corrupt_mask, random_tokens, out)
+
+    def _draft_commit_loss(self, slot_logits, labels):
+        block = slot_logits.size(2)
+        B = labels.size(0)
+        slot_commit_losses = []
+        for slot in range(block):
+            horizon = slot + 1
+            if labels.size(1) <= horizon:
+                continue
+            shift_logits = slot_logits[:, :-horizon, slot, :].contiguous()
+            shift_labels = labels[:, horizon:].contiguous()
+            valid = shift_labels != -100
+            if not valid.any():
+                continue
+            probs = F.softmax(shift_logits, dim=-1)
+            correct_prob = probs.gather(
+                -1, shift_labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+            match = (shift_logits.argmax(-1) == shift_labels).float() * valid.float()
+            denom = valid.float().sum(dim=1).clamp(min=1)
+            avg_conf = (correct_prob * valid.float()).sum(dim=1) / denom
+            avg_match = match.sum(dim=1) / denom
+            slot_commit_losses.append(
+                F.binary_cross_entropy(
+                    avg_conf.clamp(1e-6, 1 - 1e-6), avg_match, reduction='none'))
+        if not slot_commit_losses:
+            return slot_logits.new_zeros(B)
+        return torch.stack(slot_commit_losses, dim=1).mean(dim=1)
+
+    def _draft_tick_loss(self, slot_logits, labels):
+        clean = self._draft_slot_tick_loss(slot_logits, labels)
+        draft_weight = float(self.config.draft_loss_weight)
+        total = draft_weight * clean
+        if self.config.draft_mode != 'revise':
+            return total
+
+        revise_weight = float(self.config.draft_revise_weight)
+        corrupt_prob = self._effective_draft_corrupt_prob()
+        if revise_weight > 0 and corrupt_prob > 0:
+            revise_rounds = max(1, int(self.config.draft_num_revise))
+            revise_loss = slot_logits.new_zeros(clean.size(0))
+            for _ in range(revise_rounds):
+                corrupted = self._corrupt_draft_labels(labels, corrupt_prob)
+                revise_loss = revise_loss + self._draft_slot_tick_loss(
+                    slot_logits, corrupted)
+            revise_loss = revise_loss / revise_rounds
+            total = total + revise_weight * revise_loss
+
+        commit_weight = float(self.config.draft_commit_loss_weight)
+        if commit_weight > 0:
+            total = total + commit_weight * self._draft_commit_loss(
+                slot_logits, labels)
+        return total
+
     def update_dino_teacher(self):
         if not self.dino_enabled:
             return
@@ -920,10 +994,14 @@ class CTMForCausalLM(BaseCTMForCausalLM):
                         logits_t, labels, horizon=elf_h)
                     tick_components.append(horizon_loss)
 
-            if draft_slot_logits is not None and draft_weight > 0:
+            if draft_slot_logits is not None and draft_enabled and (
+                draft_weight > 0
+                or float(self.config.draft_revise_weight) > 0
+                or float(self.config.draft_commit_loss_weight) > 0
+            ):
                 slot_logits_t = draft_slot_logits[..., :, :, :, t]
-                draft_loss = self._draft_slot_tick_loss(slot_logits_t, labels)
-                tick_components.append(draft_weight * draft_loss)
+                draft_loss = self._draft_tick_loss(slot_logits_t, labels)
+                tick_components.append(draft_loss)
 
             per_sample_loss = torch.stack(tick_components, dim=1).mean(dim=1)
             losses.append(per_sample_loss)

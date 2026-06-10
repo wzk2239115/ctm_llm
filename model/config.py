@@ -98,6 +98,13 @@ class CTMLLMConfig:
         self.draft_head_mode = kwargs.get('draft_head_mode', 'shared')
         self.draft_loss_weight = kwargs.get('draft_loss_weight', 0.0)
         self.draft_slot_attention = kwargs.get('draft_slot_attention', 'causal_slots')
+        self.draft_revise_weight = kwargs.get('draft_revise_weight', 0.0)
+        self.draft_corrupt_prob = kwargs.get('draft_corrupt_prob', 0.0)
+        self.draft_commit_loss_weight = kwargs.get('draft_commit_loss_weight', 0.0)
+        self.draft_num_revise = kwargs.get('draft_num_revise', 1)
+        self.draft_memory_carry = kwargs.get('draft_memory_carry', 0)
+        self.draft_curriculum = kwargs.get('draft_curriculum', 'none')
+        self.draft_commit_threshold = kwargs.get('draft_commit_threshold', 0.65)
 
         self.dino_self_supervised_weight = kwargs.get('dino_self_supervised_weight', 0.0)
         self.dino_out_dim = kwargs.get('dino_out_dim', 512)
