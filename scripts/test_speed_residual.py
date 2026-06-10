@@ -82,9 +82,41 @@ def test_residual_observe_finite():
     )
 
 
+def test_block_skip_finite():
+    cfg = base_config(
+        residual_compute_mode="block_skip",
+        residual_synapse_mode="block_delta_skip",
+        residual_nlm_mode="output_delta",
+        residual_num_groups=16,
+        residual_active_ratio=0.25,
+        residual_gate_threshold=0.15,
+        residual_full_refresh_interval=4,
+        residual_compute_weight=0.01,
+        residual_delta_l1_weight=1e-4,
+        moe_routing_mode="regional_shared_topk",
+        moe_num_experts=16,
+        moe_expert_size=32,
+        moe_activation_passes=4,
+        moe_dispatch_mode="dense_mask",
+    )
+    model = CTMForCausalLM(cfg)
+    model.train()
+    ids = torch.randint(0, cfg.vocab_size, (2, 12))
+    loss, _, _ = model.forward_train(ids, ids)
+    assert torch.isfinite(loss)
+    assert 0.0 <= model.last_residual_skip_ratio <= 1.0
+    loss.backward()
+    print(
+        f"block skip smoke loss={loss.item():.4f} "
+        f"skip={model.last_residual_skip_ratio:.3f} "
+        f"delta={model.last_residual_delta_l1:.4f}"
+    )
+
+
 def main():
     test_speed_spectrum_finite()
     test_residual_observe_finite()
+    test_block_skip_finite()
     print("speed/residual smoke tests passed")
 
 

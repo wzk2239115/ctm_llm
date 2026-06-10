@@ -13,6 +13,7 @@ from model.draft_modules import DraftSlotHead
 from model.moe_regional import RegionalMoEMixin
 from model.base_causal_lm import BaseCTMForCausalLM
 from model.residual_compute import compute_residual_metrics, residual_enabled
+from model.residual_compute import block_skip_enabled, run_grouped_block_delta_synapse
 from model.speed_spectrum import SpeedSpectrumDistiller
 
 
@@ -490,6 +491,7 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         B, T, _ = x.shape
         device = x.device
         self.moe_aux_loss = None
+        self._init_residual_skip_tracking()
 
         normed = self.input_norm(x)
         kv = self.kv_proj(normed)
@@ -574,7 +576,7 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
 
             if self._use_group_sparse_backend():
                 activated, state_trace = self._run_group_sparse_regional_tick(
-                    attn, activated, state_trace, prev_sync_o_activated)
+                    attn, activated, state_trace, prev_sync_o_activated, tick_idx=tick)
                 state = activated
             else:
                 pre_syn_parts = [attn, activated]
@@ -584,7 +586,20 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
                     else:
                         pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
                 pre_syn = torch.cat(pre_syn_parts, dim=-1)
-                state = self.synapses(pre_syn)
+                cache = getattr(self, '_residual_synapse_cache', {})
+                if block_skip_enabled(self.config):
+                    state, cache, skip_ratio = run_grouped_block_delta_synapse(
+                        pre_syn,
+                        self.synapses,
+                        cache,
+                        self.config,
+                        tick,
+                        f'layer{self.layer_id}:dense',
+                    )
+                    self._residual_synapse_cache = cache
+                    self._accumulate_residual_skip(skip_ratio)
+                else:
+                    state = self.synapses(pre_syn)
 
                 state_trace = torch.cat(
                     [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
@@ -637,6 +652,7 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
 
         extras['final_activated'] = activated
         extras['final_trace'] = state_trace
+        self.last_residual_skip_ratio = self._consume_residual_skip_ratio()
 
         return BlockOutput(hidden=x, present_kv=present_kv, extras=extras)
 
@@ -651,6 +667,15 @@ class CTMModel(nn.Module):
         self.layers = nn.ModuleList(
             [CTMBlock(i, config) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def consume_residual_skip_ratio(self):
+        ratios = [
+            float(getattr(layer, 'last_residual_skip_ratio', 0.0))
+            for layer in self.layers
+        ]
+        if not ratios:
+            return 0.0
+        return sum(ratios) / len(ratios)
 
     def forward(self, input_ids, past_key_values=None, use_cache=False, track=False,
                 num_iters=None, return_all_ticks=False,
@@ -770,6 +795,7 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         self.speed_spectrum = None
         self.last_speed_loss = 0.0
         self.last_residual_delta_l1 = 0.0
+        self.last_residual_skip_ratio = 0.0
         if self.speed_enabled:
             self.speed_spectrum = SpeedSpectrumDistiller(
                 config, self.model, config.hidden_size, DINOProjectionHead)
@@ -1075,11 +1101,15 @@ class CTMForCausalLM(BaseCTMForCausalLM):
             self.last_speed_loss = 0.0
 
         if residual_enabled(self.config):
-            residual_penalty, delta_l1 = compute_residual_metrics(tick_outs, h, self.config)
+            skip_ratio = self.model.consume_residual_skip_ratio()
+            residual_penalty, delta_l1 = compute_residual_metrics(
+                tick_outs, h, self.config, skip_ratio=skip_ratio)
             self.last_residual_delta_l1 = delta_l1
+            self.last_residual_skip_ratio = skip_ratio
             loss = loss + residual_penalty
         else:
             self.last_residual_delta_l1 = 0.0
+            self.last_residual_skip_ratio = 0.0
 
         moe_aux_loss = self._moe_aux_loss()
         if moe_aux_loss is not None:

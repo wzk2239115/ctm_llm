@@ -174,6 +174,10 @@ def current_residual_delta_l1(model):
     return float(getattr(model, 'last_residual_delta_l1', 0.0))
 
 
+def current_residual_skip_ratio(model):
+    return float(getattr(model, 'last_residual_skip_ratio', 0.0))
+
+
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
                 tb_writer, swanlab, start_step=0, rank=0):
     model.train()
@@ -267,6 +271,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             dino_loss = current_dino_loss(raw_model)
             speed_loss = current_speed_loss(raw_model)
             residual_delta_l1 = current_residual_delta_l1(raw_model)
+            residual_skip_ratio = current_residual_skip_ratio(raw_model)
 
             Logger(
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
@@ -290,6 +295,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'dino_loss': dino_loss,
                 'speed_loss': speed_loss,
                 'residual_delta_l1': residual_delta_l1,
+                'residual_skip_ratio': residual_skip_ratio,
                 'tokens_per_sec': tokens_per_sec,
                 'steps_per_sec': steps_per_sec,
                 'peak_memory_mb': peak_mem_mb,
@@ -321,6 +327,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'dino_loss': dino_loss,
                     'speed_loss': speed_loss,
                     'residual_delta_l1': residual_delta_l1,
+                    'residual_skip_ratio': residual_skip_ratio,
                     'losses_per_tick': json.dumps(losses_tick_mean),
                     'certainties_per_tick': json.dumps(certainties_tick_mean),
                     'tokens': total_tokens,
@@ -440,6 +447,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'residual_tick_controller': args.residual_tick_controller,
                     'residual_speed_cells': args.residual_speed_cells,
                     'residual_track_deltas': args.residual_track_deltas,
+                    'residual_skip_ratio': residual_skip_ratio,
                     'self_cond': args.self_cond,
                     'cross_layer_state': args.cross_layer_state,
                     'max_seq_len': args.max_seq_len,
@@ -620,11 +628,13 @@ if __name__ == '__main__':
     parser.add_argument('--speed_teacher_temperature', type=float, default=0.04)
     parser.add_argument('--speed_warmup_steps', type=int, default=500)
     parser.add_argument('--residual_compute_mode', type=str, default='none',
-                        choices=['none', 'observe', 'gate', 'skip'])
+                        choices=['none', 'observe', 'gate', 'skip', 'block_skip',
+                                 'nlm_recursive', 'tick_controller'])
     parser.add_argument('--residual_synapse_mode', type=str, default='dense_delta',
-                        choices=['dense_delta', 'sparse_delta', 'full'])
+                        choices=['dense_delta', 'sparse_delta', 'full', 'block_delta_skip'])
     parser.add_argument('--residual_nlm_mode', type=str, default='full',
-                        choices=['full', 'output_delta', 'recursive'])
+                        choices=['full', 'output_delta', 'recursive',
+                                 'recursive_fast', 'hybrid_fast_full'])
     parser.add_argument('--residual_attention_mode', type=str, default='kv_cache',
                         choices=['kv_cache', 'refresh_delta', 'dense'])
     parser.add_argument('--residual_sync_mode', type=str, default='recursive_pairs',

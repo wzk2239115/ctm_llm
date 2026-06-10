@@ -3,9 +3,35 @@ import math
 import torch
 import torch.nn.functional as F
 
+from model.residual_compute import (
+    _novelty_score,
+    block_skip_enabled,
+    plan_block_skip_keys,
+    run_block_delta_synapse,
+    run_grouped_block_delta_synapse,
+)
+
 
 class RegionalMoEMixin:
     """Shared regional MoE routing/sparsity helpers for CTM blocks."""
+
+    def _init_residual_skip_tracking(self):
+        self._residual_synapse_cache = {}
+        self._residual_skip_total = 0.0
+        self._residual_skip_count = 0
+        self.last_residual_skip_ratio = 0.0
+
+    def _accumulate_residual_skip(self, skip_ratio):
+        self._residual_skip_total += float(skip_ratio)
+        self._residual_skip_count += 1
+
+    def _consume_residual_skip_ratio(self):
+        if self._residual_skip_count <= 0:
+            return 0.0
+        ratio = self._residual_skip_total / self._residual_skip_count
+        self._residual_skip_total = 0.0
+        self._residual_skip_count = 0
+        return ratio
 
     def _apply_moe_group_sparsity(self, activated):
         expert_size = self.moe_expert_size
@@ -196,7 +222,7 @@ class RegionalMoEMixin:
         return kept.view_as(expert_mask)
 
     def _compute_dense_pre_mask_activation(
-        self, attn, activated, state_trace, prev_sync_o_activated,
+        self, attn, activated, state_trace, prev_sync_o_activated, tick_idx=0,
     ):
         B, T, _ = activated.shape
         device = activated.device
@@ -207,13 +233,26 @@ class RegionalMoEMixin:
             else:
                 pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
         pre_syn = torch.cat(pre_syn_parts, dim=-1)
-        state = self.synapses(pre_syn)
+        cache = getattr(self, '_residual_synapse_cache', {})
+        if block_skip_enabled(self.config):
+            state, cache, skip_ratio = run_grouped_block_delta_synapse(
+                pre_syn,
+                self.synapses,
+                cache,
+                self.config,
+                tick_idx,
+                f'layer{self.layer_id}:route',
+            )
+            self._residual_synapse_cache = cache
+            self._accumulate_residual_skip(skip_ratio)
+        else:
+            state = self.synapses(pre_syn)
         new_trace = torch.cat(
             [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
         return self.trace_processor(new_trace), new_trace
 
     def _run_group_sparse_regional_tick(
-        self, attn, activated, state_trace, prev_sync_o_activated,
+        self, attn, activated, state_trace, prev_sync_o_activated, tick_idx=0,
     ):
         B, T, _ = activated.shape
         expert_size = self.moe_expert_size
@@ -228,7 +267,7 @@ class RegionalMoEMixin:
         pass_masks = []
 
         routing_activated, _ = self._compute_dense_pre_mask_activation(
-            attn, activated, state_trace, prev_sync_o_activated)
+            attn, activated, state_trace, prev_sync_o_activated, tick_idx=tick_idx)
         routing_x = routing_activated.view(B, T, num_experts, expert_size)
         raw_scores = routing_x.abs().mean(dim=-1)
         routing_scores = raw_scores.detach()
@@ -248,8 +287,12 @@ class RegionalMoEMixin:
 
         pass_outputs = []
         merged_trace = base_flat_trace.clone()
+        cache = getattr(self, '_residual_synapse_cache', {})
+        use_block_skip = block_skip_enabled(self.config)
+        skipped_blocks = 0
+        total_blocks = 0
 
-        for _ in range(passes):
+        for pass_idx in range(passes):
             expert_mask, _ = self._route_experts(
                 routing_scores, shared, routed_count, topk, selected)
             selected = selected | expert_mask[:, :, shared:].bool()
@@ -258,6 +301,7 @@ class RegionalMoEMixin:
 
             flat_active = base_flat_active.clone()
             flat_trace = base_flat_trace.clone()
+            pending_blocks = []
 
             for expert in range(num_experts):
                 token_idx = flat_mask[:, expert].nonzero(as_tuple=False).squeeze(-1)
@@ -285,7 +329,52 @@ class RegionalMoEMixin:
                 if self.self_cond:
                     parts.append(flat_self[token_idx, start:end])
                 pre_syn = torch.cat(parts, dim=-1)
-                state = synapse_module(pre_syn)
+                key = f'layer{self.layer_id}:e{expert}:p{pass_idx}'
+                cache_entry = cache.get(key)
+                pending_blocks.append({
+                    'key': key,
+                    'token_idx': token_idx,
+                    'start': start,
+                    'end': end,
+                    'mem_len': mem_len,
+                    'gate_scale': gate_scale,
+                    'pre_syn': pre_syn,
+                    'synapse_module': synapse_module,
+                    'trace_module': trace_module,
+                    'cache_entry': cache_entry,
+                    'novelty': _novelty_score(
+                        pre_syn,
+                        None if cache_entry is None else cache_entry['pre_syn'],
+                    ),
+                })
+
+            run_keys = (
+                plan_block_skip_keys(pending_blocks, self.config, tick_idx)
+                if use_block_skip else {block['key'] for block in pending_blocks}
+            )
+
+            for block in pending_blocks:
+                total_blocks += 1
+                should_run = block['key'] in run_keys if use_block_skip else True
+                if use_block_skip:
+                    state, new_cache, did_skip = run_block_delta_synapse(
+                        block['pre_syn'],
+                        block['synapse_module'],
+                        block['cache_entry'],
+                        should_run,
+                    )
+                    cache[block['key']] = new_cache
+                    if did_skip:
+                        skipped_blocks += 1
+                else:
+                    state = block['synapse_module'](block['pre_syn'])
+
+                token_idx = block['token_idx']
+                start = block['start']
+                end = block['end']
+                mem_len = block['mem_len']
+                trace_module = block['trace_module']
+                gate_scale = block['gate_scale']
                 prev_trace = flat_trace[token_idx, start:end, -mem_len:]
                 new_trace = torch.cat(
                     [prev_trace[:, :, 1:], state.unsqueeze(-1)], dim=-1)
@@ -301,6 +390,11 @@ class RegionalMoEMixin:
             if self.cell_sparsity_rescale:
                 mask = mask * (self.d_model / active_cells.unsqueeze(-1))
             pass_outputs.append((pass_x * mask).reshape(B, T, self.d_model))
+
+        if use_block_skip:
+            self._residual_synapse_cache = cache
+            self._accumulate_residual_skip(
+                skipped_blocks / max(total_blocks, 1))
 
         self._update_moe_aux_loss(raw_scores[:, :, shared:])
         self._update_region_diversity_loss(pass_masks)
