@@ -166,6 +166,14 @@ def current_dino_loss(model):
     return float(getattr(model, 'last_dino_loss', 0.0))
 
 
+def current_speed_loss(model):
+    return float(getattr(model, 'last_speed_loss', 0.0))
+
+
+def current_residual_delta_l1(model):
+    return float(getattr(model, 'last_residual_delta_l1', 0.0))
+
+
 def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, args,
                 tb_writer, swanlab, start_step=0, rank=0):
     model.train()
@@ -216,6 +224,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             optimizer.zero_grad(set_to_none=True)
             if hasattr(raw_model, 'update_dino_teacher'):
                 raw_model.update_dino_teacher()
+            if hasattr(raw_model, 'update_speed_teachers'):
+                raw_model.update_speed_teachers()
 
         total_loss += loss.item() * args.accumulation_steps
         total_steps += 1
@@ -255,10 +265,12 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             peak_mem_mb = cuda_memory_mb(args.device)
             moe_aux_loss = current_moe_aux_loss(raw_model)
             dino_loss = current_dino_loss(raw_model)
+            speed_loss = current_speed_loss(raw_model)
+            residual_delta_l1 = current_residual_delta_l1(raw_model)
 
             Logger(
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
-                f'loss:{avg_loss:.4f} dino:{dino_loss:.4f} lr:{lr:.2e} | '
+                f'loss:{avg_loss:.4f} dino:{dino_loss:.4f} speed:{speed_loss:.4f} lr:{lr:.2e} | '
                 f'best_tick:{best_tick_mean:.1f} conf_tick:{conf_tick_mean:.1f} | '
                 f'eff_tick:{effective_tick_mean:.1f} exec_tick:{executed_ticks_last_layer} | '
                 f'tok/s:{tokens_per_sec:.0f} mem:{peak_mem_mb:.0f}MB | '
@@ -276,6 +288,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'active_cell_fraction': active_cell_fraction(args),
                 'moe_aux_loss': moe_aux_loss,
                 'dino_loss': dino_loss,
+                'speed_loss': speed_loss,
+                'residual_delta_l1': residual_delta_l1,
                 'tokens_per_sec': tokens_per_sec,
                 'steps_per_sec': steps_per_sec,
                 'peak_memory_mb': peak_mem_mb,
@@ -305,6 +319,8 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'active_cell_fraction': active_cell_fraction(args),
                     'moe_aux_loss': moe_aux_loss,
                     'dino_loss': dino_loss,
+                    'speed_loss': speed_loss,
+                    'residual_delta_l1': residual_delta_l1,
                     'losses_per_tick': json.dumps(losses_tick_mean),
                     'certainties_per_tick': json.dumps(certainties_tick_mean),
                     'tokens': total_tokens,
@@ -401,6 +417,29 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'draft_memory_carry': args.draft_memory_carry,
                     'draft_curriculum': args.draft_curriculum,
                     'draft_commit_threshold': args.draft_commit_threshold,
+                    'speed_spectrum_mode': args.speed_spectrum_mode,
+                    'speed_ema_decays': args.speed_ema_decays,
+                    'speed_distill_weight': args.speed_distill_weight,
+                    'speed_target_ticks': args.speed_target_ticks,
+                    'speed_centering': args.speed_centering,
+                    'speed_center_momentum': args.speed_center_momentum,
+                    'speed_student_temperature': args.speed_student_temperature,
+                    'speed_teacher_temperature': args.speed_teacher_temperature,
+                    'speed_warmup_steps': args.speed_warmup_steps,
+                    'residual_compute_mode': args.residual_compute_mode,
+                    'residual_synapse_mode': args.residual_synapse_mode,
+                    'residual_nlm_mode': args.residual_nlm_mode,
+                    'residual_attention_mode': args.residual_attention_mode,
+                    'residual_sync_mode': args.residual_sync_mode,
+                    'residual_num_groups': args.residual_num_groups,
+                    'residual_active_ratio': args.residual_active_ratio,
+                    'residual_gate_threshold': args.residual_gate_threshold,
+                    'residual_full_refresh_interval': args.residual_full_refresh_interval,
+                    'residual_compute_weight': args.residual_compute_weight,
+                    'residual_delta_l1_weight': args.residual_delta_l1_weight,
+                    'residual_tick_controller': args.residual_tick_controller,
+                    'residual_speed_cells': args.residual_speed_cells,
+                    'residual_track_deltas': args.residual_track_deltas,
                     'self_cond': args.self_cond,
                     'cross_layer_state': args.cross_layer_state,
                     'max_seq_len': args.max_seq_len,
@@ -570,6 +609,37 @@ if __name__ == '__main__':
     parser.add_argument('--draft_curriculum', type=str, default='none',
                         choices=['none', 'linear'])
     parser.add_argument('--draft_commit_threshold', type=float, default=0.65)
+    parser.add_argument('--speed_spectrum_mode', type=str, default='none',
+                        choices=['none', 'ema_spectrum'])
+    parser.add_argument('--speed_ema_decays', type=str, default='0.90,0.97,0.995')
+    parser.add_argument('--speed_distill_weight', type=float, default=0.0)
+    parser.add_argument('--speed_target_ticks', type=str, default='fast,mid,slow')
+    parser.add_argument('--speed_centering', type=int, default=1, choices=[0, 1])
+    parser.add_argument('--speed_center_momentum', type=float, default=0.90)
+    parser.add_argument('--speed_student_temperature', type=float, default=0.10)
+    parser.add_argument('--speed_teacher_temperature', type=float, default=0.04)
+    parser.add_argument('--speed_warmup_steps', type=int, default=500)
+    parser.add_argument('--residual_compute_mode', type=str, default='none',
+                        choices=['none', 'observe', 'gate', 'skip'])
+    parser.add_argument('--residual_synapse_mode', type=str, default='dense_delta',
+                        choices=['dense_delta', 'sparse_delta', 'full'])
+    parser.add_argument('--residual_nlm_mode', type=str, default='full',
+                        choices=['full', 'output_delta', 'recursive'])
+    parser.add_argument('--residual_attention_mode', type=str, default='kv_cache',
+                        choices=['kv_cache', 'refresh_delta', 'dense'])
+    parser.add_argument('--residual_sync_mode', type=str, default='recursive_pairs',
+                        choices=['recursive_pairs', 'dense', 'none'])
+    parser.add_argument('--residual_num_groups', type=int, default=32)
+    parser.add_argument('--residual_active_ratio', type=float, default=0.25)
+    parser.add_argument('--residual_gate_threshold', type=float, default=0.15)
+    parser.add_argument('--residual_full_refresh_interval', type=int, default=4)
+    parser.add_argument('--residual_compute_weight', type=float, default=0.0)
+    parser.add_argument('--residual_delta_l1_weight', type=float, default=0.0)
+    parser.add_argument('--residual_tick_controller', type=str, default='none',
+                        choices=['none', 'full', 'residual', 'stop'])
+    parser.add_argument('--residual_speed_cells', type=str, default='none',
+                        choices=['none', 'ema_spectrum', 'bands'])
+    parser.add_argument('--residual_track_deltas', type=int, default=0, choices=[0, 1])
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--data_path', type=str,
                         default='dataset_data/sft_t2a_mini.parquet')
@@ -713,6 +783,29 @@ if __name__ == '__main__':
         draft_memory_carry=args.draft_memory_carry,
         draft_curriculum=args.draft_curriculum,
         draft_commit_threshold=args.draft_commit_threshold,
+        speed_spectrum_mode=args.speed_spectrum_mode,
+        speed_ema_decays=args.speed_ema_decays,
+        speed_distill_weight=args.speed_distill_weight,
+        speed_target_ticks=args.speed_target_ticks,
+        speed_centering=args.speed_centering,
+        speed_center_momentum=args.speed_center_momentum,
+        speed_student_temperature=args.speed_student_temperature,
+        speed_teacher_temperature=args.speed_teacher_temperature,
+        speed_warmup_steps=args.speed_warmup_steps,
+        residual_compute_mode=args.residual_compute_mode,
+        residual_synapse_mode=args.residual_synapse_mode,
+        residual_nlm_mode=args.residual_nlm_mode,
+        residual_attention_mode=args.residual_attention_mode,
+        residual_sync_mode=args.residual_sync_mode,
+        residual_num_groups=args.residual_num_groups,
+        residual_active_ratio=args.residual_active_ratio,
+        residual_gate_threshold=args.residual_gate_threshold,
+        residual_full_refresh_interval=args.residual_full_refresh_interval,
+        residual_compute_weight=args.residual_compute_weight,
+        residual_delta_l1_weight=args.residual_delta_l1_weight,
+        residual_tick_controller=args.residual_tick_controller,
+        residual_speed_cells=args.residual_speed_cells,
+        residual_track_deltas=args.residual_track_deltas,
     )
     if rank == 0:
         if args.moe_dispatch_mode in ('block_sparse', 'capacity_drop'):
@@ -781,12 +874,16 @@ if __name__ == '__main__':
                 raw = raw_model._orig_mod if hasattr(raw_model, '_orig_mod') else raw_model
                 if hasattr(raw, 'reset_dino_teacher'):
                     raw.reset_dino_teacher()
+                if hasattr(raw, 'reset_speed_teachers'):
+                    raw.reset_speed_teachers()
             else:
                 state = torch.load(weight_path, map_location=args.device, weights_only=False)
                 model.load_state_dict(state, strict=False)
                 raw = raw_model._orig_mod if hasattr(raw_model, '_orig_mod') else raw_model
                 if hasattr(raw, 'reset_dino_teacher'):
                     raw.reset_dino_teacher()
+                if hasattr(raw, 'reset_speed_teachers'):
+                    raw.reset_speed_teachers()
                 if rank == 0:
                     Logger(f'Loaded weights: {weight_path}')
 

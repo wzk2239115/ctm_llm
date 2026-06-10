@@ -12,6 +12,8 @@ from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze, TTTMLP
 from model.draft_modules import DraftSlotHead
 from model.moe_regional import RegionalMoEMixin
 from model.base_causal_lm import BaseCTMForCausalLM
+from model.residual_compute import compute_residual_metrics, residual_enabled
+from model.speed_spectrum import SpeedSpectrumDistiller
 
 
 class DINOProjectionHead(nn.Module):
@@ -761,6 +763,27 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         else:
             self.register_buffer('dino_center', torch.zeros(1, 1, 1), persistent=False)
 
+        self.speed_enabled = (
+            config.speed_spectrum_mode != 'none'
+            and float(config.speed_distill_weight) > 0
+        )
+        self.speed_spectrum = None
+        self.last_speed_loss = 0.0
+        self.last_residual_delta_l1 = 0.0
+        if self.speed_enabled:
+            self.speed_spectrum = SpeedSpectrumDistiller(
+                config, self.model, config.hidden_size, DINOProjectionHead)
+
+    def update_speed_teachers(self):
+        if self.speed_spectrum is None:
+            return
+        self.speed_spectrum.update_teachers(self.model)
+
+    def reset_speed_teachers(self):
+        if self.speed_spectrum is None:
+            return
+        self.speed_spectrum.reset_teachers(self.model)
+
     def _draft_mtp_horizons(self):
         horizons = self._mtp_horizons()
         if self.config.draft_mode == 'none':
@@ -1041,6 +1064,23 @@ class CTMForCausalLM(BaseCTMForCausalLM):
             loss = loss + dino_weight * dino_loss
         else:
             self.last_dino_loss = 0.0
+
+        speed_weight = float(self.config.speed_distill_weight)
+        if self.speed_spectrum is not None and speed_weight > 0:
+            speed_loss = self.speed_spectrum(
+                input_ids, labels, tick_outs, num_iters or self.config.iterations)
+            self.last_speed_loss = float(speed_loss.detach().float().item())
+            loss = loss + speed_weight * speed_loss
+        else:
+            self.last_speed_loss = 0.0
+
+        if residual_enabled(self.config):
+            residual_penalty, delta_l1 = compute_residual_metrics(tick_outs, h, self.config)
+            self.last_residual_delta_l1 = delta_l1
+            loss = loss + residual_penalty
+        else:
+            self.last_residual_delta_l1 = 0.0
+
         moe_aux_loss = self._moe_aux_loss()
         if moe_aux_loss is not None:
             loss = loss + moe_aux_loss
