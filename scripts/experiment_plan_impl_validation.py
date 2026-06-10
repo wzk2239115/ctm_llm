@@ -799,7 +799,7 @@ def count_quick_probe_metrics(metrics_dir):
 def completed_final_experiments(metrics_dir):
     done = set()
     for name, row in latest_row_by_experiment(metrics_dir).items():
-        if _ctx.is_final_metrics_row(row):
+        if is_completed_experiment(row):
             done.add(name)
     return done
 
@@ -2082,6 +2082,20 @@ def is_final_metrics_row(row):
     if not _ctx.is_regional_experiment(name):
         return False
     return os.path.basename(metrics_file) == f"{name}.csv"
+
+
+def is_completed_experiment(row):
+    if not is_final_metrics_row(row):
+        return False
+    max_steps_raw = row.get("max_steps", "")
+    if max_steps_raw in ("", None):
+        # Legacy metrics rows without max_steps: keep old resume behavior.
+        return True
+    max_steps = parse_float(row, "max_steps", 0)
+    global_step = parse_float(row, "global_step", 0)
+    if max_steps > 0:
+        return global_step >= max_steps
+    return True
 
 
 _ctx.is_regional_experiment = is_regional_experiment

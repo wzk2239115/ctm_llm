@@ -221,7 +221,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
         total_steps += 1
         total_tokens += valid_tokens
 
-        if rank == 0 and (step % args.log_interval == 0 or step == iters):
+        if rank == 0 and step % args.log_interval == 0:
             avg_loss = total_loss / total_steps
             if losses_per_tick is not None and certainties is not None:
                 best_tick_mean = losses_per_tick.argmin(dim=1).float().mean().item()
@@ -399,6 +399,7 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'max_seq_len': args.max_seq_len,
                     'batch_size': args.batch_size,
                     'accumulation_steps': args.accumulation_steps,
+                    'max_steps': args.max_steps,
                     'elapsed_sec': elapsed,
                     'git_commit': args.git_commit,
                 })
