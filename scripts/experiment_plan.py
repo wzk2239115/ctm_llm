@@ -281,7 +281,10 @@ def build_plan(stage, plan_size="full"):
 
 
 def summarize(args):
+    stage_prefix = getattr(args, "stage", "all")
     rows = base.latest_rows(args.metrics_dir)
+    if stage_prefix != "all":
+        rows = [r for r in rows if r.get("experiment_name", "").startswith(f"{stage_prefix}_")]
     rows.sort(key=lambda r: r.get("experiment_name", ""))
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     fields = [
