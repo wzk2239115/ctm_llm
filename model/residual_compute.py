@@ -14,12 +14,14 @@ def residual_enabled(config: CTMLLMConfig):
     )
 
 
-def block_skip_enabled(config: CTMLLMConfig):
+def block_skip_enabled(config: CTMLLMConfig, tick_exec_mode='full'):
     if config.residual_synapse_mode not in ('block_delta_skip', 'sparse_delta'):
         return False
-    return config.residual_compute_mode in (
-        'block_skip', 'gate', 'skip', 'nlm_recursive',
-    )
+    if config.residual_compute_mode in ('block_skip', 'gate', 'skip', 'nlm_recursive'):
+        return True
+    if config.residual_compute_mode in ('tick_controller', 'speed_cells'):
+        return tick_exec_mode == 'residual'
+    return False
 
 
 def _novelty_score(pre_syn, cached_pre):
@@ -76,7 +78,8 @@ def run_block_delta_synapse(pre_syn, synapse_module, cache_entry, should_run_ful
 
 def run_grouped_block_delta_synapse(pre_syn, synapse_module, cache, config, tick_idx, group_prefix):
     """Sequence-chunked block skip for dense synapse paths."""
-    if not block_skip_enabled(config):
+    tick_exec_mode = getattr(config, '_tick_exec_mode', 'full')
+    if not block_skip_enabled(config, tick_exec_mode):
         state = synapse_module(pre_syn)
         return state, cache, 0.0
 
@@ -167,7 +170,9 @@ def compute_residual_metrics(
             0.0,
             1.0 - 0.5 * float(skip_ratio) - 0.5 * float(nlm_fast_ratio),
         )
-        if block_skip_enabled(config) or config.residual_compute_mode == 'nlm_recursive':
+        if block_skip_enabled(config) or config.residual_compute_mode in (
+            'nlm_recursive', 'tick_controller', 'speed_cells',
+        ):
             penalty = penalty + compute_weight * ref.new_tensor(executed_ratio)
         else:
             penalty = penalty + compute_weight * delta_l1

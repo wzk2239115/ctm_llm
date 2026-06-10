@@ -325,7 +325,8 @@ class RegionalMoEMixin:
         pass_outputs = []
         merged_trace = base_flat_trace.clone()
         cache = getattr(self, '_residual_synapse_cache', {})
-        use_block_skip = block_skip_enabled(self.config)
+        tick_exec_mode = getattr(self.config, '_tick_exec_mode', 'full')
+        use_block_skip = block_skip_enabled(self.config, tick_exec_mode)
         skipped_blocks = 0
         total_blocks = 0
 

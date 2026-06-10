@@ -131,6 +131,15 @@ class CTMLLMConfig:
         self.residual_speed_cells = kwargs.get('residual_speed_cells', 'none')
         self.residual_track_deltas = kwargs.get('residual_track_deltas', 0)
 
+        self.objective_mode = kwargs.get('objective_mode', 'none')
+        self.objective_denoise_weight = kwargs.get('objective_denoise_weight', 0.0)
+        self.objective_ce_weight = kwargs.get('objective_ce_weight', 1.0)
+        self.objective_latent_space = kwargs.get('objective_latent_space', 'token_embed')
+        self.objective_time_schedule = kwargs.get('objective_time_schedule', 'logit_normal')
+        self.objective_self_cond_prob = kwargs.get('objective_self_cond_prob', 0.0)
+        self.objective_decoder_noise_scale = kwargs.get('objective_decoder_noise_scale', 1.0)
+        self.objective_cond_drop_prob = kwargs.get('objective_cond_drop_prob', 0.0)
+
         self.dino_self_supervised_weight = kwargs.get('dino_self_supervised_weight', 0.0)
         self.dino_out_dim = kwargs.get('dino_out_dim', 512)
         self.dino_hidden_dim = kwargs.get('dino_hidden_dim', 256)

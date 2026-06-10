@@ -5,6 +5,7 @@ and output projection. Fast bands (period=1) fire every global tick and anchor
 guaranteed emission; slow bands keep their last projection in the mix while they
 wait for their next fire.
 """
+import copy
 import math
 import torch
 import torch.nn as nn
@@ -16,6 +17,10 @@ from model.building_blocks import RMSNorm, FeedForward, _parse_int_list, BlockOu
 from model.ctm_modules import SuperLinear, SynapseUNET, Squeeze, TTTMLP
 from model.moe_regional import RegionalMoEMixin
 from model.base_causal_lm import BaseCTMForCausalLM
+from model.residual_compute import block_skip_enabled, run_grouped_block_delta_synapse
+from model.tick_controller import tick_controller_enabled, resolve_tick_exec_mode
+from model.model_ctm_llm import CTMForCausalLM, DINOProjectionHead
+from model.speed_spectrum import SpeedSpectrumDistiller
 
 
 class AsyncClockBand:
@@ -220,6 +225,7 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
         self.last_executed_ticks = 0
         self.last_async_bands_fired = 0
         self.last_async_local_ticks = []
+        self.last_controller_stop_ratio = 0.0
         self.diff_cell_mode = config.diff_cell_mode
         self.diff_cell_temperature = float(
             config.diff_cell_temperature)
@@ -615,6 +621,7 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
         B, T, _ = x.shape
         device = x.device
         self.moe_aux_loss = None
+        self._init_residual_skip_tracking()
 
         normed = self.input_norm(x)
         kv = self.kv_proj(normed)
@@ -667,57 +674,89 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
         last_sync_o = None
         self.last_executed_ticks = 0
         self.clock_engine.reset_runtime()
+        prev_tick_confidence = None
+        controller_stop_count = 0
+        controller_tick_count = 0
+        state = None
 
         for tick in range(num_iters):
+            tick_exec_mode = 'full'
+            if tick_controller_enabled(self.config):
+                tick_exec_mode = resolve_tick_exec_mode(
+                    self.config, tick, num_iters, prev_tick_confidence)
+                controller_tick_count += 1
+            self.config._tick_exec_mode = tick_exec_mode
+
             activated_prev = activated
             trace_prev = state_trace
             self.last_async_bands_fired = self.clock_engine.bands_fired_count(tick)
 
-            sync_a, alpha_a, beta_a = self._compute_synch(
-                activated, alpha_a, beta_a, r_a, self.action_left, self.action_right)
-
-            q = self.q_proj(sync_a)
-            q_mh = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-            k_mh = k.view(B, S, self.heads, self.head_dim).transpose(1, 2)
-            v_mh = v.view(B, S, self.heads, self.head_dim).transpose(1, 2)
-
-            if T > 1 and past_kv is None:
-                attn_out = F.scaled_dot_product_attention(
-                    q_mh, k_mh, v_mh, is_causal=True, attn_mask=None)
+            if tick_exec_mode == 'stop':
+                controller_stop_count += 1
             else:
-                attn_out = F.scaled_dot_product_attention(
-                    q_mh, k_mh, v_mh)
+                sync_a, alpha_a, beta_a = self._compute_synch(
+                    activated, alpha_a, beta_a, r_a, self.action_left, self.action_right)
 
-            attn = self.attn_drop(
-                self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1)))
+                q = self.q_proj(sync_a)
+                q_mh = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+                k_mh = k.view(B, S, self.heads, self.head_dim).transpose(1, 2)
+                v_mh = v.view(B, S, self.heads, self.head_dim).transpose(1, 2)
 
-            if self._use_group_sparse_backend():
-                activated, state_trace = self._run_group_sparse_regional_tick(
-                    attn, activated, state_trace, prev_sync_o_activated, global_tick=tick)
-                state = activated
-            else:
-                pre_syn_parts = [attn, activated]
-                if self.self_cond:
-                    if prev_sync_o_activated is not None:
-                        pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
+                if T > 1 and past_kv is None:
+                    attn_out = F.scaled_dot_product_attention(
+                        q_mh, k_mh, v_mh, is_causal=True, attn_mask=None)
+                else:
+                    attn_out = F.scaled_dot_product_attention(
+                        q_mh, k_mh, v_mh)
+
+                attn = self.attn_drop(
+                    self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1)))
+
+                if self._use_group_sparse_backend():
+                    activated, state_trace = self._run_group_sparse_regional_tick(
+                        attn, activated, state_trace, prev_sync_o_activated, global_tick=tick)
+                    state = activated
+                else:
+                    pre_syn_parts = [attn, activated]
+                    if self.self_cond:
+                        if prev_sync_o_activated is not None:
+                            pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
+                        else:
+                            pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
+                    pre_syn = torch.cat(pre_syn_parts, dim=-1)
+                    cache = getattr(self, '_residual_synapse_cache', {})
+                    if block_skip_enabled(self.config, tick_exec_mode):
+                        state, cache, skip_ratio = run_grouped_block_delta_synapse(
+                            pre_syn,
+                            self.synapses,
+                            cache,
+                            self.config,
+                            tick,
+                            f'layer{self.layer_id}:dense',
+                        )
+                        self._residual_synapse_cache = cache
+                        self._accumulate_residual_skip(skip_ratio)
                     else:
-                        pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
-                pre_syn = torch.cat(pre_syn_parts, dim=-1)
-                state = self.synapses(pre_syn)
+                        state = self.synapses(pre_syn)
 
-                state_trace = torch.cat(
-                    [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
+                    state_trace = torch.cat(
+                        [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
 
-                activated = self.trace_processor(state_trace)
-            if self.ttt_layer is not None:
-                activated = activated + self.ttt_layer(activated)
-            if not self._use_group_sparse_backend():
-                activated = self._apply_cell_sparsity(activated)
-            activated, state_trace = self.clock_engine.apply_carry(
-                activated, activated_prev, state_trace, trace_prev, tick)
-            for band in self.clock_engine.bands:
-                if band.fires(tick):
-                    band.local_tick += 1
+                    activated = self._apply_trace_nlm(
+                        self.trace_processor,
+                        state_trace,
+                        tick,
+                        cache_key=f'layer{self.layer_id}:dense',
+                    )
+                if self.ttt_layer is not None:
+                    activated = activated + self.ttt_layer(activated)
+                if not self._use_group_sparse_backend():
+                    activated = self._apply_cell_sparsity(activated)
+                activated, state_trace = self.clock_engine.apply_carry(
+                    activated, activated_prev, state_trace, trace_prev, tick)
+                for band in self.clock_engine.bands:
+                    if band.fires(tick):
+                        band.local_tick += 1
 
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
@@ -730,7 +769,12 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
             if all_tick_outs is not None:
                 all_tick_outs.append(tick_out)
 
-            if track:
+            if tick_controller_enabled(self.config) and halt_lm_head is not None:
+                with torch.no_grad():
+                    prev_tick_confidence = BaseCTMForCausalLM._halt_confidence_mean(
+                        halt_lm_head(tick_out.detach()))
+
+            if track and tick_exec_mode != 'stop' and state is not None:
                 tracking['pre_activations'].append(state[0].detach().cpu().numpy())
                 tracking['post_activations'].append(activated[0].detach().cpu().numpy())
                 tracking['sync_action'].append(sync_a[0].detach().cpu().numpy())
@@ -749,6 +793,11 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
                             self.config.tick_halt_threshold):
                         break
 
+        if controller_tick_count > 0:
+            self.last_controller_stop_ratio = controller_stop_count / controller_tick_count
+        else:
+            self.last_controller_stop_ratio = 0.0
+
         ctm_out = all_tick_outs[-1] if all_tick_outs is not None else \
             self.output_proj(last_sync_o)
         x = x + self.resid_drop(ctm_out)
@@ -764,6 +813,8 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
 
         extras['final_activated'] = activated
         extras['final_trace'] = state_trace
+        self.last_residual_skip_ratio = self._consume_residual_skip_ratio()
+        self.last_nlm_fast_ratio = self._consume_nlm_fast_ratio()
 
         return BlockOutput(hidden=x, present_kv=present_kv, extras=extras)
 
@@ -779,9 +830,27 @@ class AsyncCTMModel(nn.Module):
             [AsyncCTMBlock(i, config) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def consume_residual_skip_ratio(self):
+        ratios = [
+            float(getattr(layer, 'last_residual_skip_ratio', 0.0))
+            for layer in self.layers
+        ]
+        if not ratios:
+            return 0.0
+        return sum(ratios) / len(ratios)
+
+    def consume_nlm_fast_ratio(self):
+        ratios = [
+            float(getattr(layer, 'last_nlm_fast_ratio', 0.0))
+            for layer in self.layers
+        ]
+        if not ratios:
+            return 0.0
+        return sum(ratios) / len(ratios)
+
     def forward(self, input_ids, past_key_values=None, use_cache=False, track=False,
                 num_iters=None, return_all_ticks=False,
-                halt_lm_head=None, enable_tick_halt=False):
+                halt_lm_head=None, enable_tick_halt=False, draft_lm_head=None):
         B, T = input_ids.shape
         if past_key_values is None:
             past_key_values = [None] * len(self.layers)
@@ -843,95 +912,15 @@ class AsyncCTMModel(nn.Module):
         )
 
 
-class AsyncCTMForCausalLM(BaseCTMForCausalLM):
+class AsyncCTMForCausalLM(CTMForCausalLM):
     def __init__(self, config: CTMLLMConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.model = AsyncCTMModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.reflex_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.reflex_adapter = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size // 2, bias=False),
-            nn.SiLU(),
-            nn.Linear(config.hidden_size // 2, config.hidden_size, bias=False),
-        )
-        if config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
-
-    def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
-                num_iters=None):
-        enable_halt = self.config.tick_halt_mode != 'none' and not self.training
-        result = self.model(
-            input_ids, past_key_values, use_cache, track=False, num_iters=num_iters,
-            halt_lm_head=self.lm_head, enable_tick_halt=enable_halt)
-        h, past_key_values = result.hidden, result.past_key_values
-        logits = self.lm_head(h)
-        loss = None
-        if labels is not None:
-            bs = self.config.block_size
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1), ignore_index=-100)
-        return {'loss': loss, 'logits': logits, 'past_key_values': past_key_values}
-
-    def forward_train(self, input_ids, labels, num_iters=None):
-        B = input_ids.size(0)
-        result = self.model(
-            input_ids, track=False, num_iters=num_iters, return_all_ticks=True,
-            halt_lm_head=self.lm_head, enable_tick_halt=False)
-        h = result.hidden
-        tick_outs = result.tick_outputs
-        num_ticks = tick_outs.size(-1)
-
-        final_logits = self.lm_head(h)
-        final_loss = self._lm_loss_from_logits(final_logits, labels)
-
-        losses = []
-        next_losses = []
-        certainties = []
-        mtp_horizons = self._mtp_horizons()
-        for t in range(num_ticks):
-            logits_t = self.lm_head(tick_outs[..., t])
-            if mtp_horizons:
-                horizon_losses = []
-                label_mask = None
-                for horizon in mtp_horizons:
-                    horizon_loss, horizon_mask = self._per_sample_lm_loss(
-                        logits_t, labels, horizon=horizon)
-                    horizon_losses.append(horizon_loss)
-                    if horizon == 1 or label_mask is None:
-                        label_mask = horizon_mask
-                per_sample_loss = torch.stack(horizon_losses, dim=1).mean(dim=1)
-            else:
-                horizon = self._tick_horizon(t, num_ticks)
-                per_sample_loss, label_mask = self._per_sample_lm_loss(
-                    logits_t, labels, horizon=horizon)
-            losses.append(per_sample_loss)
-
-            next_loss, next_mask = self._per_sample_lm_loss(
-                logits_t, labels, horizon=1)
-            next_losses.append(next_loss)
-            certainties.append(self._per_sample_entropy(logits_t, next_mask, horizon=1))
-
-        losses = torch.stack(losses, dim=1)
-        next_losses = torch.stack(next_losses, dim=1)
-        certainties = torch.stack(certainties, dim=1)
-
-        tick_loss = self._combine_tick_losses(losses, certainties)
-        if self.config.tick_improve_weight > 0 and num_ticks > 1:
-            margin = float(self.config.tick_improve_margin)
-            improve_loss = F.relu(next_losses[:, 1:] - next_losses[:, :-1] + margin).mean()
-            tick_loss = tick_loss + self.config.tick_improve_weight * improve_loss
-        slow_weight = float(self.config.slow_output_weight)
-        base_w = float(self.config.tick_loss_base_weight)
-        loss = (base_w + slow_weight) * final_loss + base_w * tick_loss
-        fast_slow_aux = self._fast_slow_output_loss(
-            input_ids, labels, tick_outs, final_logits)
-        loss = loss + fast_slow_aux
-        moe_aux_loss = self._moe_aux_loss()
-        if moe_aux_loss is not None:
-            loss = loss + moe_aux_loss
-
-        return loss, losses, certainties
+        if self.speed_enabled:
+            self.speed_spectrum = SpeedSpectrumDistiller(
+                config, self.model, config.hidden_size, DINOProjectionHead)
+        if self.dino_enabled:
+            self.dino_teacher_model = copy.deepcopy(self.model)
+            self.dino_teacher_model.eval()
+            for param in self.dino_teacher_model.parameters():
+                param.requires_grad_(False)

@@ -1,12 +1,16 @@
 import torch
 
 from model.config import CTMLLMConfig
+from model.tick_controller import tick_controller_enabled
 
 
 def nlm_recursive_enabled(config: CTMLLMConfig) -> bool:
-    return (
-        config.residual_compute_mode == 'nlm_recursive'
-        and config.residual_nlm_mode in ('recursive_fast', 'hybrid_fast_full', 'output_delta')
+    if config.residual_nlm_mode not in (
+        'recursive_fast', 'hybrid_fast_full', 'output_delta',
+    ):
+        return False
+    return config.residual_compute_mode in (
+        'nlm_recursive', 'tick_controller', 'speed_cells',
     )
 
 
@@ -18,7 +22,24 @@ def apply_recursive_nlm(trace_module, state_trace, cache, config: CTMLLMConfig, 
 
     mem_len = state_trace.size(-1)
     refresh = max(1, int(config.residual_full_refresh_interval))
-    force_full = cache is None or (tick_idx + 1) % refresh == 0
+    if tick_controller_enabled(config):
+        tick_exec_mode = getattr(config, '_tick_exec_mode', 'full')
+        if tick_exec_mode == 'stop' and cache is not None:
+            carried = cache['activated'].to(dtype=state_trace.dtype, device=state_trace.device)
+            slot_delta = state_trace[..., -1] - cache['trace'][..., -1].to(state_trace.dtype)
+            activated = carried + slot_delta
+            new_cache = {
+                'activated': activated.detach(),
+                'trace': state_trace.detach(),
+            }
+            return activated, new_cache, 1.0
+        force_full = (
+            tick_exec_mode == 'full'
+            or cache is None
+            or (tick_idx + 1) % refresh == 0
+        )
+    else:
+        force_full = cache is None or (tick_idx + 1) % refresh == 0
 
     if force_full:
         activated = trace_module(state_trace)

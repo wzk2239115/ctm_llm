@@ -15,6 +15,8 @@ from model.base_causal_lm import BaseCTMForCausalLM
 from model.residual_compute import compute_residual_metrics, residual_enabled
 from model.residual_compute import block_skip_enabled, run_grouped_block_delta_synapse
 from model.speed_spectrum import SpeedSpectrumDistiller
+from model.tick_controller import tick_controller_enabled, resolve_tick_exec_mode
+from model.objective_elf import ObjectiveDenoiseHead, compute_objective_loss, objective_enabled
 
 
 class DINOProjectionHead(nn.Module):
@@ -52,6 +54,7 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         self.cell_sparsity_rescale = bool(config.cell_sparsity_rescale)
         self.moe_aux_loss = None
         self.last_executed_ticks = 0
+        self.last_controller_stop_ratio = 0.0
 
         self._init_moe_params(config)
         self._init_diff_cell_params(config)
@@ -553,67 +556,82 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
             and self.config.tick_halt_mode != 'none'
         )
 
+        prev_tick_confidence = None
+        controller_stop_count = 0
+        controller_tick_count = 0
+        state = None
+
         for tick in range(num_iters):
-            sync_a, alpha_a, beta_a = self._compute_synch(
-                activated, alpha_a, beta_a, r_a, self.action_left, self.action_right)
+            tick_exec_mode = 'full'
+            if tick_controller_enabled(self.config):
+                tick_exec_mode = resolve_tick_exec_mode(
+                    self.config, tick, num_iters, prev_tick_confidence)
+                controller_tick_count += 1
+            self.config._tick_exec_mode = tick_exec_mode
 
-            q = self.q_proj(sync_a)
-            q_mh = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
-            k_mh = k.view(B, S, self.heads, self.head_dim).transpose(1, 2)
-            v_mh = v.view(B, S, self.heads, self.head_dim).transpose(1, 2)
-
-            if T > 1 and past_kv is None:
-                attn_out = F.scaled_dot_product_attention(
-                    q_mh, k_mh, v_mh, is_causal=True, attn_mask=None)
+            if tick_exec_mode == 'stop':
+                controller_stop_count += 1
             else:
-                attn_out = F.scaled_dot_product_attention(
-                    q_mh, k_mh, v_mh)
+                sync_a, alpha_a, beta_a = self._compute_synch(
+                    activated, alpha_a, beta_a, r_a, self.action_left, self.action_right)
 
-            context_extra, egram_state = self._context_reading(
-                q, k, v, sync_a, activated, egram_state)
-            attn = self.attn_drop(
-                self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1) + context_extra))
+                q = self.q_proj(sync_a)
+                q_mh = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+                k_mh = k.view(B, S, self.heads, self.head_dim).transpose(1, 2)
+                v_mh = v.view(B, S, self.heads, self.head_dim).transpose(1, 2)
 
-            if self._use_group_sparse_backend():
-                activated, state_trace = self._run_group_sparse_regional_tick(
-                    attn, activated, state_trace, prev_sync_o_activated, tick_idx=tick)
-                state = activated
-            else:
-                pre_syn_parts = [attn, activated]
-                if self.self_cond:
-                    if prev_sync_o_activated is not None:
-                        pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
-                    else:
-                        pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
-                pre_syn = torch.cat(pre_syn_parts, dim=-1)
-                cache = getattr(self, '_residual_synapse_cache', {})
-                if block_skip_enabled(self.config):
-                    state, cache, skip_ratio = run_grouped_block_delta_synapse(
-                        pre_syn,
-                        self.synapses,
-                        cache,
-                        self.config,
-                        tick,
-                        f'layer{self.layer_id}:dense',
-                    )
-                    self._residual_synapse_cache = cache
-                    self._accumulate_residual_skip(skip_ratio)
+                if T > 1 and past_kv is None:
+                    attn_out = F.scaled_dot_product_attention(
+                        q_mh, k_mh, v_mh, is_causal=True, attn_mask=None)
                 else:
-                    state = self.synapses(pre_syn)
+                    attn_out = F.scaled_dot_product_attention(
+                        q_mh, k_mh, v_mh)
 
-                state_trace = torch.cat(
-                    [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
+                context_extra, egram_state = self._context_reading(
+                    q, k, v, sync_a, activated, egram_state)
+                attn = self.attn_drop(
+                    self.o_proj(attn_out.transpose(1, 2).reshape(B, T, -1) + context_extra))
 
-                activated = self._apply_trace_nlm(
-                    self.trace_processor,
-                    state_trace,
-                    tick,
-                    cache_key=f'layer{self.layer_id}:dense',
-                )
-            if self.ttt_layer is not None:
-                activated = activated + self.ttt_layer(activated)
-            if not self._use_group_sparse_backend():
-                activated = self._apply_cell_sparsity(activated)
+                if self._use_group_sparse_backend():
+                    activated, state_trace = self._run_group_sparse_regional_tick(
+                        attn, activated, state_trace, prev_sync_o_activated, tick_idx=tick)
+                    state = activated
+                else:
+                    pre_syn_parts = [attn, activated]
+                    if self.self_cond:
+                        if prev_sync_o_activated is not None:
+                            pre_syn_parts.append(self.self_cond_proj(prev_sync_o_activated))
+                        else:
+                            pre_syn_parts.append(torch.zeros(B, T, self.d_model, device=device))
+                    pre_syn = torch.cat(pre_syn_parts, dim=-1)
+                    cache = getattr(self, '_residual_synapse_cache', {})
+                    if block_skip_enabled(self.config, tick_exec_mode):
+                        state, cache, skip_ratio = run_grouped_block_delta_synapse(
+                            pre_syn,
+                            self.synapses,
+                            cache,
+                            self.config,
+                            tick,
+                            f'layer{self.layer_id}:dense',
+                        )
+                        self._residual_synapse_cache = cache
+                        self._accumulate_residual_skip(skip_ratio)
+                    else:
+                        state = self.synapses(pre_syn)
+
+                    state_trace = torch.cat(
+                        [state_trace[:, :, :, 1:], state.unsqueeze(-1)], dim=-1)
+
+                    activated = self._apply_trace_nlm(
+                        self.trace_processor,
+                        state_trace,
+                        tick,
+                        cache_key=f'layer{self.layer_id}:dense',
+                    )
+                if self.ttt_layer is not None:
+                    activated = activated + self.ttt_layer(activated)
+                if not self._use_group_sparse_backend():
+                    activated = self._apply_cell_sparsity(activated)
 
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
@@ -627,7 +645,12 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
                 _, slot_logits = self.draft_slot_head(tick_out, lm_head=draft_lm_head)
                 all_draft_slot_logits.append(slot_logits)
 
-            if track:
+            if tick_controller_enabled(self.config) and halt_lm_head is not None:
+                with torch.no_grad():
+                    prev_tick_confidence = BaseCTMForCausalLM._halt_confidence_mean(
+                        halt_lm_head(tick_out.detach()))
+
+            if track and tick_exec_mode != 'stop' and state is not None:
                 tracking['pre_activations'].append(state[0].detach().cpu().numpy())
                 tracking['post_activations'].append(activated[0].detach().cpu().numpy())
                 tracking['sync_action'].append(sync_a[0].detach().cpu().numpy())
@@ -639,6 +662,11 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
                     if BaseCTMForCausalLM._halt_confidence_mean(logits) >= float(
                             self.config.tick_halt_threshold):
                         break
+
+        if controller_tick_count > 0:
+            self.last_controller_stop_ratio = controller_stop_count / controller_tick_count
+        else:
+            self.last_controller_stop_ratio = 0.0
 
         ctm_out = all_tick_outs[-1] if all_tick_outs is not None else \
             self.output_proj(last_sync_o)
@@ -812,6 +840,11 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         self.last_residual_delta_l1 = 0.0
         self.last_residual_skip_ratio = 0.0
         self.last_nlm_fast_ratio = 0.0
+        self.last_objective_ce = 0.0
+        self.last_objective_denoise = 0.0
+        self.objective_denoise_head = None
+        if objective_enabled(config):
+            self.objective_denoise_head = ObjectiveDenoiseHead(config.hidden_size)
         if self.speed_enabled:
             self.speed_spectrum = SpeedSpectrumDistiller(
                 config, self.model, config.hidden_size, DINOProjectionHead)
@@ -1136,6 +1169,24 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         moe_aux_loss = self._moe_aux_loss()
         if moe_aux_loss is not None:
             loss = loss + moe_aux_loss
+
+        if self.objective_denoise_head is not None:
+            obj_loss, obj_metrics = compute_objective_loss(
+                config=self.config,
+                input_ids=input_ids,
+                labels=labels,
+                hidden=h,
+                lm_head=self.lm_head,
+                denoise_head=self.objective_denoise_head,
+                embed_tokens=self.model.embed_tokens,
+                base_ce_loss_fn=self._lm_loss_from_logits,
+            )
+            loss = loss + obj_loss
+            self.last_objective_ce = obj_metrics['objective_ce']
+            self.last_objective_denoise = obj_metrics['objective_denoise']
+        else:
+            self.last_objective_ce = 0.0
+            self.last_objective_denoise = 0.0
 
         return loss, losses, certainties
 

@@ -636,7 +636,7 @@ if __name__ == '__main__':
     parser.add_argument('--speed_warmup_steps', type=int, default=500)
     parser.add_argument('--residual_compute_mode', type=str, default='none',
                         choices=['none', 'observe', 'gate', 'skip', 'block_skip',
-                                 'nlm_recursive', 'tick_controller'])
+                                 'nlm_recursive', 'tick_controller', 'speed_cells'])
     parser.add_argument('--residual_synapse_mode', type=str, default='dense_delta',
                         choices=['dense_delta', 'sparse_delta', 'full', 'block_delta_skip'])
     parser.add_argument('--residual_nlm_mode', type=str, default='full',
@@ -653,10 +653,21 @@ if __name__ == '__main__':
     parser.add_argument('--residual_compute_weight', type=float, default=0.0)
     parser.add_argument('--residual_delta_l1_weight', type=float, default=0.0)
     parser.add_argument('--residual_tick_controller', type=str, default='none',
-                        choices=['none', 'full', 'residual', 'stop'])
+                        choices=['none', 'threshold', 'learned'])
     parser.add_argument('--residual_speed_cells', type=str, default='none',
-                        choices=['none', 'ema_spectrum', 'bands'])
+                        choices=['none', 'fast_mid_slow', 'event_teacher'])
     parser.add_argument('--residual_track_deltas', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--objective_mode', type=str, default='none',
+                        choices=['none', 'causal_ce', 'latent_denoise', 'hybrid_flow_ce'])
+    parser.add_argument('--objective_denoise_weight', type=float, default=0.0)
+    parser.add_argument('--objective_ce_weight', type=float, default=1.0)
+    parser.add_argument('--objective_latent_space', type=str, default='token_embed',
+                        choices=['token_embed', 'ctm_hidden', 'frozen_encoder'])
+    parser.add_argument('--objective_time_schedule', type=str, default='logit_normal',
+                        choices=['uniform', 'logit_normal'])
+    parser.add_argument('--objective_self_cond_prob', type=float, default=0.0)
+    parser.add_argument('--objective_decoder_noise_scale', type=float, default=1.0)
+    parser.add_argument('--objective_cond_drop_prob', type=float, default=0.0)
     parser.add_argument('--max_seq_len', type=int, default=512)
     parser.add_argument('--data_path', type=str,
                         default='dataset_data/sft_t2a_mini.parquet')
@@ -823,6 +834,14 @@ if __name__ == '__main__':
         residual_tick_controller=args.residual_tick_controller,
         residual_speed_cells=args.residual_speed_cells,
         residual_track_deltas=args.residual_track_deltas,
+        objective_mode=args.objective_mode,
+        objective_denoise_weight=args.objective_denoise_weight,
+        objective_ce_weight=args.objective_ce_weight,
+        objective_latent_space=args.objective_latent_space,
+        objective_time_schedule=args.objective_time_schedule,
+        objective_self_cond_prob=args.objective_self_cond_prob,
+        objective_decoder_noise_scale=args.objective_decoder_noise_scale,
+        objective_cond_drop_prob=args.objective_cond_drop_prob,
     )
     if rank == 0:
         if args.moe_dispatch_mode in ('block_sparse', 'capacity_drop'):
