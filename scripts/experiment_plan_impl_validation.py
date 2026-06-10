@@ -2572,14 +2572,9 @@ def export_final_plan(args):
 
 
 def summarize(args):
-    stage_prefix = getattr(args, "stage", "all")
     rows = [
         row for row in latest_rows(args.metrics_dir)
         if _ctx.is_final_metrics_row(row)
-        and (
-            stage_prefix == "all"
-            or row.get("experiment_name", "").startswith(f"{stage_prefix}_")
-        )
     ]
     for row in rows:
         loss = parse_float(row, "loss")
@@ -2778,9 +2773,6 @@ def parse_args():
     p.set_defaults(func=run_only)
 
     p = sub.add_parser("summarize")
-    p.add_argument("--stage", default="all",
-                   choices=list(_ctx.stages) + ["all"],
-                   help="Export only experiments matching this stage prefix (e.g. dr01); 'all' for no filter.")
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--output", default=None)
     p.set_defaults(func=_ctx.summarize_fn)

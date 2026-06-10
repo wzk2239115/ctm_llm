@@ -3,8 +3,8 @@
 This folder records the first full 71-experiment CTM-LLM sweep, the follow-up
 49-experiment sparsity sweep, the 32-experiment MoE sparsity sweep, the
 82-experiment regional multi-pass MoE sweep, the 73-experiment
-implementation-validation sweep, and the 225-base-experiment overnight sparse
-CTM quick-probe sweep.
+implementation-validation sweep, the 225-base-experiment overnight sparse
+CTM quick-probe sweep, and the draft-revise experiment sweep.
 
 Source summary: `summary.csv` exported from `runs/metrics`.
 Sparsity source summary: `sparsity_summary.csv` exported from `runs/metrics`.
@@ -13,6 +13,7 @@ Regional MoE source summary: `regional_moe_summary.csv` exported from `runs/metr
 Implementation-validation source summary: `impl_validation_73_summary.csv` exported from `runs/metrics`.
 Overnight sparse CTM quick-probe report: `overnight_sparse_ctm_quick_probe_report.csv`.
 Overnight sparse CTM source summary: `overnight_sparse_ctm_summary.csv` exported from `runs/metrics` (currently header-only, no final rows).
+Draft-revise source summaries: `csv_data/draft_revise_{dr00,dr01,dr03,dr06-dr12}_summary.csv` exported from `runs/metrics`.
 
 Filtering rule:
 - Keep only formal experiment names matching each sweep prefix: `s00_` to `s05_`, `sp00_` to `sp05_`, `moe00_` to `moe07_`, `rg00_` to `rg11_`, and `iv00_` to `iv08_`.
@@ -146,7 +147,9 @@ Overnight sparse CTM quick-probe count:
    210 of 225 base experiments had a runnable probe. Fast/reflex, low-active compute, MTP/ELF, and differentiated-cell probes fit well; long-tick, long-memory, recruitment, and fast/slow output families need smaller batches and separate profiling.
 
 15. The formal overnight sparse CTM summary is a partial survivor export, not the full 225-run matrix.
-   `csv_data/overnight_sparse_ctm_summary.csv` contains 33 completed runs (26 finite loss); 192 planned runs OOM'd on 2-GPU lanes. See `overnight_sparse_ctm_summary.md` for analysis of the passing experiments only.
+    `csv_data/overnight_sparse_ctm_summary.csv` contains 33 completed runs (26 finite loss); 192 planned runs OOM'd on 2-GPU lanes. See `overnight_sparse_ctm_summary.md` for analysis of the passing experiments only.
+
+16. The draft-revise sweep found one working mechanism: corruption-based draft-revise training achieves loss 4.616 (14.5% improvement over regional anchor 5.401), but at 3.4x throughput cost. All efficiency mechanisms (residual compute, block skipping, recursive NLM, tick controllers) failed. See `draft_revise.md` for full analysis.
 
 ## Recommended Next Direction
 
@@ -182,3 +185,4 @@ Use `s05_synapse2_mh2` as the next CTM base. Then run smaller, more targeted swe
 - `impl_validation_73.md`
 - `overnight_sparse_ctm_quick_probe.md`
 - `overnight_sparse_ctm_summary.md`
+- `draft_revise.md`
