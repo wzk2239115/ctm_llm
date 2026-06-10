@@ -523,8 +523,13 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         with torch.no_grad():
             self.decay_action.clamp_(0, 15)
             self.decay_out.clamp_(0, 15)
-        r_a = torch.exp(-self.decay_action).view(1, 1, -1).expand(B, T, -1)
-        r_o = torch.exp(-self.decay_out).view(1, 1, -1).expand(B, T, -1)
+        r_a_base = torch.exp(-self.decay_action).view(1, 1, -1)
+        r_o_base = torch.exp(-self.decay_out).view(1, 1, -1)
+        r_a = r_a_base.expand(B, T, -1)
+        r_o = r_o_base.expand(B, T, -1)
+        decay_schedule = self.config.tick_sync_decay_schedule
+        decay_start = float(self.config.tick_sync_decay_start)
+        decay_end = float(self.config.tick_sync_decay_end)
 
         alpha_a = beta_a = None
         _, alpha_o, beta_o = self._compute_synch(
@@ -549,12 +554,17 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         last_sync_o = None
         self.last_executed_ticks = 0
         egram_state = None
+        train_halt_active = (
+            self.training
+            and halt_lm_head is not None
+            and self.config.tick_halt_train_mode != 'none'
+        )
         allow_halt_break = (
             enable_tick_halt
             and not self.training
             and halt_lm_head is not None
             and self.config.tick_halt_mode != 'none'
-        )
+        ) or train_halt_active
 
         prev_tick_confidence = None
         controller_stop_count = 0
@@ -562,6 +572,11 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         state = None
 
         for tick in range(num_iters):
+            if decay_schedule != "none" and num_iters > 1:
+                t_ratio = tick / (num_iters - 1)
+                tick_decay_offset = decay_start * (1 - t_ratio) + decay_end * t_ratio
+                r_a = torch.exp(-self.decay_action + tick_decay_offset).view(1, 1, -1).expand(B, T, -1)
+                r_o = torch.exp(-self.decay_out + tick_decay_offset).view(1, 1, -1).expand(B, T, -1)
             tick_exec_mode = 'full'
             if tick_controller_enabled(self.config):
                 tick_exec_mode = resolve_tick_exec_mode(
@@ -659,8 +674,8 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
             if allow_halt_break and tick + 1 < num_iters:
                 with torch.no_grad():
                     logits = halt_lm_head(tick_out.detach())
-                    if BaseCTMForCausalLM._halt_confidence_mean(logits) >= float(
-                            self.config.tick_halt_threshold):
+                    threshold = float(self.config.tick_halt_train_threshold) if train_halt_active else float(self.config.tick_halt_threshold)
+                    if BaseCTMForCausalLM._halt_confidence_mean(logits) >= threshold:
                         break
 
         if controller_tick_count > 0:
@@ -842,6 +857,17 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         self.last_nlm_fast_ratio = 0.0
         self.last_objective_ce = 0.0
         self.last_objective_denoise = 0.0
+        self.last_tick_diversity_loss = 0.0
+        self.last_halt_expected_tick = 0.0
+        self.last_tick_sync_distill_loss = 0.0
+        self.last_tick_sync_dino_loss = 0.0
+        self._sync_dino_step_counter = 0
+        self._cached_sync_dino_teacher_probs = None
+        self._cached_sync_dino_token_mask = None
+        self.register_buffer(
+            'sync_dino_center',
+            torch.zeros(1, 1, 1), persistent=False,
+        )
         self.objective_denoise_head = None
         if objective_enabled(config):
             self.objective_denoise_head = ObjectiveDenoiseHead(config.hidden_size)
@@ -1025,6 +1051,49 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         per_token_loss = -(teacher_probs.detach() * student_log_probs).sum(dim=-1)
         return per_token_loss[token_mask].mean()
 
+    def _tick_sync_dino_loss(self, input_ids, labels, tick_outs, num_iters):
+        if not self.dino_enabled:
+            return tick_outs.new_zeros(())
+        token_mask = self._dino_token_mask(input_ids, labels)
+        if not token_mask.any():
+            return tick_outs.new_zeros(())
+        student_temp = max(float(self.config.dino_student_temperature), 1e-4)
+        teacher_temp = max(float(self.config.dino_teacher_temperature), 1e-4)
+        center_momentum = float(self.config.dino_center_momentum)
+        teacher_freq = max(1, int(self.config.dino_teacher_update_freq))
+        self._sync_dino_step_counter += 1
+        if self._sync_dino_step_counter % teacher_freq == 1 or self._cached_sync_dino_teacher_probs is None:
+            with torch.no_grad():
+                self.dino_teacher_model.eval()
+                self.dino_teacher_head.eval()
+                teacher_result = self.dino_teacher_model(
+                    input_ids, use_cache=False, track=False,
+                    num_iters=num_iters, return_all_ticks=True,
+                )
+                teacher_tick_outs = teacher_result.tick_outputs
+                teacher_tick_mean = teacher_tick_outs.mean(dim=-1)
+                teacher_logits = self.dino_teacher_head(teacher_tick_mean.float())
+                batch_center = teacher_logits[token_mask].mean(dim=0, keepdim=True).view(1, 1, -1)
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(batch_center)
+                    batch_center = batch_center / dist.get_world_size()
+                self.sync_dino_center = self.sync_dino_center.to(
+                    batch_center.device, dtype=batch_center.dtype)
+                self.sync_dino_center.mul_(center_momentum).add_(
+                    batch_center, alpha=1.0 - center_momentum)
+                teacher_probs = F.softmax(
+                    (teacher_logits - self.sync_dino_center.to(teacher_logits.device)) / teacher_temp,
+                    dim=-1,
+                )
+                self._cached_sync_dino_teacher_probs = teacher_probs.detach()
+                self._cached_sync_dino_token_mask = token_mask
+        student_tick_mean = tick_outs.mean(dim=-1)
+        student_logits = self.dino_student_head(student_tick_mean.float())
+        teacher_probs = self._cached_sync_dino_teacher_probs
+        student_log_probs = F.log_softmax(student_logits / student_temp, dim=-1)
+        per_token_loss = -(teacher_probs.detach() * student_log_probs).sum(dim=-1)
+        return per_token_loss[token_mask].mean()
+
     def forward(self, input_ids, past_key_values=None, use_cache=False, labels=None,
                 num_iters=None):
         enable_halt = self.config.tick_halt_mode != 'none' and not self.training
@@ -1112,10 +1181,27 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         certainties = torch.stack(certainties, dim=1)
 
         tick_loss = self._combine_tick_losses(losses, certainties)
+        if self.config.tick_halt_train_mode != 'none':
+            halt_loss, halt_expected_tick = self._halt_train_weighted_loss(
+                losses, certainties, num_iters or self.config.iterations)
+            if halt_loss is not None:
+                self.last_halt_expected_tick = float(halt_expected_tick.detach().item())
+                tick_loss = halt_loss
+            else:
+                self.last_halt_expected_tick = 0.0
+        else:
+            self.last_halt_expected_tick = 0.0
         if self.config.tick_improve_weight > 0 and num_ticks > 1:
             margin = float(self.config.tick_improve_margin)
             improve_loss = F.relu(next_losses[:, 1:] - next_losses[:, :-1] + margin).mean()
             tick_loss = tick_loss + self.config.tick_improve_weight * improve_loss
+        div_weight = float(self.config.tick_diversity_weight)
+        if div_weight > 0:
+            div_loss = self._tick_diversity_loss(tick_outs, labels)
+            self.last_tick_diversity_loss = float(div_loss.detach().item())
+            tick_loss = tick_loss + div_weight * div_loss
+        else:
+            self.last_tick_diversity_loss = 0.0
         slow_weight = float(self.config.slow_output_weight)
         base_w = float(self.config.tick_loss_base_weight)
         loss = (base_w + slow_weight) * final_loss + base_w * tick_loss
@@ -1187,6 +1273,20 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         else:
             self.last_objective_ce = 0.0
             self.last_objective_denoise = 0.0
+        sync_distill_weight = float(self.config.tick_sync_distill_weight)
+        if sync_distill_weight > 0:
+            sdl = self._tick_sync_distill_loss(tick_outs, labels)
+            self.last_tick_sync_distill_loss = float(sdl.detach().item())
+            loss = loss + sync_distill_weight * sdl
+        else:
+            self.last_tick_sync_distill_loss = 0.0
+        sync_dino_weight = float(self.config.tick_sync_dino_weight)
+        if sync_dino_weight > 0 and self.config.tick_sync_dino_mode != "none":
+            sdino = self._tick_sync_dino_loss(input_ids, labels, tick_outs, num_iters)
+            self.last_tick_sync_dino_loss = float(sdino.detach().item())
+            loss = loss + sync_dino_weight * sdino
+        else:
+            self.last_tick_sync_dino_loss = 0.0
 
         return loss, losses, certainties
 

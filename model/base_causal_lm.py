@@ -212,6 +212,82 @@ class BaseCTMForCausalLM(nn.Module):
             tick_loss = tick_loss + self.config.tick_compute_weight * compute_penalty
         return tick_loss, weights
 
+    def _tick_diversity_loss(self, tick_outs, labels):
+        mode = self.config.tick_diversity_mode
+        if mode == 'none':
+            return torch.tensor(0.0, device=tick_outs.device)
+        num_ticks = tick_outs.size(-1)
+        if num_ticks < 2:
+            return torch.tensor(0.0, device=tick_outs.device)
+        temperature = max(float(self.config.tick_diversity_temperature), 1e-4)
+        gap = max(1, int(self.config.tick_diversity_horizon_gap))
+        total_div_loss = torch.tensor(0.0, device=tick_outs.device)
+        count = 0
+        for t in range(0, num_ticks - gap, gap):
+            t2 = min(t + gap, num_ticks - 1)
+            if t2 <= t:
+                continue
+            logits_t = self.lm_head(tick_outs[..., t]).detach()
+            logits_t2 = self.lm_head(tick_outs[..., t2])
+            shift_labels = labels[..., 1:].contiguous()
+            p_t = F.softmax(logits_t[..., :-1, :] / temperature, dim=-1)
+            p_t2 = F.softmax(logits_t2[..., :-1, :] / temperature, dim=-1)
+            kl = F.kl_div(p_t2.log(), p_t, reduction='none').sum(-1)
+            mask = (shift_labels != -100).float()
+            total_div_loss = total_div_loss + (kl * mask).sum() / mask.sum().clamp(min=1)
+            count += 1
+        if count == 0:
+            return torch.tensor(0.0, device=tick_outs.device)
+        return total_div_loss / count
+
+    def _halt_train_weighted_loss(self, losses, certainties, num_iters):
+        mode = self.config.tick_halt_train_mode
+        if mode == 'none':
+            return None, None
+        confidence = 1 - certainties
+        threshold = float(self.config.tick_halt_train_threshold)
+        hit = confidence >= threshold
+        any_hit = hit.any(dim=1)
+        first_hit = hit.float().argmax(dim=1)
+        last_tick = torch.full_like(first_hit, losses.size(1) - 1)
+        selected = torch.where(any_hit, first_hit, last_tick)
+        weights = F.one_hot(selected, num_classes=losses.size(1)).type_as(losses)
+        tick_loss = (losses * weights).sum(dim=1).mean()
+        expected_tick = weights.float() * torch.arange(
+            1, losses.size(1) + 1, device=losses.device, dtype=losses.dtype).unsqueeze(0)
+        expected_tick_val = expected_tick.sum(dim=1).mean()
+        conf_weight = float(self.config.tick_halt_train_confidence_weight)
+        if conf_weight > 0:
+            conf_penalty = expected_tick_val / losses.size(1)
+            tick_loss = tick_loss + conf_weight * conf_penalty
+        early_weight = float(self.config.tick_halt_train_early_loss_weight)
+        early_bonus = None
+        if early_weight > 0:
+            for t in range(min(3, losses.size(1))):
+                mask_t = F.one_hot(torch.full((losses.size(0),), t, device=losses.device,
+                                              dtype=torch.long), num_classes=losses.size(1)).type_as(losses)
+                early_loss = (losses * mask_t).sum(dim=1).mean()
+                tick_loss = tick_loss + early_weight * early_loss
+            early_bonus = tick_loss
+        return tick_loss, expected_tick_val
+
+    def _tick_sync_distill_loss(self, tick_outs, labels):
+        num_ticks = tick_outs.size(-1)
+        if num_ticks < 2:
+            return tick_outs.new_zeros(())
+        temp = max(float(self.config.tick_sync_distill_temperature), 1e-4)
+        teacher_logits = self.lm_head(tick_outs[..., -1].detach())
+        shift_labels = labels[..., 1:].contiguous()
+        teacher_probs = F.softmax(teacher_logits[..., :-1, :] / temp, dim=-1)
+        losses = []
+        for t in range(num_ticks - 1):
+            student_logits = self.lm_head(tick_outs[..., t])
+            student_log_probs = F.log_softmax(student_logits[..., :-1, :] / temp, dim=-1)
+            per_token = -(teacher_probs * student_log_probs).sum(dim=-1)
+            mask = (shift_labels != -100).float()
+            losses.append((per_token * mask).sum() / mask.sum().clamp(min=1))
+        return torch.stack(losses).mean()
+
     @torch.inference_mode()
     def forward_track(self, input_ids, num_iters=None):
         result = self.model(input_ids, track=True, num_iters=num_iters,

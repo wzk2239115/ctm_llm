@@ -170,6 +170,22 @@ def current_speed_loss(model):
     return float(getattr(model, 'last_speed_loss', 0.0))
 
 
+def current_tick_diversity_loss(model):
+    return float(getattr(model, 'last_tick_diversity_loss', 0.0))
+
+
+def current_halt_expected_tick(model):
+    return float(getattr(model, 'last_halt_expected_tick', 0.0))
+
+
+def current_sync_distill_loss(model):
+    return float(getattr(model, 'last_tick_sync_distill_loss', 0.0))
+
+
+def current_sync_dino_loss(model):
+    return float(getattr(model, 'last_tick_sync_dino_loss', 0.0))
+
+
 def current_residual_delta_l1(model):
     return float(getattr(model, 'last_residual_delta_l1', 0.0))
 
@@ -274,13 +290,19 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
             moe_aux_loss = current_moe_aux_loss(raw_model)
             dino_loss = current_dino_loss(raw_model)
             speed_loss = current_speed_loss(raw_model)
+            tick_diversity_loss = current_tick_diversity_loss(raw_model)
+            halt_expected_tick = current_halt_expected_tick(raw_model)
+            sync_distill_loss = current_sync_distill_loss(raw_model)
+            sync_dino_loss = current_sync_dino_loss(raw_model)
             residual_delta_l1 = current_residual_delta_l1(raw_model)
             residual_skip_ratio = current_residual_skip_ratio(raw_model)
             nlm_fast_ratio = current_nlm_fast_ratio(raw_model)
 
             Logger(
                 f'Epoch[{epoch + 1}/{args.epochs}]({step}/{iters}) | '
-                f'loss:{avg_loss:.4f} dino:{dino_loss:.4f} speed:{speed_loss:.4f} lr:{lr:.2e} | '
+                f'loss:{avg_loss:.4f} dino:{dino_loss:.4f} speed:{speed_loss:.4f} '
+                f'div:{tick_diversity_loss:.4f} halt_et:{halt_expected_tick:.1f} '
+                f'sdl:{sync_distill_loss:.4f} sdino:{sync_dino_loss:.4f} lr:{lr:.2e} | '
                 f'best_tick:{best_tick_mean:.1f} conf_tick:{conf_tick_mean:.1f} | '
                 f'eff_tick:{effective_tick_mean:.1f} exec_tick:{executed_ticks_last_layer} | '
                 f'tok/s:{tokens_per_sec:.0f} mem:{peak_mem_mb:.0f}MB | '
@@ -299,6 +321,10 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                 'moe_aux_loss': moe_aux_loss,
                 'dino_loss': dino_loss,
                 'speed_loss': speed_loss,
+                'tick_diversity_loss': tick_diversity_loss,
+                'halt_expected_tick': halt_expected_tick,
+                'tick_sync_distill_loss': sync_distill_loss,
+                'tick_sync_dino_loss': sync_dino_loss,
                 'residual_delta_l1': residual_delta_l1,
                 'residual_skip_ratio': residual_skip_ratio,
                 'nlm_fast_ratio': nlm_fast_ratio,
@@ -332,6 +358,10 @@ def train_epoch(epoch, loader, iters, model, optimizer, scaler, autocast_ctx, ar
                     'moe_aux_loss': moe_aux_loss,
                     'dino_loss': dino_loss,
                     'speed_loss': speed_loss,
+                    'tick_diversity_loss': tick_diversity_loss,
+                    'halt_expected_tick': halt_expected_tick,
+                    'tick_sync_distill_loss': sync_distill_loss,
+                    'tick_sync_dino_loss': sync_dino_loss,
                     'residual_delta_l1': residual_delta_l1,
                     'residual_skip_ratio': residual_skip_ratio,
                     'nlm_fast_ratio': nlm_fast_ratio,
@@ -588,6 +618,25 @@ if __name__ == '__main__':
     parser.add_argument('--dino_pad_token_id', type=int, default=0)
     parser.add_argument('--dino_student_ticks', type=int, default=1)
     parser.add_argument('--dino_teacher_update_freq', type=int, default=4)
+    parser.add_argument('--tick_diversity_mode', type=str, default='none',
+                        choices=['none', 'kl'])
+    parser.add_argument('--tick_diversity_weight', type=float, default=0.0)
+    parser.add_argument('--tick_diversity_temperature', type=float, default=0.1)
+    parser.add_argument('--tick_diversity_horizon_gap', type=int, default=1)
+    parser.add_argument('--tick_halt_train_mode', type=str, default='none',
+                        choices=['none', 'threshold'])
+    parser.add_argument('--tick_halt_train_threshold', type=float, default=0.65)
+    parser.add_argument('--tick_halt_train_confidence_weight', type=float, default=0.0)
+    parser.add_argument('--tick_halt_train_early_loss_weight', type=float, default=0.0)
+    parser.add_argument('--tick_sync_distill_weight', type=float, default=0.0)
+    parser.add_argument('--tick_sync_distill_temperature', type=float, default=0.1)
+    parser.add_argument('--tick_sync_dino_mode', type=str, default='none',
+                        choices=['none', 'tick_center'])
+    parser.add_argument('--tick_sync_dino_weight', type=float, default=0.0)
+    parser.add_argument('--tick_sync_decay_schedule', type=str, default='none',
+                        choices=['none', 'linear'])
+    parser.add_argument('--tick_sync_decay_start', type=float, default=0.0)
+    parser.add_argument('--tick_sync_decay_end', type=float, default=0.0)
     parser.add_argument('--async_tick_mode', type=str, default='none',
                         choices=['none', 'banded'])
     parser.add_argument('--async_tick_periods', type=str, default='1,2,4,8')
@@ -842,6 +891,21 @@ if __name__ == '__main__':
         objective_self_cond_prob=args.objective_self_cond_prob,
         objective_decoder_noise_scale=args.objective_decoder_noise_scale,
         objective_cond_drop_prob=args.objective_cond_drop_prob,
+        tick_diversity_mode=args.tick_diversity_mode,
+        tick_diversity_weight=args.tick_diversity_weight,
+        tick_diversity_temperature=args.tick_diversity_temperature,
+        tick_diversity_horizon_gap=args.tick_diversity_horizon_gap,
+        tick_halt_train_mode=args.tick_halt_train_mode,
+        tick_halt_train_threshold=args.tick_halt_train_threshold,
+        tick_halt_train_confidence_weight=args.tick_halt_train_confidence_weight,
+        tick_halt_train_early_loss_weight=args.tick_halt_train_early_loss_weight,
+        tick_sync_distill_weight=args.tick_sync_distill_weight,
+        tick_sync_distill_temperature=args.tick_sync_distill_temperature,
+        tick_sync_dino_mode=args.tick_sync_dino_mode,
+        tick_sync_dino_weight=args.tick_sync_dino_weight,
+        tick_sync_decay_schedule=args.tick_sync_decay_schedule,
+        tick_sync_decay_start=args.tick_sync_decay_start,
+        tick_sync_decay_end=args.tick_sync_decay_end,
     )
     if rank == 0:
         if args.moe_dispatch_mode in ('block_sparse', 'capacity_drop'):

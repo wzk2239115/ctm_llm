@@ -152,6 +152,26 @@ class CTMLLMConfig:
         self.dino_student_ticks = kwargs.get('dino_student_ticks', 1)
         self.dino_teacher_update_freq = kwargs.get('dino_teacher_update_freq', 4)
 
+        self.tick_diversity_mode = kwargs.get('tick_diversity_mode', 'none')
+        self.tick_diversity_weight = kwargs.get('tick_diversity_weight', 0.0)
+        self.tick_diversity_temperature = kwargs.get('tick_diversity_temperature', 0.1)
+        self.tick_diversity_horizon_gap = kwargs.get('tick_diversity_horizon_gap', 1)
+
+        self.tick_halt_train_mode = kwargs.get('tick_halt_train_mode', 'none')
+        self.tick_halt_train_threshold = kwargs.get('tick_halt_train_threshold', 0.65)
+        self.tick_halt_train_confidence_weight = kwargs.get('tick_halt_train_confidence_weight', 0.0)
+        self.tick_halt_train_early_loss_weight = kwargs.get('tick_halt_train_early_loss_weight', 0.0)
+
+        self.tick_sync_distill_weight = kwargs.get('tick_sync_distill_weight', 0.0)
+        self.tick_sync_distill_temperature = kwargs.get('tick_sync_distill_temperature', 0.1)
+
+        self.tick_sync_dino_mode = kwargs.get('tick_sync_dino_mode', 'none')
+        self.tick_sync_dino_weight = kwargs.get('tick_sync_dino_weight', 0.0)
+
+        self.tick_sync_decay_schedule = kwargs.get('tick_sync_decay_schedule', 'none')
+        self.tick_sync_decay_start = kwargs.get('tick_sync_decay_start', 0.0)
+        self.tick_sync_decay_end = kwargs.get('tick_sync_decay_end', 0.0)
+
         assert self.d_model >= max(self.n_synch_out, self.n_synch_action), \
             f"d_model({self.d_model}) must >= n_synch_out({self.n_synch_out}) and n_synch_action({self.n_synch_action})"
         assert self.d_input % self.heads == 0, \
