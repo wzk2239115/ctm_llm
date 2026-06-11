@@ -298,7 +298,11 @@ if __name__=='__main__':
                         predictions, certainties, synchronisation = out
                         extras = {}
                 else:
-                    predictions, certainties, synchronisation = model(inputs, z)
+                    out = model(inputs, z)
+                    if isinstance(out[-1], dict):
+                        predictions, certainties, synchronisation = out[:-1]
+                    else:
+                        predictions, certainties, synchronisation = out
                     extras = {}
 
                 predictions_answer_steps = predictions[:, :, -args.q_num_answer_steps:]

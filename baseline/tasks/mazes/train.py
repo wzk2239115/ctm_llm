@@ -441,7 +441,11 @@ if __name__=='__main__':
                             draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
                             loss = loss + args.draft_revise_weight * draft_loss
                     else:
-                        predictions_raw, certainties, synchronisation = model(inputs)
+                        out = model(inputs)
+                        if isinstance(out[-1], dict):
+                            predictions_raw, certainties, synchronisation = out[:-1]
+                        else:
+                            predictions_raw, certainties, synchronisation = out
                         predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1))
                         loss, where_most_certain, upto_where = maze_loss(predictions, certainties, targets, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)
                     accuracy_finegrained = (predictions.argmax(2)[torch.arange(predictions.size(0), device=predictions.device), :, where_most_certain] == targets).float().mean().item()

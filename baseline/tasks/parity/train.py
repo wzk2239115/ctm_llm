@@ -290,7 +290,11 @@ if __name__=='__main__':
                         draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
                         loss = loss + args.draft_revise_weight * draft_loss
                 else:
-                    predictions, certainties, synchronisation = model(inputs)
+                    out = model(inputs)
+                    if isinstance(out[-1], dict):
+                        predictions, certainties, synchronisation = out[:-1]
+                    else:
+                        predictions, certainties, synchronisation = out
                     predictions = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
                     loss, where_most_certain = parity_loss(predictions, certainties, targets, use_most_certain=args.use_most_certain)
 
@@ -351,7 +355,11 @@ if __name__=='__main__':
                                 
                                 inputs = inputs.to(device)
                                 targets = targets.to(device)
-                                these_predictions, certainties, synchronisation = model(inputs)
+                                out = model(inputs)
+                                if isinstance(out[-1], dict):
+                                    these_predictions, certainties, synchronisation = out[:-1]
+                                else:
+                                    these_predictions, certainties, synchronisation = out
 
                                 these_predictions = reshape_predictions(these_predictions, prediction_reshaper)
                                 loss, where_most_certain = parity_loss(these_predictions, certainties, targets, use_most_certain=args.use_most_certain)
@@ -387,7 +395,11 @@ if __name__=='__main__':
                                 
                                 inputs = inputs.to(device)
                                 targets = targets.to(device)
-                                these_predictions, certainties, synchronisation = model(inputs)
+                                out = model(inputs)
+                                if isinstance(out[-1], dict):
+                                    these_predictions, certainties, synchronisation = out[:-1]
+                                else:
+                                    these_predictions, certainties, synchronisation = out
 
                                 these_predictions = these_predictions.reshape(these_predictions.size(0), -1, 2, these_predictions.size(-1))
                                 loss, where_most_certain = parity_loss(these_predictions, certainties, targets, use_most_certain=args.use_most_certain)

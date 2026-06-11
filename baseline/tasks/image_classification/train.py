@@ -477,7 +477,11 @@ if __name__=='__main__':
                             predictions, certainties, synchronisation = out
                             extras = {}
                     else:
-                        predictions, certainties, synchronisation = model(inputs)
+                        out = model(inputs)
+                        if isinstance(out[-1], dict):
+                            predictions, certainties, synchronisation = out[:-1]
+                        else:
+                            predictions, certainties, synchronisation = out
                         extras = {}
                     loss, where_most_certain = image_classification_loss(predictions, certainties, targets, use_most_certain=True)
                     # Multi-tick loss

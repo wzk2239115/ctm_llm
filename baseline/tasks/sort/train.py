@@ -381,7 +381,11 @@ if __name__=='__main__':
                         draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
                         loss = loss + args.draft_revise_weight * draft_loss
                 else:
-                    predictions, certainties, synchronisation = model(inputs)
+                    out = model(inputs)
+                    if isinstance(out[-1], dict):
+                        predictions, certainties, synchronisation = out[:-1]
+                    else:
+                        predictions, certainties, synchronisation = out
                     loss = sort_loss(predictions, targets)
             
                         
