@@ -345,7 +345,7 @@ if __name__=='__main__':
                     targets = targets.to(device)
                     z = torch.stack(z, 1).to(device)
                     pbar.set_description('Tracking: Processing test data')
-                    predictions, certainties, synchronisation, pre_activations, post_activations, attention_tracking, embedding_tracking = model(inputs, z, track=True)
+                    predictions, certainties, synchronisation, pre_activations, post_activations, attention_tracking, embedding_tracking, _ = model(inputs, z, track=True)
 
                     predictions = reshape_predictions(predictions, prediction_reshaper)
                     attention = reshape_attention_weights(attention_tracking)

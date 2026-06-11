@@ -315,7 +315,7 @@ if __name__=='__main__':
                     inputs, targets = next(iter(testloader))
                     inputs = inputs.to(device)
                     targets = targets.to(device)                                 
-                    predictions, certainties, synchronisation, pre_activations, post_activations, attention = model(inputs, track=True)
+                    predictions, certainties, synchronisation, pre_activations, post_activations, attention, _ = model(inputs, track=True)
 
                     predictions = reshape_predictions(predictions, prediction_reshaper)
                     attention = reshape_attention_weights(attention)

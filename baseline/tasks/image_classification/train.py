@@ -725,7 +725,7 @@ if __name__=='__main__':
                         targets_viz = targets_viz.to(device)
 
                         pbar.set_description('Tracking: Processing test data for viz')
-                        predictions_viz, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
+                        predictions_viz, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz, _ = model(inputs_viz, track=True)
 
                         att_shape = (model.kv_features.shape[2], model.kv_features.shape[3])
                         attention_tracking_viz = attention_tracking_viz.reshape(

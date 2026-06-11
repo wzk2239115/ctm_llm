@@ -716,7 +716,7 @@ if __name__=='__main__':
                             longest_index = (targets_viz!=4).sum(-1).argmax() # Action 4 assumed padding/end
 
                             # Track internal states
-                            predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
+                            predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz, _ = model(inputs_viz, track=True)
 
                             # Reshape predictions (assuming raw is B, D, T)
                             predictions_viz = predictions_viz_raw.reshape(predictions_viz_raw.size(0), -1, 5, predictions_viz_raw.size(-1)) # B, S, C, T

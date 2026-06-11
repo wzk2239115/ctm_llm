@@ -285,7 +285,7 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
             base = (predictions, certainties, synchronization_out,
                     np.array(pre_activations_tracking), np.array(post_activations_tracking),
                     np.array(attention_tracking), np.array(embedding_tracking))
-            return base + (extras,) if extras else base
+            return base + (extras,)
 
         if extras:
             return predictions, certainties, synchronization_out, extras

@@ -685,9 +685,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         if track:
             base = (predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)),
                     np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking))
-            if extras:
-                return base + (extras,)
-            return base
+            return base + (extras,)
 
         if extras:
             return predictions, certainties, synchronisation_out, extras

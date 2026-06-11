@@ -177,7 +177,7 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         if track:
             base = (predictions, certainties, np.array(synch_out_tracking),
                     np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking))
-            return base + (extras,) if extras else base
+            return base + (extras,)
 
         if extras:
             return predictions, certainties, synchronisation_out, extras
