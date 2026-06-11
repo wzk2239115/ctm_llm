@@ -48,6 +48,12 @@ METRICS_DIR = SCRIPTS / "runs" / "metrics"
 DEFAULT_CONFIG = "infra/envs/smoke_baseline.env"
 DEFAULT_MASTER_ADDR = "11.131.210.78"
 DEFAULT_PORT = 8765
+BASELINE_NODES = ("11.131.209.154", "11.131.210.3", "11.131.210.78", "11.131.211.9")
+_node_idx = [0]
+def _next_node():
+    n = BASELINE_NODES[_node_idx[0] % len(BASELINE_NODES)]
+    _node_idx[0] += 1
+    return n
 
 STAGES = (
     "bl00", "bl01", "bl02", "bl03", "bl04", "bl05", "bl06",
@@ -90,6 +96,7 @@ def exp(name, question, command, tags=None):
         "question": question,
         "command": command,
         "tags": tags or [],
+        "node_addr": _next_node(),
     }
 
 
@@ -1037,7 +1044,7 @@ def submit_to_pool(exp, config, master_addr=None, port=None):
     With smoke_baseline.env, TRAIN_ENTRY=scripts/run_via_pool.sh, which executes
     `python -m $TRAIN_ARGS`. So extra_args is the task module + flags.
     """
-    node_addrs = exp.get("node_addrs") or []
+    node_addrs = exp.get("node_addrs") or [exp.get("node_addr")]
     payload = {
         "config": config,
         "extra_args": exp["command"],
@@ -1097,24 +1104,62 @@ def wait_until_idle(master_addr, port, task_id, poll_interval=30.0):
 
 
 def run_submit(args):
-    """Submit experiments to the cluster pool, one at a time (sequential)."""
+    """Submit experiments to the cluster pool."""
     plan = build_plan(args.stage)
     if not plan:
         print("No experiments to submit.")
         return
     print(f"Submitting {len(plan)} experiments to pool at {args.master_addr}:{args.port}")
+
+    submitted = []
     for i, e in enumerate(plan):
         print(f"\n[{i+1}/{len(plan)}] {e['name']}")
         print(f"  {e['question']}")
         task = submit_to_pool(e, args.config, args.master_addr, args.port)
         if task and "task_id" in task:
             tid = task["task_id"]
-            print(f"  submitted as {tid}, waiting...")
-            wait_until_idle(args.master_addr, args.port, tid, args.poll_interval)
+            submitted.append((tid, e["name"]))
+            print(f"  submitted as {tid}")
+            if not getattr(args, "parallel", False):
+                print(f"  waiting...")
+                wait_until_idle(args.master_addr, args.port, tid, args.poll_interval)
         else:
             print(f"  WARNING: submit failed, skipping")
-            continue
-    print(f"\nAll {len(plan)} experiments submitted and completed.")
+
+    if not submitted:
+        return
+
+    if getattr(args, "parallel", False):
+        print(f"\nAll {len(submitted)} tasks submitted. Monitoring...")
+        final = {"completed", "failed", "cancelled"}
+        done = set()
+        while len(done) < len(submitted):
+            time.sleep(args.poll_interval)
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                resp = opener.open(f"http://{args.master_addr}:{args.port}/status", timeout=10)
+                status = json.loads(resp.read())
+                tasks = status.get("tasks", [])
+                for tid, name in submitted:
+                    if tid in done:
+                        continue
+                    for t in tasks:
+                        if t["task_id"] == tid and t["status"] in final:
+                            done.add(tid)
+                            rc = t.get("return_code", "?")
+                            print(f"  [{len(done)}/{len(submitted)}] {name} ({tid}) -> {t['status']} rc={rc}")
+                            if t["status"] == "failed":
+                                log_path = "runs/logs/pool_last_run.log"
+                                if os.path.isfile(log_path):
+                                    with open(log_path) as f:
+                                        for line in f:
+                                            print(f"    {line}", end="")
+                            break
+            except Exception:
+                pass
+        print(f"\nAll {len(submitted)} tasks finished.")
+    else:
+        print(f"\nAll {len(plan)} experiments submitted and completed.")
 
 
 def main():
@@ -1137,6 +1182,8 @@ def main():
     parser.add_argument("--master_addr", type=str, default=DEFAULT_MASTER_ADDR)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--poll_interval", type=float, default=30.0)
+    parser.add_argument("--parallel", action="store_true",
+                        help="Submit all tasks at once instead of waiting for each one.")
     args = parser.parse_args()
 
     plan = build_plan(args.stage, args.plan_size)
