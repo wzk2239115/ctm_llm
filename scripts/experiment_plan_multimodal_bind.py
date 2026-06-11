@@ -63,7 +63,7 @@ BIND_BASE_ARGS = {
     "max_seq_len": 196,
     "log_interval": 10,
     "save_interval": 200,
-    "max_steps": 500,
+    "max_steps": 1000,
     "dtype": "bfloat16",
     "temperature": 0.07,
     "image_size": 128,
