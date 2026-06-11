@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Smoke test for baseline CTM experiments.
-Verifies all 5 tasks + key ideas run for 1-2 iterations without crashing.
+Parallel smoke test across all GPUs.
 Usage: python scripts/smoke_baseline.py [--iterations 2]
 """
 import argparse
+import concurrent.futures
 import subprocess
 import sys
 import time
 
 ROOT = "/home/jovyan/h800fast/wangzekai/ctm_llm"
-DATA_ROOT = ROOT + "/dataset_data"  # symlink → minimind-o/dataset/
 
 TASKS = {
     "sort": ("baseline.tasks.sort.train", dict(
@@ -26,7 +25,7 @@ TASKS = {
         warmup_steps=1, use_scheduler=False,
         weight_decay=0.0, gradient_clipping=-1,
         track_every=100, save_every=1000,
-        reload=False, device=[0], log_dir="/tmp/smoke/sort",
+        reload=False, log_dir="/tmp/smoke/sort",
     )),
     "parity": ("baseline.tasks.parity.train", dict(
         seed=0, iterations=2, memory_length=5,
@@ -43,7 +42,7 @@ TASKS = {
         lr=1e-4, training_iterations=2,
         warmup_steps=1, track_every=100,
         save_every=1000, reload=False,
-        device=[0], use_amp=False,
+        use_amp=False,
         neuron_select_type="random", n_test_batches=1,
         log_dir="/tmp/smoke/parity",
     )),
@@ -64,7 +63,7 @@ TASKS = {
         use_scheduler=False,
         gradient_clipping=-1,
         track_every=100, save_every=1000,
-        reload=False, device=[0],
+        reload=False,
         n_test_batches=1,
         data_root="baseline/data/mazes",
         log_dir="/tmp/smoke/mazes",
@@ -83,8 +82,7 @@ TASKS = {
         weight_decay=0.0,
         save_every=100, track_every=100, n_test_batches=1,
         batch_size=16, batch_size_test=16,
-        lr=1e-4, device=[0], seed=1,
-        data_root="/home/jovyan/h800fast/wangzekai/minimind-o/dataset/",
+        lr=1e-4, seed=1,
         log_dir="/tmp/smoke/cifar10",
     )),
     "qamnist": ("baseline.tasks.qamnist.train", dict(
@@ -98,12 +96,12 @@ TASKS = {
         batch_size=4, batch_size_test=4,
         lr=1e-4, training_iterations=2,
         warmup_steps=1, track_every=100, save_every=1000,
-        reload=False, device=[0], use_amp=False,
+        reload=False, use_amp=False,
         neuron_select_type="random",
         data_root="baseline/data/",
         n_test_batches=1,
         log_dir="/tmp/smoke/qamnist",
-    )),
+    ))),
 }
 
 
@@ -123,133 +121,104 @@ def _cmd(module, cfg):
     return parts
 
 
-def run_test(name, cmd):
-    print(f"\n{'='*60}")
-    print(f"  SMOKE: {name}")
-    print(f"{'='*60}")
+def run_test(name, cmd, device):
+    env = dict(CUDA_VISIBLE_DEVICES=str(device))
     start = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env={**dict(__import__('os').environ), **env})
     elapsed = time.time() - start
-    if result.returncode == 0:
-        print(f"  ✅ PASS ({elapsed:.1f}s)")
-        return True
-    else:
-        print(f"  ❌ FAIL (rc={result.returncode}, {elapsed:.1f}s)")
-        for line in (result.stderr or "").split("\n")[-20:]:
-            if line.strip():
-                print(f"     {line}")
-        return False
+    ok = result.returncode == 0
+    tag = f"  {'✅' if ok else '❌'} {name} (GPU {device}, {elapsed:.1f}s)"
+    if not ok:
+        tag += "\n" + "\n".join("     " + l for l in (result.stderr or "").split("\n")[-8:] if l.strip())
+    print(tag, flush=True)
+    return name, ok
+
+
+def build_specs(iterations):
+    specs = []
+    for task_name, (module, base_cfg) in TASKS.items():
+        cfg = dict(base_cfg)
+        cfg["iterations"] = iterations
+        cfg["training_iterations"] = iterations
+        specs.append((f"{task_name}_paper", module, cfg))
+
+    sort_mod, sort_base = TASKS["sort"]
+    base = dict(sort_base)
+    base["iterations"] = iterations
+    base["training_iterations"] = iterations
+
+    specs.append(("sort_jepa", sort_mod, dict(base, cross_tick_jepa_weight=1.0, cross_tick_jepa_hidden_dim=32, cross_tick_jepa_predictor_depth=1, cross_tick_jepa_dropout=0.0)))
+    specs.append(("sort_halt", sort_mod, dict(base, tick_halt_mode="threshold", tick_halt_threshold=0.6)))
+    specs.append(("sort_sparsity", sort_mod, dict(base, topk_neurons=0.5)))
+    specs.append(("sort_reflex", sort_mod, dict(base, reflex_head=True, reflex_weight=0.2, reflex_ticks=1)))
+    specs.append(("sort_multitick", sort_mod, dict(base, tick_loss_mode="mean")))
+    specs.append(("sort_draft", sort_mod, dict(base, draft_mode="revise", draft_block_size=1, draft_revise_weight=0.1, draft_corrupt_prob=0.15)))
+    specs.append(("sort_async", sort_mod, dict(base, async_tick_mode="banded", async_tick_periods="1,2")))
+    specs.append(("sort_diffmem", sort_mod, dict(base, diff_memory=True, diff_memory_lengths="2,4")))
+    specs.append(("sort_ema", sort_mod, dict(base, ema_speed_mode="ema_spectrum", ema_speed_decays="0.9,0.99", ema_distill_weight=0.02, ema_warmup_steps=1)))
+    specs.append(("sort_jepa_halt", sort_mod, dict(base, cross_tick_jepa_weight=1.0, cross_tick_jepa_hidden_dim=32, cross_tick_jepa_predictor_depth=1, cross_tick_jepa_dropout=0.0, tick_halt_mode="threshold", tick_halt_threshold=0.6)))
+
+    p_mod, p_base = TASKS["parity"]
+    p_cfg = dict(p_base)
+    p_cfg["iterations"] = iterations
+    p_cfg["training_iterations"] = iterations
+    specs.append(("parity_jepa", p_mod, dict(p_cfg, cross_tick_jepa_weight=1.0, cross_tick_jepa_hidden_dim=32, cross_tick_jepa_predictor_depth=1, cross_tick_jepa_dropout=0.0)))
+
+    m_mod, m_base = TASKS["mazes"]
+    m_cfg = dict(m_base)
+    m_cfg["iterations"] = iterations
+    m_cfg["training_iterations"] = iterations
+    specs.append(("mazes_draft", m_mod, dict(m_cfg, draft_mode="revise", draft_block_size=1, draft_revise_weight=0.1)))
+
+    c_mod, c_base = TASKS["cifar10"]
+    c_cfg = dict(c_base)
+    c_cfg["iterations"] = iterations
+    c_cfg["training_iterations"] = iterations
+    specs.append(("cifar10_sparsity", c_mod, dict(c_cfg, topk_neurons=0.75)))
+
+    q_mod, q_base = TASKS["qamnist"]
+    q_cfg = dict(q_base)
+    q_cfg["iterations"] = iterations
+    q_cfg["training_iterations"] = iterations
+    specs.append(("qamnist_halt", q_mod, dict(q_cfg, tick_halt_mode="threshold", tick_halt_threshold=0.6)))
+
+    return specs
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=2)
+    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs (default: auto-detect)")
     args = parser.parse_args()
 
+    import torch
+    num_gpus = args.gpus or torch.cuda.device_count()
+    if num_gpus == 0:
+        print("No GPUs found, defaulting to CPU")
+        num_gpus = 1
+
+    specs = build_specs(args.iterations)
+    print(f"  Launching {len(specs)} tests across {num_gpus} GPUs...\n")
+
     results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as pool:
+        futures = {}
+        for i, (name, module, cfg) in enumerate(specs):
+            cfg = dict(cfg, device=[i % num_gpus])
+            cmd = _cmd(module, cfg)
+            futures[pool.submit(run_test, name, cmd, i % num_gpus)] = name
 
-    # ── 1. Paper config smoke (1 iter per task) ──
-    print("\n═══ TASK PAPER CONFIGS ═══")
-    for task_name, (module, base_cfg) in TASKS.items():
-        cfg = dict(base_cfg)
-        cfg["iterations"] = args.iterations
-        cfg["training_iterations"] = args.iterations
-        results.append((f"{task_name}_paper", run_test(f"{task_name} paper", _cmd(module, cfg))))
+        for future in concurrent.futures.as_completed(futures):
+            name, ok = future.result()
+            results.append((name, ok))
 
-    # ── 2. Idea configs (on sort, fastest) ──
-    print("\n═══ IDEA SMOKES (sort) ═══")
-    sort_mod, sort_base = TASKS["sort"]
-    base = dict(sort_base)
-
-    # JEPA
-    cfg = dict(base)
-    cfg.update(cross_tick_jepa_weight=1.0, cross_tick_jepa_hidden_dim=32,
-               cross_tick_jepa_predictor_depth=1, cross_tick_jepa_dropout=0.0)
-    results.append(("sort_jepa", run_test("sort + JEPA", _cmd(sort_mod, cfg))))
-
-    # Tick halt
-    cfg = dict(base)
-    cfg.update(tick_halt_mode="threshold", tick_halt_threshold=0.6)
-    results.append(("sort_halt", run_test("sort + halt", _cmd(sort_mod, cfg))))
-
-    # Cell sparsity
-    cfg = dict(base)
-    cfg.update(topk_neurons=0.5)
-    results.append(("sort_sparsity", run_test("sort + sparsity", _cmd(sort_mod, cfg))))
-
-    # Reflex head
-    cfg = dict(base)
-    cfg.update(reflex_head=True, reflex_weight=0.2, reflex_ticks=1)
-    results.append(("sort_reflex", run_test("sort + reflex", _cmd(sort_mod, cfg))))
-
-    # Multi-tick loss
-    cfg = dict(base)
-    cfg.update(tick_loss_mode="mean")
-    results.append(("sort_multitick", run_test("sort + multi-tick", _cmd(sort_mod, cfg))))
-
-    # Draft-revise
-    cfg = dict(base)
-    cfg.update(draft_mode="revise", draft_block_size=1, draft_revise_weight=0.1, draft_corrupt_prob=0.15)
-    results.append(("sort_draft", run_test("sort + draft-revise", _cmd(sort_mod, cfg))))
-
-    # Async ticks
-    cfg = dict(base)
-    cfg.update(async_tick_mode="banded", async_tick_periods="1,2")
-    results.append(("sort_async", run_test("sort + async ticks", _cmd(sort_mod, cfg))))
-
-    # Differentiated memory
-    cfg = dict(base)
-    cfg.update(diff_memory=True, diff_memory_lengths="2,4")
-    results.append(("sort_diffmem", run_test("sort + diff memory", _cmd(sort_mod, cfg))))
-
-    # EMA spectrum
-    cfg = dict(base)
-    cfg.update(ema_speed_mode="ema_spectrum", ema_speed_decays="0.9,0.99", ema_distill_weight=0.02, ema_warmup_steps=1)
-    results.append(("sort_ema", run_test("sort + EMA spectrum", _cmd(sort_mod, cfg))))
-
-    # ── 3. Combo: JEPA + halt ──
-    cfg = dict(base)
-    cfg.update(cross_tick_jepa_weight=1.0, cross_tick_jepa_hidden_dim=32,
-               cross_tick_jepa_predictor_depth=1, cross_tick_jepa_dropout=0.0,
-               tick_halt_mode="threshold", tick_halt_threshold=0.6)
-    results.append(("sort_jepa_halt", run_test("sort + JEPA+halt", _cmd(sort_mod, cfg))))
-
-    # ── 4. Idea smoke on other tasks (one each) ──
-    print("\n═══ CROSS-TASK IDEA SMOKES ═══")
-    # Parity + JEPA
-    p_mod, p_base = TASKS["parity"]
-    cfg = dict(p_base)
-    cfg.update(cross_tick_jepa_weight=1.0, cross_tick_jepa_hidden_dim=32,
-               cross_tick_jepa_predictor_depth=1, cross_tick_jepa_dropout=0.0)
-    results.append(("parity_jepa", run_test("parity + JEPA", _cmd(p_mod, cfg))))
-
-    # Mazes + draft-revise
-    m_mod, m_base = TASKS["mazes"]
-    cfg = dict(m_base)
-    cfg.update(draft_mode="revise", draft_block_size=1, draft_revise_weight=0.1)
-    results.append(("mazes_draft", run_test("mazes + draft-revise", _cmd(m_mod, cfg))))
-
-    # CIFAR10 + sparsity
-    c_mod, c_base = TASKS["cifar10"]
-    cfg = dict(c_base)
-    cfg.update(topk_neurons=0.75)
-    results.append(("cifar10_sparsity", run_test("cifar10 + sparsity", _cmd(c_mod, cfg))))
-
-    # QAMNIST + halt
-    q_mod, q_base = TASKS["qamnist"]
-    cfg = dict(q_base)
-    cfg.update(tick_halt_mode="threshold", tick_halt_threshold=0.6)
-    results.append(("qamnist_halt", run_test("qamnist + halt", _cmd(q_mod, cfg))))
-
-    # ── Summary ──
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
     print(f"\n{'='*60}")
     print(f"  SMOKE TEST RESULTS: {passed}/{total} passed")
-    for name, ok in results:
+    for name, ok in sorted(results, key=lambda x: x[0]):
         print(f"    {'✅' if ok else '❌'} {name}")
     print(f"{'='*60}")
-
     return 0 if passed == total else 1
 
 
