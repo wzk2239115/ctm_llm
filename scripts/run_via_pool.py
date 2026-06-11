@@ -17,6 +17,20 @@ def main():
     module = sys.argv[1]
     args = sys.argv[2:]
 
+    if module.startswith("-"):
+        fallback = os.environ.get("TRAIN_MODULE", "")
+        for i, arg in enumerate(sys.argv[1:], 1):
+            if arg == "--train_module" and i < len(sys.argv):
+                fallback = sys.argv[i + 1]
+                args = sys.argv[1:i] + sys.argv[i + 2:]
+                break
+        if fallback:
+            module = fallback
+        else:
+            print(f"[run_via_pool] Error: first arg '{module}' looks like a flag, "
+                  f"expected a module path. Set TRAIN_MODULE env var or pass module as first arg.")
+            sys.exit(1)
+
     print(f"[run_via_pool] Module: {module}")
     print(f"[run_via_pool] Args: {' '.join(args)}")
     print(f"[run_via_pool] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}")

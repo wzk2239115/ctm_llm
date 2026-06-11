@@ -38,6 +38,7 @@ BIND_PREFIXES = tuple(f"{stage}_" for stage in BIND_STAGES if stage != "all")
 METRICS_PREFIX = "multimodal_bind"
 
 BIND_BASE_ARGS = {
+    "train_module": "baseline.tasks.multimodal_bind.train",
     "model_type": "ctm_bind",
     "epochs": 1,
     "accumulation_steps": 4,
