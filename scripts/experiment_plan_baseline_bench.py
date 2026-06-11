@@ -49,11 +49,15 @@ DEFAULT_CONFIG = "infra/envs/smoke_baseline.env"
 DEFAULT_MASTER_ADDR = "11.131.210.78"
 DEFAULT_PORT = 8765
 BASELINE_NODES = ("11.131.209.154", "11.131.210.3", "11.131.210.78", "11.131.211.9")
-_node_idx = [0]
-def _next_node():
-    n = BASELINE_NODES[_node_idx[0] % len(BASELINE_NODES)]
-    _node_idx[0] += 1
-    return n
+_GPUS_PER_NODE = 8
+_slot_idx = [0]
+
+def _next_slot():
+    i = _slot_idx[0]
+    _slot_idx[0] += 1
+    node = BASELINE_NODES[i // _GPUS_PER_NODE % len(BASELINE_NODES)]
+    gpu = i % _GPUS_PER_NODE
+    return f"{node}:{gpu}"
 
 STAGES = (
     "bl00", "bl01", "bl02", "bl03", "bl04", "bl05", "bl06",
@@ -96,7 +100,7 @@ def exp(name, question, command, tags=None):
         "question": question,
         "command": command,
         "tags": tags or [],
-        "node_addr": _next_node(),
+        "node_addr": _next_slot(),
     }
 
 
