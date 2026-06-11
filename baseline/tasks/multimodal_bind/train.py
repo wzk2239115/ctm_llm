@@ -264,9 +264,10 @@ class Flickr30kDataset(Dataset):
 
 
 class TartanRGBTDataset(Dataset):
+    PAIR_DIRS = {"thermal": "thermal_right_rect_8", "depth": "stereo_depth"}
+
     def __init__(self, data_root, modality="thermal", image_size=128, max_samples=None):
         from torchvision import transforms
-        from PIL import Image
         self.image_size = image_size
         self.transform_rgb = transforms.Compose([
             transforms.Resize((image_size, image_size)),
@@ -278,8 +279,9 @@ class TartanRGBTDataset(Dataset):
             transforms.ToTensor(),
         ])
         self.modality = modality
-        self.pairs = []
+        self.image_pairs = []
         base = os.path.join(data_root, "TartanRGBT") if os.path.exists(os.path.join(data_root, "TartanRGBT")) else data_root
+        other_name = self.PAIR_DIRS.get(modality, "thermal_right_rect_8")
         for day_dir in sorted(os.listdir(base)):
             day_path = os.path.join(base, day_dir)
             if not os.path.isdir(day_path) or day_dir.startswith("."):
@@ -288,39 +290,77 @@ class TartanRGBTDataset(Dataset):
                 traj_path = os.path.join(day_path, traj_dir)
                 if not os.path.isdir(traj_path):
                     continue
-                rgb_dir = os.path.join(traj_path, "rgb_in_thermal")
-                if not os.path.isdir(rgb_dir):
-                    continue
-                if modality == "thermal":
-                    other_dir = os.path.join(traj_path, "thermal_right_rect_8")
-                else:
-                    other_dir = os.path.join(traj_path, "stereo_depth")
-                if not os.path.isdir(other_dir):
-                    continue
-                for fname in sorted(os.listdir(rgb_dir)):
-                    if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
-                        continue
-                    rgb_path = os.path.join(rgb_dir, fname)
-                    other_path = os.path.join(other_dir, fname)
-                    if os.path.exists(other_path):
-                        self.pairs.append((rgb_path, other_path))
+                self._collect_pairs(traj_path, "rgb_in_thermal", other_name)
         if max_samples:
-            self.pairs = self.pairs[:max_samples]
+            self.image_pairs = self.image_pairs[:max_samples]
+
+    @staticmethod
+    def _list_images(path, name):
+        dir_path = os.path.join(path, name)
+        zip_path = dir_path + ".zip"
+        import zipfile
+        entries = []
+        if os.path.isdir(dir_path):
+            for f in sorted(os.listdir(dir_path)):
+                if f.lower().endswith((".png", ".jpg", ".jpeg")):
+                    entries.append(("dir", os.path.join(dir_path, f)))
+        if os.path.isfile(zip_path):
+            try:
+                with zipfile.ZipFile(zip_path) as z:
+                    names = sorted(z.namelist())
+            except Exception:
+                names = []
+            for n in names:
+                if os.path.basename(n).lower().endswith((".png", ".jpg", ".jpeg")):
+                    entries.append(("zip", zip_path, n))
+        return entries
+
+    @staticmethod
+    def _frame_key(name):
+        base = os.path.basename(name)
+        no_ext = os.path.splitext(base)[0]
+        digits = ""
+        for ch in no_ext:
+            if ch.isdigit() or (not digits and ch == "0"):
+                if ch.isdigit():
+                    digits += ch
+            elif digits:
+                break
+        return digits.zfill(8) if digits else no_ext
+
+    def _collect_pairs(self, traj_path, rgb_name, other_name):
+        rgb_entries = self._list_images(traj_path, rgb_name)
+        other_entries = self._list_images(traj_path, other_name)
+        if not rgb_entries or not other_entries:
+            return
+        def _key(entry):
+            return self._frame_key(entry[-1])
+        rgb_map = {_key(e): e for e in rgb_entries}
+        other_map = {_key(e): e for e in other_entries}
+        common = sorted(set(rgb_map) & set(other_map))
+        for key in common:
+            self.image_pairs.append((rgb_map[key], other_map[key]))
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.image_pairs)
+
+    @staticmethod
+    def _open_image(entry, mode="RGB"):
+        from PIL import Image
+        if entry[0] == "dir":
+            return Image.open(entry[1]).convert(mode)
+        import io, zipfile
+        with zipfile.ZipFile(entry[1]) as z:
+            return Image.open(io.BytesIO(z.read(entry[2]))).convert(mode)
 
     def __getitem__(self, idx):
-        from PIL import Image
-        rgb_path, other_path = self.pairs[idx]
+        rgb_entry, other_entry = self.image_pairs[idx]
         try:
-            rgb = Image.open(rgb_path).convert("RGB")
-            rgb_tensor = self.transform_rgb(rgb)
+            rgb_tensor = self.transform_rgb(self._open_image(rgb_entry, "RGB"))
         except Exception:
             rgb_tensor = torch.zeros(3, self.image_size, self.image_size)
         try:
-            other = Image.open(other_path).convert("L")
-            other_tensor = self.transform_other(other)
+            other_tensor = self.transform_other(self._open_image(other_entry, "L"))
         except Exception:
             other_tensor = torch.zeros(1, self.image_size, self.image_size)
         return rgb_tensor, other_tensor
