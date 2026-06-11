@@ -122,9 +122,8 @@ def _cmd(module, cfg):
 
 
 def run_test(name, cmd, device):
-    env = dict(CUDA_VISIBLE_DEVICES=str(device))
     start = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env={**dict(__import__('os').environ), **env})
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     elapsed = time.time() - start
     ok = result.returncode == 0
     tag = f"  {'✅' if ok else '❌'} {name} (GPU {device}, {elapsed:.1f}s)"
