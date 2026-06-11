@@ -5,7 +5,7 @@ from torchvision import datasets
 from torchvision import transforms
 import numpy as np
 
-def get_dataset(q_num_images, q_num_images_delta, q_num_repeats_per_input, q_num_operations, q_num_operations_delta):
+def get_dataset(q_num_images, q_num_images_delta, q_num_repeats_per_input, q_num_operations, q_num_operations_delta, data_root="data/"):
     dataset_mean = 0.1307
     dataset_std = 0.3081    
     transform = transforms.Compose(
@@ -13,8 +13,8 @@ def get_dataset(q_num_images, q_num_images_delta, q_num_repeats_per_input, q_num
         transforms.ToTensor(),
         transforms.Normalize(dataset_mean, dataset_std)
         ])
-    train_data = QAMNISTDataset(datasets.MNIST("data/", train=True, transform=transform, download=True), num_images=q_num_images, num_images_delta=q_num_images_delta, num_repeats_per_input=q_num_repeats_per_input, num_operations=q_num_operations, num_operations_delta=q_num_operations_delta)
-    test_data = QAMNISTDataset(datasets.MNIST("data/", train=False, transform=transform, download=True), num_images=q_num_images, num_images_delta=q_num_images_delta, num_repeats_per_input=q_num_repeats_per_input, num_operations=q_num_operations, num_operations_delta=q_num_operations_delta)
+    train_data = QAMNISTDataset(datasets.MNIST(data_root, train=True, transform=transform, download=True), num_images=q_num_images, num_images_delta=q_num_images_delta, num_repeats_per_input=q_num_repeats_per_input, num_operations=q_num_operations, num_operations_delta=q_num_operations_delta)
+    test_data = QAMNISTDataset(datasets.MNIST(data_root, train=False, transform=transform, download=True), num_images=q_num_images, num_images_delta=q_num_images_delta, num_repeats_per_input=q_num_repeats_per_input, num_operations=q_num_operations, num_operations_delta=q_num_operations_delta)
     class_labels = [str(i) for i in np.arange(train_data.output_range[0], train_data.output_range[1]+1)]        
     return train_data, test_data, class_labels, dataset_mean, dataset_std
 

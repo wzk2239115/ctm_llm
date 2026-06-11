@@ -22,9 +22,11 @@ def main():
     print(f"[run_via_pool] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}")
     print(f"[run_via_pool] Start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    logdir = "runs/logs"
+    exp_name = os.environ.get("CTM_EXPERIMENT_NAME")
+    logdir = os.environ.get("CTM_LOG_DIR", "runs/logs")
     os.makedirs(logdir, exist_ok=True)
-    logpath = os.path.join(logdir, "pool_last_run.log")
+    log_name = f"{exp_name}.log" if exp_name else "pool_last_run.log"
+    logpath = os.path.join(logdir, log_name)
 
     proc = subprocess.run(
         [sys.executable, "-m", module] + args,
@@ -39,7 +41,6 @@ def main():
 
     if proc.returncode != 0:
         print(f"[run_via_pool] exit_code={proc.returncode}")
-        exp_name = os.environ.get("CTM_EXPERIMENT_NAME")
         if exp_name:
             metrics_dir = os.environ.get("CTM_METRICS_DIR", "runs/metrics")
             fail_path = os.path.join(metrics_dir, f"{exp_name}.fail.json")
@@ -50,6 +51,7 @@ def main():
                 "rank": 0,
                 "error_type": "SubprocessError",
                 "error": output[-4000:],
+                "log_path": logpath,
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "git_commit": "unknown",
             }

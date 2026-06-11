@@ -1070,6 +1070,7 @@ def submit_to_pool(exp, config, master_addr=None, port=None):
         "env": {
             "CTM_EXPERIMENT_NAME": exp["name"],
             "CTM_METRICS_DIR": "runs/metrics",
+            "CTM_LOG_DIR": "runs/logs/baseline_bench",
         },
     }
     base = f"http://{master_addr}:{port}"
@@ -1089,7 +1090,44 @@ def submit_to_pool(exp, config, master_addr=None, port=None):
         return None
 
 
-def wait_until_idle(master_addr, port, task_id, poll_interval=30.0):
+def print_failure_details(experiment_name):
+    fail_paths = [
+        ROOT / "runs" / "metrics" / f"{experiment_name}.fail.json",
+        METRICS_DIR / f"{experiment_name}.fail.json",
+    ]
+    for fail_path in fail_paths:
+        if not fail_path.is_file():
+            continue
+        try:
+            with open(fail_path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            print(f"    could not read failure report {fail_path}: {exc}")
+            return
+        err = payload.get("error", "")
+        log_path = payload.get("log_path")
+        print(f"    failure report: {fail_path}")
+        if log_path:
+            print(f"    log: {log_path}")
+        for line in err.splitlines()[-40:]:
+            print(f"    {line}")
+        return
+
+    log_paths = [
+        ROOT / "runs" / "logs" / "baseline_bench" / f"{experiment_name}.log",
+        ROOT / "runs" / "logs" / "pool_last_run.log",
+    ]
+    for log_path in log_paths:
+        if log_path.is_file():
+            print(f"    log: {log_path}")
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-80:]
+            for line in lines:
+                print(f"    {line}", end="")
+            return
+
+
+def wait_until_idle(master_addr, port, task_id, experiment_name=None, poll_interval=30.0):
     """Poll pool until the task is completed or failed."""
     base = f"http://{master_addr}:{port}"
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -1108,13 +1146,8 @@ def wait_until_idle(master_addr, port, task_id, poll_interval=30.0):
                     acks = status.get("acks", {}).get(task_id, {})
                     for addr, ack in sorted(acks.items()):
                         print(f"  [pool] ack {addr}: status={ack.get('status')} msg={ack.get('message', '')}")
-                    if t["status"] == "failed":
-                        log_path = "runs/logs/pool_last_run.log"
-                        if os.path.isfile(log_path):
-                            print(f"  [pool] last run log ({log_path}):")
-                            with open(log_path) as f:
-                                for line in f:
-                                    print(f"    {line}", end="")
+                    if t["status"] == "failed" and experiment_name:
+                        print_failure_details(experiment_name)
                     return t["status"]
         except Exception:
             pass
@@ -1146,7 +1179,7 @@ def run_submit(args):
             print(f"  submitted as {tid}")
             if not getattr(args, "parallel", False):
                 print(f"  waiting...")
-                wait_until_idle(args.master_addr, args.port, tid, args.poll_interval)
+                wait_until_idle(args.master_addr, args.port, tid, e["name"], args.poll_interval)
         else:
             print(f"  WARNING: submit failed, skipping")
 
@@ -1173,11 +1206,7 @@ def run_submit(args):
                             rc = t.get("return_code", "?")
                             print(f"  [{len(done)}/{len(submitted)}] {name} ({tid}) -> {t['status']} rc={rc}")
                             if t["status"] == "failed":
-                                log_path = "runs/logs/pool_last_run.log"
-                                if os.path.isfile(log_path):
-                                    with open(log_path) as f:
-                                        for line in f:
-                                            print(f"    {line}", end="")
+                                print_failure_details(name)
                             break
             except Exception:
                 pass
