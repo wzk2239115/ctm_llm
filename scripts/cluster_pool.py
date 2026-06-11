@@ -796,6 +796,302 @@ def run_task(args):
         sys.exit(1)
 
 
+def _fmt_time(seconds):
+    if seconds < 0 or not seconds or seconds != seconds:
+        return "    -"
+    if seconds < 60:
+        return f"{seconds:5.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:5.1f}m"
+    return f"{seconds / 3600:5.1f}h"
+
+
+def _fmt_progress_bar(ratio, width=20):
+    if ratio < 0 or ratio != ratio:
+        return "[" + " " * width + "]"
+    filled = min(width, int(ratio * width))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _read_experiment_metrics(metrics_dir, experiment_name):
+    path = os.path.join(metrics_dir, f"{experiment_name}.csv")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        if not rows:
+            return rows[0] if rows else None
+        return rows[-1]
+    except Exception:
+        return None
+
+
+def _read_failure(metrics_dir, experiment_name):
+    path = os.path.join(metrics_dir, f"{experiment_name}.fail.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def run_kanban(args):
+    import csv as csv_mod
+    global csv
+    csv = csv_mod
+
+    base = f"http://{args.master_addr}:{args.port}"
+    metrics_dir = args.metrics_dir
+    refresh = args.refresh
+    width = args.width
+
+    while True:
+        try:
+            status = get_json(f"{base}/status", timeout=5)
+        except Exception as exc:
+            if args.once:
+                print(f"  Cannot reach pool server: {exc}")
+                break
+            print(f"\r  Waiting for pool server... {exc}    ", end="", flush=True)
+            time.sleep(refresh)
+            continue
+
+        os.system("clear" if os.name != "nt" else "cls")
+
+        nodes = status.get("nodes", {})
+        tasks = status.get("tasks", [])
+        acks = status.get("acks", {})
+        now = time.time()
+
+        sep = "=" * min(width, 72)
+        thin = "-" * min(width, 72)
+
+        lines = []
+        lines.append(sep)
+        lines.append(f"  CTM-LLM POOL KANBAN  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(sep)
+
+        total_gpus = 0
+        idle_gpus = 0
+        node_lines = []
+        for addr, node in sorted(nodes.items()):
+            age = now - node.get("last_seen", now)
+            gpus = node.get("gpus", 0)
+            total_gpus += gpus
+            busy = node.get("busy_gpus", [])
+            idle = gpus - len(busy)
+            idle_gpus += idle
+            gpu_sum = node.get("gpu_summary", f"{gpus} GPU(s)")
+            host = node.get("hostname", "?")
+            nodestatus = node.get("status", "?")
+            running = node.get("running_tasks", [])
+            run_str = ",".join(running) if running else "idle"
+            busy_str = ",".join(str(g) for g in busy) if busy else "-"
+            node_lines.append(
+                f"  {addr:20s} {host:12s} {gpu_sum:30s} "
+                f"busy=[{busy_str:10s}] {run_str}"
+            )
+        n_nodes = len(nodes)
+        lines.append(f"  NODES: {n_nodes}   TOTAL GPUS: {total_gpus}   IDLE GPUS: {idle_gpus}")
+        if node_lines:
+            lines.append(thin)
+            lines.extend(node_lines)
+
+        lines.append(sep)
+        lines.append("  TASK QUEUE")
+        lines.append(thin)
+
+        header = f"  {'#':>3s}  {'ID':22s}  {'STATUS':10s}  {'PROGRESS':24s}  {'ELAPSED':>7s}  {'ETA':>7s}  {'INFO'}"
+        lines.append(header)
+
+        active_tasks = []
+        pending_tasks = []
+        finished_tasks = []
+        for t in tasks:
+            st = t.get("status", "pending")
+            if st in ("completed", "failed", "cancelled"):
+                finished_tasks.append(t)
+            elif st == "running":
+                active_tasks.append(t)
+            else:
+                pending_tasks.append(t)
+
+        row_idx = 0
+
+        for t in active_tasks:
+            row_idx += 1
+            tid = t["task_id"]
+            extra = t.get("extra_args", "")
+            created = t.get("created_at", now)
+            elapsed = now - created
+
+            exp_name = ""
+            extra_args_for_module = extra
+            parts = extra.split(None, 1)
+            if len(parts) >= 2:
+                possible_module = parts[0]
+                if possible_module.startswith("baseline.") or possible_module.startswith("scripts."):
+                    extra_args_for_module = parts[1] if len(parts) > 1 else ""
+            elif len(parts) == 1:
+                extra_args_for_module = ""
+
+            for kw in ["--experiment_name", "--experiment-name"]:
+                idx_kw = extra_args_for_module.find(kw)
+                if idx_kw >= 0:
+                    rest = extra_args_for_module[idx_kw + len(kw):].strip()
+                    nrest = rest.split(None, 1)
+                    if nrest:
+                        exp_name = nrest[0]
+                    break
+
+            if not exp_name:
+                for kw in ["--metrics_path", "--metrics-path"]:
+                    idx_kw = extra.find(kw)
+                    if idx_kw >= 0:
+                        rest = extra[idx_kw + len(kw):].strip()
+                        nrest = rest.split(None, 1)
+                        if nrest:
+                            mpath = nrest[0]
+                            exp_name = os.path.splitext(os.path.basename(mpath))[0]
+                        break
+
+            if not exp_name:
+                exp_name = f"task_{tid}"
+
+            metrics = _read_experiment_metrics(metrics_dir, exp_name)
+            max_steps = 0
+            cur_step = 0
+            step_rate = 0
+            loss_val = ""
+            if metrics:
+                try:
+                    cur_step = float(metrics.get("global_step", 0))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    max_steps = float(metrics.get("max_steps", 0))
+                except (TypeError, ValueError):
+                    pass
+                loss_val = metrics.get("loss", "")
+
+            ratio = cur_step / max_steps if max_steps > 0 else -1
+            bar = _fmt_progress_bar(ratio)
+            step_str = f"{int(cur_step):>6}/{int(max_steps):<6}" if max_steps > 0 else "   -/   - "
+
+            if max_steps > 0 and cur_step > 0:
+                step_rate = cur_step / elapsed
+                remaining = (max_steps - cur_step) / step_rate if step_rate > 0 else -1
+            else:
+                remaining = -1
+
+            elapsed_s = _fmt_time(elapsed)
+            eta_s = _fmt_time(remaining)
+
+            info_parts = []
+            if loss_val and loss_val not in ("", "nan", "inf"):
+                info_parts.append(f"loss={float(loss_val):.4f}")
+            lines.append(
+                f"  {row_idx:3d}  {tid:22s}  {'running':10s}  {bar} {step_str}  {elapsed_s:>7s}  {eta_s:>7s}  {' '.join(info_parts)}"
+            )
+
+        for t in pending_tasks:
+            row_idx += 1
+            tid = t["task_id"]
+            created = t.get("created_at", now)
+            elapsed = now - created
+            extra = t.get("extra_args", "")
+            short_extra = extra[:40] + "..." if len(extra) > 40 else extra
+            lines.append(
+                f"  {row_idx:3d}  {tid:22s}  {'pending':10s}  "
+                f"{'[                      ]':24s}  {_fmt_time(elapsed):>7s}  {'    -':>7s}  {short_extra}"
+            )
+
+        if not active_tasks and not pending_tasks:
+            lines.append("  (no active or pending tasks)")
+
+        lines.append(thin)
+        lines.append("  RECENTLY FINISHED (last 10)")
+        lines.append(thin)
+
+        recent = sorted(finished_tasks, key=lambda t: t.get("status_changed_at", 0), reverse=True)[:10]
+        for t in recent:
+            tid = t["task_id"]
+            st = t.get("status", "?")
+            rc = t.get("return_code")
+            extra = t.get("extra_args", "")
+            changed = t.get("status_changed_at", t.get("created_at", now))
+            duration = changed - t.get("created_at", changed)
+
+            extra_label = extra[:50] + "..." if len(extra) > 50 else extra
+
+            exp_name = ""
+            for kw in ["--experiment_name", "--experiment-name"]:
+                idx_kw = extra.find(kw)
+                if idx_kw >= 0:
+                    rest = extra[idx_kw + len(kw):].strip()
+                    nrest = rest.split(None, 1)
+                    if nrest:
+                        exp_name = nrest[0]
+                    break
+            if not exp_name:
+                for kw in ["--metrics_path", "--metrics-path"]:
+                    idx_kw = extra.find(kw)
+                    if idx_kw >= 0:
+                        rest = extra[idx_kw + len(kw):].strip()
+                        nrest = rest.split(None, 1)
+                        if nrest:
+                            exp_name = os.path.splitext(os.path.basename(nrest[0]))[0]
+                        break
+
+            if not exp_name:
+                parts = extra.split(None, 1)
+                if parts:
+                    module = parts[0]
+                    exp_name = module.split(".")[-1] if "." in module else module
+
+            fail_info = None
+            if st == "failed" and exp_name:
+                fail_info = _read_failure(metrics_dir, exp_name)
+
+            status_label = st.upper()
+            info_parts = []
+            if st == "completed" and exp_name:
+                metrics = _read_experiment_metrics(metrics_dir, exp_name)
+                if metrics:
+                    lv = metrics.get("loss", "")
+                    if lv and lv not in ("", "nan", "inf"):
+                        info_parts.append(f"loss={float(lv):.4f}")
+            elif st == "failed":
+                if fail_info:
+                    err_type = fail_info.get("error_type", "")
+                    info_parts.append(err_type)
+                elif rc is not None:
+                    info_parts.append(f"rc={rc}")
+
+            info_str = " ".join(info_parts) if info_parts else extra_label
+            lines.append(
+                f"  {tid:22s}  {status_label:10s}  {_fmt_time(duration):>7s}  {info_str}"
+            )
+
+        if not recent:
+            lines.append("  (no finished tasks)")
+
+        lines.append(sep)
+        print("\n".join(lines), flush=True)
+
+        if args.once:
+            break
+        try:
+            time.sleep(refresh)
+        except KeyboardInterrupt:
+            print("\n(kanban stopped)")
+            break
+
+
 def main():
     parser = argparse.ArgumentParser(description="CTM-LLM lightweight cluster pool")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -837,6 +1133,15 @@ def main():
     p.add_argument("--master_addr", default="11.131.210.78")
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=run_task)
+
+    p = sub.add_parser("kanban")
+    p.add_argument("--master_addr", default="11.131.210.78")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--metrics_dir", default="runs/metrics")
+    p.add_argument("--refresh", type=float, default=5.0, help="Refresh interval in seconds")
+    p.add_argument("--width", type=int, default=100, help="Display width")
+    p.add_argument("--once", action="store_true", help="Print once and exit (no loop)")
+    p.set_defaults(func=run_kanban)
 
     args, unknown = parser.parse_known_args()
     if args.cmd == "submit" and unknown:
