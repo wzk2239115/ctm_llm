@@ -418,7 +418,7 @@ if __name__=='__main__':
                     pbar.set_description('Tracking: Processing test data')
                     predictions, certainties, synchronisation, pre_activations, post_activations, _ = model(inputs, track=True)
                     pbar.set_description('Tracking: Neural dynamics')
-                    plot_neural_dynamics(post_activations, min(100, post_activations.shape[-1]), args.log_dir)
+                    plot_neural_dynamics(post_activations, min(100, post_activations.shape[-1] // 5 * 5), args.log_dir)
 
                     imgi = 0
 

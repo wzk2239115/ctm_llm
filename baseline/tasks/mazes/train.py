@@ -727,7 +727,7 @@ if __name__=='__main__':
                                 attention_tracking_viz.shape[1], -1, att_shape[0], att_shape[1])
 
                             # Plot dynamics (common plotting function)
-                            plot_neural_dynamics(post_activations_viz, min(100, post_activations_viz.shape[-1]), args.log_dir, axis_snap=True)
+                            plot_neural_dynamics(post_activations_viz, min(100, post_activations_viz.shape[-1] // 5 * 5), args.log_dir, axis_snap=True)
 
                             # Create maze GIF (task-specific plotting)
                             make_maze_gif((inputs_viz[longest_index].detach().cpu().numpy()+1)/2,
