@@ -278,7 +278,7 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
             extras['reflex_preds'] = torch.stack(reflex_preds, dim=-1)
         if draft_pred is not None:
             extras['draft_prediction'] = draft_pred
-        if n_steps_used < self.iterations:
+        if n_steps_used < total_iterations:
             extras['n_steps_used'] = n_steps_used
 
         if track:

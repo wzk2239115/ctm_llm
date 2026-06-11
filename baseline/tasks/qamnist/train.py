@@ -337,55 +337,63 @@ if __name__=='__main__':
 
             # Metrics tracking and plotting
             if bi%args.track_every==0:
-                model.eval()
-                with torch.inference_mode():
-                    
-                    inputs, z, question_readable, targets = next(iter(testloader))
-                    inputs = inputs.to(device)
-                    targets = targets.to(device)
-                    z = torch.stack(z, 1).to(device)
-                    pbar.set_description('Tracking: Processing test data')
-                    predictions, certainties, synchronisation, pre_activations, post_activations, attention_tracking, embedding_tracking, _ = model(inputs, z, track=True)
+                try:
+                    model.eval()
+                    with torch.inference_mode():
+                        
+                        inputs, z, question_readable, targets = next(iter(testloader))
+                        inputs = inputs.to(device)
+                        targets = targets.to(device)
+                        z = torch.stack(z, 1).to(device)
+                        pbar.set_description('Tracking: Processing test data')
+                        predictions, certainties, synchronisation, pre_activations, post_activations, attention_tracking, embedding_tracking, _ = model(inputs, z, track=True)
 
-                    predictions = reshape_predictions(predictions, prediction_reshaper)
-                    attention = reshape_attention_weights(attention_tracking)
+                        predictions = reshape_predictions(predictions, prediction_reshaper)
+                        attention = reshape_attention_weights(attention_tracking)
 
-                    T = predictions.size(-1)
-                    B = predictions.size(0)
-                    gif_inputs = torch.zeros((T, B, 1, 32, 32), device=inputs.device)
-                    digits_input = inputs.permute(1, 0, 2, 3, 4)
-                    gif_inputs[:digits_input.size(0)] = digits_input
+                        T = predictions.size(-1)
+                        B = predictions.size(0)
+                        gif_inputs = torch.zeros((T, B, 1, 32, 32), device=inputs.device)
+                        digits_input = inputs.permute(1, 0, 2, 3, 4)
+                        gif_inputs[:digits_input.size(0)] = digits_input
 
-                    T_embed = embedding_tracking.shape[0]
-                    pad_width = ((0, 0), (0, 0), (0, (32*32)-args.d_input))
-                    embedding_padded = np.pad(embedding_tracking, pad_width, mode='constant')
-                    reshaped = embedding_padded.reshape(T_embed,B, 1, 32, 32)
-                    embedding_input = np.zeros((T_embed, B, 1, 32, 32))
-                    embedding_input[:T_embed] = reshaped
+                        T_embed = embedding_tracking.shape[0]
+                        pad_width = ((0, 0), (0, 0), (0, (32*32)-args.d_input))
+                        embedding_padded = np.pad(embedding_tracking, pad_width, mode='constant')
+                        reshaped = embedding_padded.reshape(T_embed,B, 1, 32, 32)
+                        embedding_input = np.zeros((T_embed, B, 1, 32, 32))
+                        embedding_input[:T_embed] = reshaped
 
-                    embedding_tensor = torch.from_numpy(embedding_input).to(gif_inputs.device)
-                    gif_inputs[digits_input.size(0):digits_input.size(0) + T_embed] = embedding_tensor[:T_embed]
+                        embedding_tensor = torch.from_numpy(embedding_input).to(gif_inputs.device)
+                        gif_inputs[digits_input.size(0):digits_input.size(0) + T_embed] = embedding_tensor[:T_embed]
 
-        
-                    pbar.set_description('Tracking: Neural dynamics')
-                    plot_neural_dynamics(post_activations, min(100, post_activations.shape[-1] // 5 * 5), args.log_dir, axis_snap=True)
+            
+                        pbar.set_description('Tracking: Neural dynamics')
+                        if len(post_activations) > 0:
+                            plot_neural_dynamics(post_activations, min(100, post_activations.shape[-1] // 5 * 5), args.log_dir, axis_snap=True)
 
-                    pbar.set_description('Tracking: Producing attention gif')
+                        pbar.set_description('Tracking: Producing attention gif')
 
-                    process = multiprocessing.Process(
-                        target=make_qamnist_gif,
-                        args=(
-                        predictions.detach().cpu().numpy(),
-                        certainties.detach().cpu().numpy(),
-                        targets.detach().cpu().numpy(),
-                        pre_activations,
-                        post_activations,
-                        attention,
-                        gif_inputs.detach().cpu().numpy(),
-                        f"{args.log_dir}/eval_output_val_{0}_iter_{0}.gif",
-                        question_readable
-                    ))
-                    process.start()
+                        if len(pre_activations) > 0:
+                            process = multiprocessing.Process(
+                                target=make_qamnist_gif,
+                                args=(
+                                predictions.detach().cpu().numpy(),
+                                certainties.detach().cpu().numpy(),
+                                targets.detach().cpu().numpy(),
+                                pre_activations,
+                                post_activations,
+                                attention,
+                                gif_inputs.detach().cpu().numpy(),
+                                f"{args.log_dir}/eval_output_val_{0}_iter_{0}.gif",
+                                question_readable
+                            ))
+                            process.start()
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"[qamnist] tracking step {bi} failed, continuing")
+                model.train()
 
                     
                     ##################################### TRAIN METRICS
