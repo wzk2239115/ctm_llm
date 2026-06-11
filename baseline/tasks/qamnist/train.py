@@ -389,11 +389,6 @@ if __name__=='__main__':
                                 question_readable
                             ))
                             process.start()
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
-                    print(f"[qamnist] tracking step {bi} failed, continuing")
-                model.train()
 
                     
                     ##################################### TRAIN METRICS
@@ -513,7 +508,12 @@ if __name__=='__main__':
                         figloss.savefig(f'{args.log_dir}/losses.png', dpi=150)
                         plt.close(figloss)
 
-                model.train()
+                    model.train()
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"[qamnist] tracking step {bi} failed, continuing")
+                    model.train()
                             
 
 
