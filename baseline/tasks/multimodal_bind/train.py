@@ -300,9 +300,10 @@ class TartanRGBTDataset(Dataset):
         zip_path = dir_path + ".zip"
         import zipfile
         entries = []
+        exts = (".png", ".jpg", ".jpeg", ".npy")
         if os.path.isdir(dir_path):
             for f in sorted(os.listdir(dir_path)):
-                if f.lower().endswith((".png", ".jpg", ".jpeg")):
+                if f.lower().endswith(exts):
                     entries.append(("dir", os.path.join(dir_path, f)))
         if os.path.isfile(zip_path):
             try:
@@ -311,7 +312,7 @@ class TartanRGBTDataset(Dataset):
             except Exception:
                 names = []
             for n in names:
-                if os.path.basename(n).lower().endswith((".png", ".jpg", ".jpeg")):
+                if os.path.basename(n).lower().endswith(exts):
                     entries.append(("zip", zip_path, n))
         return entries
 
@@ -345,13 +346,29 @@ class TartanRGBTDataset(Dataset):
         return len(self.image_pairs)
 
     @staticmethod
-    def _open_image(entry, mode="RGB"):
-        from PIL import Image
+    def _read_entry(entry):
         if entry[0] == "dir":
-            return Image.open(entry[1]).convert(mode)
+            return entry[1]
         import io, zipfile
         with zipfile.ZipFile(entry[1]) as z:
-            return Image.open(io.BytesIO(z.read(entry[2]))).convert(mode)
+            return io.BytesIO(z.read(entry[2]))
+
+    @staticmethod
+    def _open_image(entry, mode="RGB"):
+        from PIL import Image
+        data = TartanRGBTDataset._read_entry(entry)
+        return Image.open(data).convert(mode)
+
+    @staticmethod
+    def _open_depth(entry):
+        data = TartanRGBTDataset._read_entry(entry)
+        import numpy as np
+        arr = np.load(data)
+        d_max = arr.max()
+        if d_max > 0:
+            arr = arr / d_max
+        tensor = torch.from_numpy(arr).unsqueeze(0).float()
+        return tensor
 
     def __getitem__(self, idx):
         rgb_entry, other_entry = self.image_pairs[idx]
@@ -360,7 +377,13 @@ class TartanRGBTDataset(Dataset):
         except Exception:
             rgb_tensor = torch.zeros(3, self.image_size, self.image_size)
         try:
-            other_tensor = self.transform_other(self._open_image(other_entry, "L"))
+            other_path = other_entry[-1]
+            if other_path.lower().endswith(".npy"):
+                depth = self._open_depth(other_entry)
+                from torchvision.transforms.functional import resize
+                other_tensor = resize(depth, (self.image_size, self.image_size))
+            else:
+                other_tensor = self.transform_other(self._open_image(other_entry, "L"))
         except Exception:
             other_tensor = torch.zeros(1, self.image_size, self.image_size)
         return rgb_tensor, other_tensor
