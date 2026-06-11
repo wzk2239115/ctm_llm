@@ -18,6 +18,8 @@ data/*
 !data/mazes/
 !data/MNIST/
 !data/imagenet/
+!data/cifar-10-batches-py/
+!data/cifar-100-python/
 examples/*
 !examples/01_mnist.ipynb
 !examples/02_inference.ipynb
