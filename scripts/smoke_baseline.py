@@ -10,6 +10,7 @@ import sys
 import time
 
 ROOT = "/home/jovyan/h800fast/wangzekai/ctm_llm"
+DATA_ROOT = ROOT + "/dataset_data"  # symlink → minimind-o/dataset/
 
 TASKS = {
     "sort": ("baseline.tasks.sort.train", dict(
@@ -65,7 +66,7 @@ TASKS = {
         track_every=100, save_every=1000,
         reload=False, device=[0],
         n_test_batches=1,
-        data_root="/home/jovyan/h800fast/wangzekai/minimind-o/dataset/",
+        data_root="baseline/data/mazes",
         log_dir="/tmp/smoke/mazes",
     )),
     "cifar10": ("baseline.tasks.image_classification.train", dict(
@@ -113,6 +114,9 @@ def _cmd(module, cfg):
             continue
         if isinstance(v, bool):
             parts.append(f"--{k}" if v else f"--no-{k}")
+        elif isinstance(v, (list, tuple)):
+            parts.append(f"--{k}")
+            parts.extend(str(x) for x in v)
         else:
             parts.append(f"--{k}")
             parts.append(str(v))
