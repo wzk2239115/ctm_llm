@@ -289,6 +289,9 @@ if __name__=='__main__':
                         dp = extras['draft_prediction']
                         draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
                         loss = loss + args.draft_revise_weight * draft_loss
+                    # Compute where_most_certain for accuracy tracking
+                    p_for_accuracy = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
+                    _, where_most_certain = parity_loss(p_for_accuracy, certainties, targets, use_most_certain=args.use_most_certain)
                 else:
                     out = model(inputs)
                     if isinstance(out[-1], dict):

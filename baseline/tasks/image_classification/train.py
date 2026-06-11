@@ -573,7 +573,11 @@ if __name__=='__main__':
 
                             # Model-specific forward and loss for evaluation
                             if args.model == 'ctm':
-                                these_predictions, certainties, _ = model(inputs)
+                                out = model(inputs)
+                                if isinstance(out[-1], dict):
+                                    these_predictions, certainties, _ = out[:-1]
+                                else:
+                                    these_predictions, certainties, _ = out
                                 loss, where_most_certain = image_classification_loss(these_predictions, certainties, targets, use_most_certain=True)
                                 all_predictions_list.append(these_predictions.argmax(1).detach().cpu().numpy()) # Shape (B, T)
                                 all_predictions_most_certain_list.append(these_predictions.argmax(1)[torch.arange(these_predictions.size(0), device=these_predictions.device), where_most_certain].detach().cpu().numpy()) # Shape (B,)
@@ -610,7 +614,7 @@ if __name__=='__main__':
                     else: # FF
                          current_train_accuracies = (all_targets == all_predictions).mean() # Shape scalar
                          train_accuracies.append(current_train_accuracies)
-                
+
                 del these_predictions
                 
 
@@ -632,7 +636,11 @@ if __name__=='__main__':
 
                             # Model-specific forward and loss for evaluation
                             if args.model == 'ctm':
-                                these_predictions, certainties, _ = model(inputs)
+                                out = model(inputs)
+                                if isinstance(out[-1], dict):
+                                    these_predictions, certainties, _ = out[:-1]
+                                else:
+                                    these_predictions, certainties, _ = out
                                 loss, where_most_certain = image_classification_loss(these_predictions, certainties, targets, use_most_certain=True)
                                 all_predictions_list.append(these_predictions.argmax(1).detach().cpu().numpy())
                                 all_predictions_most_certain_list.append(these_predictions.argmax(1)[torch.arange(these_predictions.size(0), device=these_predictions.device), where_most_certain].detach().cpu().numpy())

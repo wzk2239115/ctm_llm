@@ -439,7 +439,11 @@ if __name__=='__main__':
                                 
                                 inputs = inputs.to(device)
                                 targets = targets.to(device)
-                                these_predictions, certainties, synchronisation = model(inputs)
+                                out = model(inputs)
+                                if isinstance(out[-1], dict):
+                                    these_predictions, certainties, synchronisation = out[:-1]
+                                else:
+                                    these_predictions, certainties, synchronisation = out
 
                                 loss = sort_loss(these_predictions, targets)
                                 all_losses.append(loss.item())
@@ -473,7 +477,11 @@ if __name__=='__main__':
                                 
                                 inputs = inputs.to(device)
                                 targets = targets.to(device)
-                                these_predictions, certainties, synchronisation = model(inputs)
+                                out = model(inputs)
+                                if isinstance(out[-1], dict):
+                                    these_predictions, certainties, synchronisation = out[:-1]
+                                else:
+                                    these_predictions, certainties, synchronisation = out
 
                                 loss = sort_loss(these_predictions, targets)
                                 all_losses.append(loss.item())

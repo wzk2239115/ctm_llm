@@ -546,7 +546,11 @@ if __name__=='__main__':
 
                             # Model-specific forward, reshape, loss for evaluation
                             if args.model == 'ctm':
-                                predictions_raw, certainties, _ = model(inputs)
+                                _out = model(inputs)
+                                if isinstance(_out[-1], dict):
+                                    predictions_raw, certainties, _ = _out[:-1]
+                                else:
+                                    predictions_raw, certainties, _ = _out
                                 predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1)) # B,S,C,T
                                 loss, where_most_certain, _ = maze_loss(predictions, certainties, targets, use_most_certain=True)
                                 all_predictions_list.append(predictions.argmax(2).detach().cpu().numpy()) # B,S,C,T -> argmax class -> B,S,T
@@ -593,7 +597,6 @@ if __name__=='__main__':
                     # Calculate full maze accuracy at chosen step/tick averaged over batches
                     train_accuracies_most_certain_permaze.append((all_targets == all_predictions_most_certain).reshape(all_targets.shape[0], -1).all(-1).mean()) # Scalar
 
-
                     # TEST METRICS
                     pbar.set_description('Tracking: Computing TEST metrics')
                     loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test)
@@ -603,14 +606,19 @@ if __name__=='__main__':
                     all_losses = []
 
                     with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
+                       for inferi, (inputs, targets) in enumerate(loader):
+                            
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             all_targets_list.append(targets.detach().cpu().numpy())
 
                              # Model-specific forward, reshape, loss for evaluation
                             if args.model == 'ctm':
-                                predictions_raw, certainties, _ = model(inputs)
+                                _out = model(inputs)
+                                if isinstance(_out[-1], dict):
+                                    predictions_raw, certainties, _ = _out[:-1]
+                                else:
+                                    predictions_raw, certainties, _ = _out
                                 predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1)) # B,S,C,T
                                 loss, where_most_certain, _ = maze_loss(predictions, certainties, targets, use_most_certain=True)
                                 all_predictions_list.append(predictions.argmax(2).detach().cpu().numpy()) # B,S,T
