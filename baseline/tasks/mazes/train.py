@@ -19,7 +19,10 @@ from baseline.models.ff import FFBaseline
 from baseline.tasks.mazes.plotting import make_maze_gif
 from baseline.tasks.image_classification.plotting import plot_neural_dynamics 
 from baseline.utils.housekeeping import set_seed, zip_python_code
-from baseline.utils.losses import maze_loss 
+from baseline.utils.losses import maze_loss
+from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
+from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
+from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 
 import torchvision
@@ -126,7 +129,9 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='List of GPU(s) to use. Set to -1 to use CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
 
-
+    add_jepa_args(parser)
+    add_all_idea_args(parser)
+    add_train_idea_args(parser)
     args = parser.parse_args()
     return args
 
@@ -185,6 +190,32 @@ if __name__=='__main__':
             neuron_select_type=args.neuron_select_type,
             n_random_pairing_self=args.n_random_pairing_self,
         ).to(device)
+        jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
+        if jepa_predictor is not None:
+            model.cross_tick_predictor = jepa_predictor
+        # --- Setup CTM ideas ---
+        if args.diff_memory:
+            mem_lengths = [int(m) for m in args.diff_memory_lengths.split(',')]
+            from baseline.utils.ctm_model_ideas import DifferentiatedMemoryNLM
+            model.nlm_differentiated = DifferentiatedMemoryNLM(
+                d_model=args.d_model,
+                memory_lengths=mem_lengths,
+                hidden_dims_list=[args.memory_hidden_dims] * len(mem_lengths),
+                dropout=args.dropout_nlm or args.dropout,
+            ).to(device)
+        model.topk_neurons = args.topk_neurons
+        model.async_tick_mode = args.async_tick_mode
+        model.async_tick_periods = args.async_tick_periods
+        model.async_tick_phases = args.async_tick_phases
+        model.tick_halt_mode = args.tick_halt_mode
+        model.tick_halt_threshold = args.tick_halt_threshold
+        model.tick_min_ticks = args.tick_min_ticks
+        if args.reflex_head:
+            model.reflex_head = ReflexHead(
+                synch_size=model.synch_representation_size_out,
+                out_dims=args.out_dims,
+            ).to(device)
+            model.reflex_ticks = args.reflex_ticks
     elif args.model == 'lstm':
          model = LSTMBaseline(
             num_layers=args.num_layers,
@@ -374,12 +405,45 @@ if __name__=='__main__':
                      torch.compiler.cudagraph_mark_step_begin()
 
                 if args.model == 'ctm':
-                    # CTM output: (B, SeqLength*5, Ticks), Certainties: (B, Ticks)
-                    predictions_raw, certainties, synchronisation = model(inputs)
-                    # Reshape predictions: (B, SeqLength, 5, Ticks)
-                    predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1))
-                    loss, where_most_certain, upto_where = maze_loss(predictions, certainties, targets, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)
-                    # Accuracy uses predictions[B, S, C, T] indexed at where_most_certain[B] -> gives (B, S, C) -> argmax(2) -> (B,S)
+                    ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
+                                    args.tick_loss_mode != 'last' or args.reflex_head or
+                                    args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
+                                    args.ema_distill_weight > 0)
+                    if ideas_active:
+                        out = model(inputs, return_per_tick_synch=(args.cross_tick_jepa_weight > 0))
+                        if isinstance(out[-1], dict):
+                            *base, extras = out
+                            predictions_raw, certainties, synchronisation = base
+                        else:
+                            predictions_raw, certainties, synchronisation = out
+                            extras = {}
+                        predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1))
+                        loss, where_most_certain, upto_where = maze_loss(predictions, certainties, targets, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)
+                        # Multi-tick: maze_loss already uses most_certain, but we can weight by compute_multi_tick_loss
+                        if args.tick_loss_mode != 'last':
+                            loss = compute_multi_tick_loss(predictions.argmax(2), targets,
+                                                           lambda p, t: maze_loss(predictions, certainties, t, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)[0],
+                                                           mode=args.tick_loss_mode, certainties=certainties,
+                                                           weights=args.tick_loss_weights)
+                        if args.cross_tick_jepa_weight > 0 and hasattr(model, 'cross_tick_predictor') and 'synch_per_tick' in extras:
+                            from baseline.utils.jepa import compute_jepa_loss
+                            synch_per_tick = extras['synch_per_tick']
+                            loss = loss + compute_jepa_loss(
+                                model.cross_tick_predictor, synch_per_tick,
+                                args.cross_tick_jepa_weight, args.cross_tick_jepa_loss,
+                                args.cross_tick_jepa_target_stop_grad)
+                        if args.tick_compute_weight > 0:
+                            n_steps = extras.get('n_steps_used', args.iterations)
+                            loss = loss + compute_tick_penalty(n_steps, args.iterations, args.tick_compute_weight)
+                        # Draft-revise loss
+                        if args.draft_revise_weight > 0 and 'draft_prediction' in extras:
+                            dp = extras['draft_prediction']
+                            draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
+                            loss = loss + args.draft_revise_weight * draft_loss
+                    else:
+                        predictions_raw, certainties, synchronisation = model(inputs)
+                        predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1))
+                        loss, where_most_certain, upto_where = maze_loss(predictions, certainties, targets, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)
                     accuracy_finegrained = (predictions.argmax(2)[torch.arange(predictions.size(0), device=predictions.device), :, where_most_certain] == targets).float().mean().item()
 
                 elif args.model == 'lstm':

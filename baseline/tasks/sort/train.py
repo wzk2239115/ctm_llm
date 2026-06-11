@@ -17,8 +17,11 @@ from baseline.models.ctm_sort import ContinuousThoughtMachineSORT
 from baseline.tasks.image_classification.plotting import plot_neural_dynamics, make_classification_gif
 from baseline.utils.housekeeping import set_seed, zip_python_code
 from baseline.utils.losses import sort_loss
+from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
 from baseline.tasks.sort.utils import compute_ctc_accuracy, decode_predictions
 from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
+from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
+from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 
 import torchvision
 torchvision.disable_beta_transforms_warning()
@@ -118,6 +121,9 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1],
                         help='List of GPU(s) to use. Set to -1 to use CPU.')
 
+    add_jepa_args(parser)
+    add_all_idea_args(parser)
+    add_train_idea_args(parser)
     args = parser.parse_args()
     return args
 
@@ -185,6 +191,42 @@ if __name__=='__main__':
         neuron_select_type=args.neuron_select_type,
         n_random_pairing_self=args.n_random_pairing_self,
     ).to(device)
+
+    # --- Setup CTM ideas ---
+    nlm_diff = None
+    if args.diff_memory:
+        mem_lengths = [int(m) for m in args.diff_memory_lengths.split(',')]
+        from baseline.utils.ctm_model_ideas import DifferentiatedMemoryNLM
+        nlm_diff = DifferentiatedMemoryNLM(
+            d_model=args.d_model,
+            memory_lengths=mem_lengths,
+            hidden_dims_list=[args.memory_hidden_dims] * len(mem_lengths),
+            dropout=args.dropout_nlm or args.dropout,
+        ).to(device)
+        model.nlm_differentiated = nlm_diff
+
+    # Set idea attributes on model
+    model.topk_neurons = args.topk_neurons
+    model.async_tick_mode = args.async_tick_mode
+    model.async_tick_periods = args.async_tick_periods
+    model.async_tick_phases = args.async_tick_phases
+    model.tick_halt_mode = args.tick_halt_mode
+    model.tick_halt_threshold = args.tick_halt_threshold
+    model.tick_min_ticks = args.tick_min_ticks
+
+    # Reflex head
+    if args.reflex_head:
+        model.reflex_head = ReflexHead(
+            synch_size=model.synch_representation_size_out,
+            out_dims=args.out_dims,
+        ).to(device)
+        model.reflex_ticks = args.reflex_ticks
+    else:
+        model.reflex_head = None
+
+    jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
+    if jepa_predictor is not None:
+        model.cross_tick_predictor = jepa_predictor
 
     
     model.train()
@@ -305,8 +347,42 @@ if __name__=='__main__':
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
                 if args.do_compile:
                     torch.compiler.cudagraph_mark_step_begin()
-                predictions, certainties, synchronisation = model(inputs)
-                loss = sort_loss(predictions, targets)
+                ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
+                                args.tick_loss_mode != 'last' or args.reflex_head or
+                                args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
+                                args.ema_distill_weight > 0)
+                if ideas_active:
+                    out = model(inputs, return_per_tick_synch=(args.cross_tick_jepa_weight > 0))
+                    if isinstance(out[-1], dict):
+                        *base, extras = out
+                        predictions, certainties, synchronisation = base
+                    else:
+                        predictions, certainties, synchronisation = out
+                        extras = {}
+                    loss = compute_multi_tick_loss(predictions, targets, sort_loss,
+                                                   mode=args.tick_loss_mode,
+                                                   certainties=certainties,
+                                                   weights=args.tick_loss_weights)
+                    # JEPA loss
+                    if args.cross_tick_jepa_weight > 0 and hasattr(model, 'cross_tick_predictor') and 'synch_per_tick' in extras:
+                        from baseline.utils.jepa import compute_jepa_loss
+                        synch_per_tick = extras['synch_per_tick']
+                        loss = loss + compute_jepa_loss(
+                            model.cross_tick_predictor, synch_per_tick,
+                            args.cross_tick_jepa_weight, args.cross_tick_jepa_loss,
+                            args.cross_tick_jepa_target_stop_grad)
+                    # Tick compute penalty
+                    if args.tick_compute_weight > 0:
+                        n_steps = extras.get('n_steps_used', args.iterations)
+                        loss = loss + compute_tick_penalty(n_steps, args.iterations, args.tick_compute_weight)
+                    # Draft-revise loss
+                    if args.draft_revise_weight > 0 and 'draft_prediction' in extras:
+                        dp = extras['draft_prediction']
+                        draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
+                        loss = loss + args.draft_revise_weight * draft_loss
+                else:
+                    predictions, certainties, synchronisation = model(inputs)
+                    loss = sort_loss(predictions, targets)
             
                         
             scaler.scale(loss).backward()

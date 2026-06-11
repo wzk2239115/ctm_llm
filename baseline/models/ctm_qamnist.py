@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from baseline.models.ctm import ContinuousThoughtMachine
 from baseline.models.modules import MNISTBackbone, QAMNISTIndexEmbeddings, QAMNISTOperatorEmbeddings
+from baseline.utils.ctm_model_ideas import apply_topk_sparsity, get_async_tick_mask, should_halt
 
 class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
     def __init__(self,
@@ -123,9 +124,19 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
 
 
 
-    def forward(self, x, z, track=False):
+    def forward(self, x, z, track=False, return_per_tick_synch=False):
         B = x.size(0)
         device = x.device
+
+        topk = getattr(self, 'topk_neurons', 1.0)
+        async_mode = getattr(self, 'async_tick_mode', 'none')
+        async_periods = getattr(self, 'async_tick_periods', None)
+        async_phases = getattr(self, 'async_tick_phases', None)
+        halt_mode = getattr(self, 'tick_halt_mode', 'none')
+        halt_threshold = getattr(self, 'tick_halt_threshold', 0.0)
+        min_ticks = getattr(self, 'tick_min_ticks', 1)
+        use_reflex = hasattr(self, 'reflex_head') and self.reflex_head is not None
+        nlm_diff = getattr(self, 'nlm_differentiated', None)
 
         # --- Tracking Initialization ---
         pre_activations_tracking = []
@@ -133,21 +144,30 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
         attention_tracking = []
         embedding_tracking = []
 
+        # --- Per-tick synch tracking ---
+        if return_per_tick_synch:
+            synch_per_tick = []
+
         total_iterations_for_digits = x.size(1)
         total_iterations_for_question = z.size(1)
         total_iterations = total_iterations_for_digits + total_iterations_for_question + self.iterations_for_answering
 
         # --- Initialise Recurrent State ---
-        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
-        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
+        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1)
+        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1)
+        d_model = activated_state.size(-1)
 
         # --- Storage for outputs per iteration ---
         predictions = torch.empty(B, self.out_dims, total_iterations, device=device, dtype=x.dtype)
         certainties = torch.empty(B, 2, total_iterations, device=device, dtype=x.dtype)
+        n_steps_used = total_iterations
+        reflex_preds = []
+        draft_pred = None
+        draft_mode = getattr(self, 'draft_mode', 'none')
 
         # --- Initialise Recurrent Synch Values  ---
         decay_alpha_action, decay_beta_action = None, None
-        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)  # Fix from github user: kuviki
+        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
         self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
         r_action, r_out = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1), torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
 
@@ -163,6 +183,12 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
             kv, prev_input = self.get_kv_for_step(total_iterations_for_digits, total_iterations_for_question, stepi, x, z, prev_input, prev_kv)
             prev_kv = kv
 
+            async_mask = None
+            if async_mode == 'banded' and async_periods is not None:
+                periods = [int(p) for p in async_periods.split(',')]
+                phases = [int(p) for p in async_phases.split(',')] if async_phases else None
+                async_mask = get_async_tick_mask(stepi, d_model, periods, phases)
+
             synchronization_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
 
             # --- Interact with Data via Attention ---
@@ -171,17 +197,33 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
                 q = self.q_proj(synchronization_action).unsqueeze(1)
                 attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
                 attn_out = attn_out.squeeze(1)
-                pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
+                base_input = attn_out
             else:
-                kv = kv.squeeze(1)
-                pre_synapse_input = torch.concatenate((kv, activated_state), dim=-1)
+                kv_sq = kv.squeeze(1)
+                base_input = kv_sq
+
+            state_input = activated_state
+            if async_mask is not None:
+                state_input = activated_state * async_mask.unsqueeze(0).float()
+            pre_synapse_input = torch.concatenate((base_input, state_input), dim=-1)
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input)
+            if async_mask is not None:
+                state = state * async_mask.unsqueeze(0).float()
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
             # --- Apply NLMs ---
-            activated_state = self.trace_processor(state_trace)
+            if nlm_diff is not None:
+                activated_state = nlm_diff(state_trace)
+            else:
+                activated_state = self.trace_processor(state_trace)
+            if async_mask is not None:
+                activated_state = activated_state * async_mask.unsqueeze(0).float()
+
+            # --- Top-k Sparsity ---
+            if topk < 1.0:
+                activated_state = apply_topk_sparsity(activated_state, topk, stepi)
 
             # --- Calculate Synchronisation for Output Predictions ---
             synchronization_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
@@ -193,6 +235,32 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
 
+            # Draft-revise: save draft at block boundary, corrupt state
+            if draft_mode == 'revise':
+                from baseline.utils.ctm_model_ideas import apply_draft_revise_corruption
+                draft_block_size = getattr(self, 'draft_block_size', 2)
+                corrupt_prob = getattr(self, 'draft_corrupt_prob', 0.0)
+                _saved, activated_state = apply_draft_revise_corruption(
+                    stepi, draft_block_size, activated_state, corrupt_prob)
+                if _saved:
+                    draft_pred = current_prediction.detach()
+
+            # --- Per-tick synch tracking ---
+            if return_per_tick_synch:
+                synch_per_tick.append(synchronization_out)
+
+            # --- Reflex head ---
+            if use_reflex and stepi < getattr(self, 'reflex_ticks', 1):
+                rp = self.reflex_head(synchronization_out)
+                reflex_preds.append(rp)
+
+            # --- Tick halt ---
+            if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
+                n_steps_used = stepi + 1
+                if stepi + 1 < total_iterations:
+                    predictions[..., stepi+1:] = 0
+                break
+
             # --- Tracking ---
             if track:
                 pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
@@ -203,6 +271,21 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
                     embedding_tracking.append(kv.detach().cpu().numpy())
 
         # --- Return Values ---
+        extras = {}
+        if return_per_tick_synch:
+            extras['synch_per_tick'] = torch.stack(synch_per_tick, dim=-1)
+        if use_reflex and reflex_preds:
+            extras['reflex_preds'] = torch.stack(reflex_preds, dim=-1)
+        if draft_pred is not None:
+            extras['draft_prediction'] = draft_pred
+        extras['n_steps_used'] = n_steps_used
+
         if track:
-            return predictions, certainties, synchronization_out, np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking), np.array(embedding_tracking)
+            base = (predictions, certainties, synchronization_out,
+                    np.array(pre_activations_tracking), np.array(post_activations_tracking),
+                    np.array(attention_tracking), np.array(embedding_tracking))
+            return base + (extras,) if extras else base
+
+        if extras:
+            return predictions, certainties, synchronization_out, extras
         return predictions, certainties, synchronization_out

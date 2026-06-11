@@ -25,6 +25,9 @@ from baseline.tasks.parity.plotting import make_parity_gif
 from baseline.tasks.parity.utils import prepare_model, reshape_attention_weights, reshape_inputs
 from baseline.utils.housekeeping import set_seed, zip_python_code
 from baseline.utils.losses import parity_loss
+from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
+from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
+from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 
 torchvision.disable_beta_transforms_warning()
@@ -81,6 +84,9 @@ def parse_args():
     parser.add_argument('--device', type=int, nargs='+', default=[-1], help='GPU(s) or -1 for CPU.')
     parser.add_argument('--use_amp', action=argparse.BooleanOptionalAction, default=False, help='AMP autocast.')
 
+    add_jepa_args(parser)
+    add_all_idea_args(parser)
+    add_train_idea_args(parser)
     args = parser.parse_args()
     return args
 
@@ -123,6 +129,40 @@ if __name__=='__main__':
 
     # Build model
     model = prepare_model(prediction_reshaper, args, device)
+
+    # --- Setup CTM ideas (CTM model only) ---
+    if args.model_type == 'ctm':
+        nlm_diff = None
+        if args.diff_memory:
+            mem_lengths = [int(m) for m in args.diff_memory_lengths.split(',')]
+            from baseline.utils.ctm_model_ideas import DifferentiatedMemoryNLM
+            nlm_diff = DifferentiatedMemoryNLM(
+                d_model=args.d_model,
+                memory_lengths=mem_lengths,
+                hidden_dims_list=[args.memory_hidden_dims] * len(mem_lengths),
+                dropout=args.dropout_nlm or args.dropout,
+            ).to(device)
+            model.nlm_differentiated = nlm_diff
+
+        model.topk_neurons = args.topk_neurons
+        model.async_tick_mode = args.async_tick_mode
+        model.async_tick_periods = args.async_tick_periods
+        model.async_tick_phases = args.async_tick_phases
+        model.tick_halt_mode = args.tick_halt_mode
+        model.tick_halt_threshold = args.tick_halt_threshold
+        model.tick_min_ticks = args.tick_min_ticks
+
+        if args.reflex_head:
+            from baseline.utils.ctm_model_ideas import ReflexHead
+            model.reflex_head = ReflexHead(
+                synch_size=model.synch_representation_size_out,
+                out_dims=args.out_dims,
+            ).to(device)
+            model.reflex_ticks = args.reflex_ticks
+
+    jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
+    if jepa_predictor is not None:
+        model.cross_tick_predictor = jepa_predictor
 
     model.train()
 
@@ -217,9 +257,42 @@ if __name__=='__main__':
             targets = targets.to(device)
             
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
-                predictions, certainties, synchronisation = model(inputs)
-                predictions = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
-                loss, where_most_certain = parity_loss(predictions, certainties, targets, use_most_certain=args.use_most_certain)
+                ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
+                                args.tick_loss_mode != 'last' or args.reflex_head or args.model_type != 'ctm' or
+                                args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
+                                args.ema_distill_weight > 0)
+                if ideas_active and args.model_type == 'ctm':
+                    out = model(inputs, return_per_tick_synch=(args.cross_tick_jepa_weight > 0))
+                    if isinstance(out[-1], dict):
+                        *base, extras = out
+                        predictions, certainties, synchronisation = base
+                    else:
+                        predictions, certainties, synchronisation = out
+                        extras = {}
+                    loss = compute_multi_tick_loss(predictions, targets,
+                                                   lambda p, t: parity_loss(p, certainties, t)[0],
+                                                   mode=args.tick_loss_mode,
+                                                   certainties=certainties,
+                                                   weights=args.tick_loss_weights)
+                    if args.cross_tick_jepa_weight > 0 and hasattr(model, 'cross_tick_predictor') and 'synch_per_tick' in extras:
+                        from baseline.utils.jepa import compute_jepa_loss
+                        synch_per_tick = extras['synch_per_tick']
+                        loss = loss + compute_jepa_loss(
+                            model.cross_tick_predictor, synch_per_tick,
+                            args.cross_tick_jepa_weight, args.cross_tick_jepa_loss,
+                            args.cross_tick_jepa_target_stop_grad)
+                    if args.tick_compute_weight > 0:
+                        n_steps = extras.get('n_steps_used', args.iterations)
+                        loss = loss + compute_tick_penalty(n_steps, args.iterations, args.tick_compute_weight)
+                    # Draft-revise loss
+                    if args.draft_revise_weight > 0 and 'draft_prediction' in extras:
+                        dp = extras['draft_prediction']
+                        draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
+                        loss = loss + args.draft_revise_weight * draft_loss
+                else:
+                    predictions, certainties, synchronisation = model(inputs)
+                    predictions = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
+                    loss, where_most_certain = parity_loss(predictions, certainties, targets, use_most_certain=args.use_most_certain)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)

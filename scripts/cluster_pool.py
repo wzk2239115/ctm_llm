@@ -88,10 +88,18 @@ def gpu_sets_overlap(left, right):
 
 def node_can_accept_task(node, task, addr):
     requested = task_gpus_for_addr(task, addr)
-    busy = node.get("busy_gpus") or []
+    gpu_slots = node.get("gpu_slots_config", 1)
+    gpu_slots_used = node.get("gpu_slots_used", {})
     if requested is None:
-        return not busy and not node.get("running_tasks")
-    return not set(requested) & set(busy)
+        total = node.get("gpus", 0)
+        for gpu in range(total):
+            if gpu_slots_used.get(str(gpu), 0) >= gpu_slots:
+                return False
+        return True
+    for gpu in requested:
+        if gpu_slots_used.get(str(gpu), 0) >= gpu_slots:
+            return False
+    return True
 
 
 def load_cluster_config(path):
@@ -610,6 +618,12 @@ def run_worker(args):
         running_tasks = sorted(procs)
         status = "idle" if not procs else "running:" + ",".join(running_tasks)
 
+        gpu_slots_config = args.gpu_slots
+        gpu_slots_used = {}
+        for item in procs.values():
+            for gpu in (item.get("gpus") or []):
+                gpu_slots_used[str(gpu)] = gpu_slots_used.get(str(gpu), 0) + 1
+
         heartbeat = {
             "node_addr": node_addr,
             "rank": rank,
@@ -621,6 +635,8 @@ def run_worker(args):
             "busy_gpus": busy_gpus,
             "running_tasks": running_tasks,
             "pid": next(iter(procs.values()))["proc"].pid if procs else None,
+            "gpu_slots_config": gpu_slots_config,
+            "gpu_slots_used": gpu_slots_used,
         }
         try:
             post_json(f"{base}/heartbeat", heartbeat, timeout=5)
@@ -635,14 +651,25 @@ def run_worker(args):
 
         if task and task["task_id"] not in procs:
             requested_gpus = task_gpus_for_addr(task, node_addr)
-            if any(gpu_sets_overlap(requested_gpus, item.get("gpus")) for item in procs.values()):
-                msg = f"busy gpus={busy_gpus}, requested={requested_gpus or 'all'}"
-                print(f"[worker] task {task['task_id']} ignored: {msg}", flush=True)
+            reject = False
+            reject_msg = ""
+            if requested_gpus is not None:
+                for gpu in requested_gpus:
+                    used = gpu_slots_used.get(str(gpu), 0)
+                    if used >= gpu_slots_config:
+                        reject = True
+                        reject_msg = f"slot full gpu={gpu} used={used}/{gpu_slots_config}"
+                        break
+            elif busy_gpus:
+                reject = True
+                reject_msg = f"busy gpus={busy_gpus}, requested=all"
+            if reject:
+                print(f"[worker] task {task['task_id']} ignored: {reject_msg}", flush=True)
                 post_json(f"{base}/ack", {
                     "node_addr": node_addr,
                     "task_id": task["task_id"],
                     "status": "busy",
-                    "message": msg,
+                    "message": reject_msg,
                 })
             else:
                 if args.auto_pull:
@@ -1116,6 +1143,8 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--node_addr", default=None)
     p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument("--gpu-slots", type=int, default=1,
+                   help="Number of concurrent tasks per GPU (default 1 = exclusive)")
     p.add_argument("--no_auto_pull", action="store_false", dest="auto_pull")
     p.add_argument("--no_restart_on_update", action="store_false", dest="restart_on_update")
     p.set_defaults(auto_pull=True, restart_on_update=True)

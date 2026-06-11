@@ -7,6 +7,7 @@ from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 from baseline.models.modules import ParityBackbone, SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
 from baseline.models.resnet import prepare_resnet_backbone
 from baseline.models.utils import compute_normalized_entropy
+from baseline.utils.ctm_model_ideas import apply_topk_sparsity, get_async_tick_mask, should_halt
 
 from baseline.models.constants import (
     VALID_NEURON_SELECT_TYPES,
@@ -524,9 +525,19 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
 
 
-    def forward(self, x, track=False):
+    def forward(self, x, track=False, return_per_tick_synch=False):
         B = x.size(0)
         device = x.device
+
+        # --- Read idea config attributes (set by training script) ---
+        topk = getattr(self, 'topk_neurons', 1.0)
+        async_mode = getattr(self, 'async_tick_mode', 'none')
+        async_periods = getattr(self, 'async_tick_periods', None)
+        async_phases = getattr(self, 'async_tick_phases', None)
+        halt_mode = getattr(self, 'tick_halt_mode', 'none')
+        halt_threshold = getattr(self, 'tick_halt_threshold', 0.0)
+        min_ticks = getattr(self, 'tick_min_ticks', 1)
+        use_reflex = hasattr(self, 'reflex_head') and self.reflex_head is not None
 
         # --- Tracking Initialization ---
         pre_activations_tracking = []
@@ -535,29 +546,52 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         synch_action_tracking = []
         attention_tracking = []
 
+        # --- Per-tick synch tracking ---
+        if return_per_tick_synch:
+            synch_per_tick = []
+
         # --- Featurise Input Data ---
         kv = self.compute_features(x)
 
         # --- Initialise Recurrent State ---
+        trace_proc = getattr(self, 'trace_processor', None)
+        nlm_diff = getattr(self, 'nlm_differentiated', None)
+
         state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
         activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
+
+        d_model = activated_state.size(-1)
 
         # --- Prepare Storage for Outputs per Iteration ---
         predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
         certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+        n_steps_used = self.iterations
+
+        # --- Reflex head output storage ---
+        reflex_preds = []
+        use_reflex = use_reflex and self.reflex_head is not None
+
+        # --- Draft-revise state ---
+        draft_pred = None
+        draft_mode = getattr(self, 'draft_mode', 'none')
 
         # --- Initialise Recurrent Synch Values  ---
         decay_alpha_action, decay_beta_action = None, None
-        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)  # Fix from github user: kuviki
+        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
         self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
         r_action, r_out = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1), torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
 
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
-        # Compute learned weighting for synchronisation
-        
 
         # --- Recurrent Loop  ---
         for stepi in range(self.iterations):
+
+            # --- Async Tick Mask: determine which neurons are active ---
+            async_mask = None
+            if async_mode == 'banded' and async_periods is not None:
+                periods = [int(p) for p in async_periods.split(',')]
+                phases = [int(p) for p in async_phases.split(',')] if async_phases else None
+                async_mask = get_async_tick_mask(stepi, d_model, periods, phases)
 
             # --- Calculate Synchronisation for Input Data Interaction ---
             synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
@@ -566,18 +600,25 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             q = self.q_proj(synchronisation_action).unsqueeze(1)
             attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
             attn_out = attn_out.squeeze(1)
-            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
+            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1) if async_mask is None else torch.concatenate((attn_out, activated_state * async_mask.unsqueeze(0).float()), dim=-1)
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input)
-            # The 'state_trace' is the history of incoming pre-activations
+            if async_mask is not None:
+                state = state * async_mask.unsqueeze(0).float()
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
-            # --- Apply Neuron-Level Models ---
-            activated_state = self.trace_processor(state_trace)
-            # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
-            # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
-            # done using only the currect activated state (see compute_synchronisation method for explanation)
+            # --- Apply Neuron-Level Models (standard or differentiated) ---
+            if nlm_diff is not None:
+                activated_state = nlm_diff(state_trace)
+            else:
+                activated_state = trace_proc(state_trace)
+            if async_mask is not None:
+                activated_state = activated_state * async_mask.unsqueeze(0).float()
+
+            # --- Top-k Sparsity ---
+            if topk < 1.0:
+                activated_state = apply_topk_sparsity(activated_state, topk, stepi)
 
             # --- Calculate Synchronisation for Output Predictions ---
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
@@ -589,6 +630,33 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
 
+            # 8b. Draft-revise: save draft at block boundary, corrupt state
+            if draft_mode == 'revise':
+                from baseline.utils.ctm_model_ideas import apply_draft_revise_corruption
+                draft_block_size = getattr(self, 'draft_block_size', 2)
+                corrupt_prob = getattr(self, 'draft_corrupt_prob', 0.0)
+                _saved, activated_state = apply_draft_revise_corruption(
+                    stepi, draft_block_size, activated_state, corrupt_prob)
+                if _saved:
+                    draft_pred = current_prediction.detach()
+
+            # --- Reflex Head: produce early output ---
+            if use_reflex and stepi < getattr(self, 'reflex_ticks', 1):
+                rp = self.reflex_head(synchronisation_out)
+                reflex_preds.append(rp)
+
+            # --- Per-tick synch tracking for JEPA ---
+            if return_per_tick_synch:
+                synch_per_tick.append(synchronisation_out)
+
+            # --- Tick Halt: early exit ---
+            if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
+                n_steps_used = stepi + 1
+                # Zero out unused tick slots
+                if stepi + 1 < self.iterations:
+                    predictions[..., stepi+1:] = 0
+                break
+
             # --- Tracking ---
             if track:
                 pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
@@ -597,8 +665,30 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
                 synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
 
-        # --- Return Values ---
+        # --- Build return tuple ---
+        ret = (predictions, certainties, synchronisation_out)
+
+        if return_per_tick_synch:
+            synch_per_tick = torch.stack(synch_per_tick, dim=-1)
+
+        # Append extras: synch_per_tick, reflex_preds, n_steps_used
+        extras = {}
+        if return_per_tick_synch:
+            extras['synch_per_tick'] = synch_per_tick
+        if use_reflex and reflex_preds:
+            extras['reflex_preds'] = torch.stack(reflex_preds, dim=-1)
+        extras['n_steps_used'] = n_steps_used
+        if draft_pred is not None:
+            extras['draft_prediction'] = draft_pred
+
         if track:
-            return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+            base = (predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)),
+                    np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking))
+            if extras:
+                return base + (extras,)
+            return base
+
+        if extras:
+            return predictions, certainties, synchronisation_out, extras
         return predictions, certainties, synchronisation_out
 
