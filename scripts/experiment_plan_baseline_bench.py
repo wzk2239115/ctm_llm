@@ -48,15 +48,29 @@ METRICS_DIR = SCRIPTS / "runs" / "metrics"
 DEFAULT_CONFIG = "infra/envs/smoke_baseline.env"
 DEFAULT_MASTER_ADDR = "11.131.210.78"
 DEFAULT_PORT = 8765
-BASELINE_NODES = ("11.131.209.154", "11.131.210.3", "11.131.210.78", "11.131.211.9")
-_GPUS_PER_NODE = 8
+DEFAULT_BASELINE_NODES = ("11.131.209.154", "11.131.210.3", "11.131.210.78", "11.131.211.9")
+BASELINE_NODES = DEFAULT_BASELINE_NODES
+GPUS_PER_NODE = 8
 _slot_idx = [0]
+
+def configure_lanes(nodes=None, gpus_per_node=None):
+    global BASELINE_NODES, GPUS_PER_NODE
+    if nodes:
+        parsed = []
+        for item in nodes:
+            parsed.extend(part.strip() for part in item.split(",") if part.strip())
+        if parsed:
+            BASELINE_NODES = tuple(parsed)
+    if gpus_per_node is not None:
+        GPUS_PER_NODE = int(gpus_per_node)
+    _slot_idx[0] = 0
+
 
 def _next_slot():
     i = _slot_idx[0]
     _slot_idx[0] += 1
-    node = BASELINE_NODES[i // _GPUS_PER_NODE % len(BASELINE_NODES)]
-    gpu = i % _GPUS_PER_NODE
+    node = BASELINE_NODES[i // GPUS_PER_NODE % len(BASELINE_NODES)]
+    gpu = i % GPUS_PER_NODE
     return f"{node}:{gpu}"
 
 STAGES = (
@@ -1109,16 +1123,22 @@ def wait_until_idle(master_addr, port, task_id, poll_interval=30.0):
 
 def run_submit(args):
     """Submit experiments to the cluster pool."""
-    plan = build_plan(args.stage)
+    configure_lanes(args.lane_nodes, args.gpus_per_node)
+    plan = build_plan(args.stage, args.plan_size)
     if not plan:
         print("No experiments to submit.")
         return
     print(f"Submitting {len(plan)} experiments to pool at {args.master_addr}:{args.port}")
+    print(
+        f"Baseline lanes: {len(BASELINE_NODES)} node(s) x {GPUS_PER_NODE} GPU(s) "
+        f"= {len(BASELINE_NODES) * GPUS_PER_NODE} single-GPU lane(s)"
+    )
 
     submitted = []
     for i, e in enumerate(plan):
         print(f"\n[{i+1}/{len(plan)}] {e['name']}")
         print(f"  {e['question']}")
+        print(f"  lane: {e.get('node_addr')}")
         task = submit_to_pool(e, args.config, args.master_addr, args.port)
         if task and "task_id" in task:
             tid = task["task_id"]
@@ -1188,8 +1208,13 @@ def main():
     parser.add_argument("--poll_interval", type=float, default=30.0)
     parser.add_argument("--parallel", action="store_true",
                         help="Submit all tasks at once instead of waiting for each one.")
+    parser.add_argument("--lane_nodes", nargs="+", default=None,
+                        help="Node IPs used as single-GPU baseline lanes; comma or space separated.")
+    parser.add_argument("--gpus_per_node", type=int, default=GPUS_PER_NODE,
+                        help="Number of single-GPU baseline lanes per node.")
     args = parser.parse_args()
 
+    configure_lanes(args.lane_nodes, args.gpus_per_node)
     plan = build_plan(args.stage, args.plan_size)
 
     if args.action == "plan":

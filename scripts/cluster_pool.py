@@ -23,6 +23,7 @@ STATE = {
     "tasks": [],
     "acks": {},
     "next_master_port": 20000,
+    "next_task_seq": 0,
 }
 LOCK = threading.Lock()
 
@@ -303,8 +304,13 @@ class PoolHandler(BaseHTTPRequestHandler):
         self._write_json({"ok": True})
 
     def _handle_submit(self, payload):
-        task_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
         with LOCK:
+            STATE["next_task_seq"] = int(STATE.get("next_task_seq", 0)) + 1
+            task_id = (
+                time.strftime("%Y%m%d_%H%M%S")
+                + f"_{int(time.time() * 1000000) % 1000000:06d}"
+                + f"_{STATE['next_task_seq']:04d}"
+            )
             master_port = int(payload.get("master_port") or STATE.get("next_master_port", 20000))
             STATE["next_master_port"] = 20000 + ((master_port - 19999) % 30000)
         task = {
@@ -312,6 +318,7 @@ class PoolHandler(BaseHTTPRequestHandler):
             "config": payload["config"],
             "extra_args": payload.get("extra_args", ""),
             "node_addrs": payload.get("node_addrs") or [],
+            "env": payload.get("env") or {},
             "master_port": master_port,
             "created_at": time.time(),
             "status": "pending",
