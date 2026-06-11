@@ -5,3 +5,5 @@ pyarrow
 numpy
 tensorboard
 datasets
+mcap
+mcap-ros2-support
