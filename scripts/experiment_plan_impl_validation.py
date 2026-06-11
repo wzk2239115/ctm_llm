@@ -2053,6 +2053,16 @@ def latest_rows(metrics_dir):
         row = data[-1]
         row["metrics_file"] = path
         rows.append(row)
+    for path in glob.glob(os.path.join(metrics_dir, "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        data["metrics_file"] = path
+        rows.append(data)
     return rows
 
 
