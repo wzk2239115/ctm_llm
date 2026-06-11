@@ -31,3 +31,4 @@
 - **torchrun entry point 必须是 Python 文件**, 不能是 shell 脚本.
 - **pool submit payload 的 `env` 字段会透传给 worker 子进程**, 用于传 `CTM_EXPERIMENT_NAME` 等上下文.
 - **批量 submit 必须加 `--no-wait`**: `experiment_plan*.py submit` 默认 `--wait` 会在每个任务完成后才提交下一个, 1057 个任务要等几天. 加 `--no-wait` 一口气全部入队, workers 自动并行消费. 同理, `cluster_pool.py submit` 的 `--wait` 默认 0 (不等待).
+- **GPU slots 自动计算**: `--gpu-slots 0` (默认) 会根据显存和 d_model 自动算并发数. 80GB H100 + d_model=512 ≈ 16 slots/卡, d_model=1024 ≈ 8 slots/卡. 也可手动指定 `--gpu-slots N` 覆盖.

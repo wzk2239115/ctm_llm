@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -571,6 +572,21 @@ def restart_worker_process():
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+def auto_gpu_slots(gpus, config):
+    if not gpus:
+        return 1
+    total_mb = gpus[0]["memory_mb"]
+    total_gb = total_mb / 1024
+    train_args = config.get("TRAIN_ARGS", "")
+    d_model = 512
+    m = re.search(r'--d_model\s+(\d+)', train_args)
+    if m:
+        d_model = int(m.group(1))
+    gb_per_task = max(2.0, d_model * 0.008)
+    slots = max(1, int(total_gb / gb_per_task))
+    return min(slots, 64)
+
+
 def run_worker(args):
     config = load_cluster_config(args.config)
     node_addr = args.node_addr or detect_node_addr(config)
@@ -582,6 +598,10 @@ def run_worker(args):
     status = "idle"
     procs = {}
     process_head = git_head()
+
+    if args.gpu_slots < 1:
+        args.gpu_slots = auto_gpu_slots(gpus, config)
+        print(f"[worker] auto-slots: {args.gpu_slots} per GPU (d_model from config)", flush=True)
 
     print(f"CTM worker online: addr={node_addr} rank={rank} host={hostname}", flush=True)
     print(gpu_summary, flush=True)
@@ -1143,8 +1163,8 @@ def main():
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--node_addr", default=None)
     p.add_argument("--interval", type=float, default=5.0)
-    p.add_argument("--gpu-slots", type=int, default=1,
-                   help="Number of concurrent tasks per GPU (default 1 = exclusive)")
+    p.add_argument("--gpu-slots", type=int, default=0,
+                   help="Concurrent tasks per GPU (0=auto, 1=exclusive, N=custom)")
     p.add_argument("--no_auto_pull", action="store_false", dest="auto_pull")
     p.add_argument("--no_restart_on_update", action="store_false", dest="restart_on_update")
     p.set_defaults(auto_pull=True, restart_on_update=True)
