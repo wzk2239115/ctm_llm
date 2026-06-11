@@ -30,7 +30,7 @@ TASKS = {
     )),
     "parity": ("baseline.tasks.parity.train", dict(
         seed=0, iterations=2, memory_length=5,
-        parity_sequence_length=8,
+        parity_sequence_length=9,
         d_model=64, d_input=32,
         n_synch_out=8, n_synch_action=8,
         synapse_depth=1, heads=2, memory_hidden_dims=4, dropout=0.0,
