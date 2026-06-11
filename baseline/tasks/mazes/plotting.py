@@ -41,8 +41,10 @@ def draw_path(x, route, valid_only=False, gt=False, cmap=None):
         A numpy array representing the maze image with the path drawn in blue.
     """
     x = np.copy(x)
-    start = np.argwhere((x == [1, 0, 0]).all(axis=2))
-    end = np.argwhere((x == [0, 1, 0]).all(axis=2))
+    start = np.argwhere(np.all(np.isclose(x, [1, 0, 0], atol=0.5), axis=2))
+    end = np.argwhere(np.all(np.isclose(x, [0, 1, 0], atol=0.5), axis=2))
+    if len(start) == 0:
+        return x
     if cmap is None:
         cmap = plt.get_cmap('winter') if not valid_only else  plt.get_cmap('summer')
 
@@ -77,7 +79,7 @@ def draw_path(x, route, valid_only=False, gt=False, cmap=None):
 
         # Draw the step
         if new_pos[0] >= 0 and new_pos[0] < x.shape[0] and new_pos[1] >= 0 and new_pos[1] < x.shape[1]:
-            if not ((x[new_pos] == [1,0,0]).all() or (x[new_pos] == [0,1,0]).all()):
+            if not (np.allclose(x[new_pos], [1,0,0], atol=0.5) or np.allclose(x[new_pos], [0,1,0], atol=0.5)):
                 colour = colors[si][:3]
                 si += 1
                 x[new_pos] = x[new_pos]*0.5 + colour*0.5
@@ -124,7 +126,7 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
     figscale = 1
     aspect_ratio = (len(mosaic[0]) * figscale, len(mosaic) * figscale * img_aspect) # W, H
     
-    route_steps = [np.unravel_index(np.argmax((inputs == np.reshape(np.array([1, 0, 0]), (3, 1, 1))).all(0)), inputs.shape[1:])]  # Starting point
+    route_steps = [np.unravel_index(np.argmax((np.isclose(inputs, np.reshape(np.array([1, 0, 0]), (3, 1, 1)), atol=0.5)).all(0)), inputs.shape[1:])]  # Starting point
     frames = []
     cmap = plt.get_cmap('gist_rainbow')
     cmap_viridis = plt.get_cmap('viridis')
