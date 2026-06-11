@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 POOL_CONFIG = "infra/envs/h100_baseline.env"
 MASTER_ADDR = "11.131.210.78"
-PORT = 8765
+PORT = 21999
 BASELINE_NODES = ("11.131.209.154", "11.131.210.3", "11.131.210.78", "11.131.211.9")
 GPUS_PER_NODE = 8
 _slot_idx = [0]
