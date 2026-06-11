@@ -1076,7 +1076,20 @@ def wait_until_idle(master_addr, port, task_id, poll_interval=30.0):
             tasks = status.get("tasks", [])
             for t in tasks:
                 if t["task_id"] == task_id and t["status"] in final:
-                    print(f"  [pool] task {task_id} → {t['status']}")
+                    print(f"  [pool] task {task_id} -> {t['status']}")
+                    rc = t.get("return_code")
+                    if rc is not None:
+                        print(f"  [pool] return_code={rc}")
+                    acks = status.get("acks", {}).get(task_id, {})
+                    for addr, ack in sorted(acks.items()):
+                        print(f"  [pool] ack {addr}: status={ack.get('status')} msg={ack.get('message', '')}")
+                    if t["status"] == "failed":
+                        log_path = "runs/logs/pool_last_run.log"
+                        if os.path.isfile(log_path):
+                            print(f"  [pool] last run log ({log_path}):")
+                            with open(log_path) as f:
+                                for line in f:
+                                    print(f"    {line}", end="")
                     return t["status"]
         except Exception:
             pass

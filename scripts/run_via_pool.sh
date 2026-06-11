@@ -8,8 +8,9 @@
 # Example: "$@" = "baseline.tasks.parity.train --seed 0 --iterations 75 ..."
 # This script runs: python -m baseline.tasks.parity.train --seed 0 --iterations 75 ...
 #
-# On failure, writes .fail.json to $CTM_METRICS_DIR (default: runs/metrics)
-# matching the same format as trainer/train.py write_failure_report().
+# Always writes combined stdout+stderr to runs/logs/pool_last_run.log so the
+# submit script can cat it on failure.  Also writes .fail.json when
+# $CTM_EXPERIMENT_NAME is set.
 
 set -euo pipefail
 
@@ -26,37 +27,37 @@ echo "[run_via_pool] Args: $*"
 echo "[run_via_pool] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}"
 echo "[run_via_pool] Start: $(date)"
 
-LOGTMP=$(mktemp /tmp/pool_run_XXXXXX)
-trap 'rm -f "$LOGTMP"' EXIT
+LOGDIR="runs/logs"
+mkdir -p "$LOGDIR"
+LOGPATH="$LOGDIR/pool_last_run.log"
 
 set +o pipefail
 set +e
-python -m "$MODULE" "$@" 2>&1 | tee "$LOGTMP"
+python -m "$MODULE" "$@" 2>&1 | tee "$LOGPATH"
 RC=${PIPESTATUS[0]}
 set -e
 set -o pipefail
 
-if [ $RC -ne 0 ] && [ -n "${CTM_EXPERIMENT_NAME:-}" ]; then
-    METRICS_DIR="${CTM_METRICS_DIR:-runs/metrics}"
-    FAIL_PATH="$METRICS_DIR/${CTM_EXPERIMENT_NAME}.fail.json"
-    mkdir -p "$METRICS_DIR"
-    CTM_EXPERIMENT_NAME="$CTM_EXPERIMENT_NAME" \
-    POOL_EXIT_CODE="$RC" \
-    POOL_LOG="$LOGTMP" \
-    POOL_FAIL_PATH="$FAIL_PATH" \
-    python3 -c "
+if [ $RC -ne 0 ]; then
+    echo "[run_via_pool] exit_code=$RC" >> "$LOGPATH"
+    if [ -n "${CTM_EXPERIMENT_NAME:-}" ]; then
+        METRICS_DIR="${CTM_METRICS_DIR:-runs/metrics}"
+        FAIL_PATH="$METRICS_DIR/${CTM_EXPERIMENT_NAME}.fail.json"
+        mkdir -p "$METRICS_DIR"
+        CTM_EXPERIMENT_NAME="$CTM_EXPERIMENT_NAME" \
+        POOL_EXIT_CODE="$RC" \
+        POOL_LOG="$LOGPATH" \
+        POOL_FAIL_PATH="$FAIL_PATH" \
+        python3 -c "
 import json, os, sys, time
-
 exp_name = os.environ['CTM_EXPERIMENT_NAME']
 try:
     with open(os.environ['POOL_LOG']) as f:
         stderr_text = f.read()[-4000:]
 except Exception:
     stderr_text = '<no log captured>'
-
 rc = int(os.environ['POOL_EXIT_CODE'])
 status = 'oom' if rc == 137 else 'failed'
-
 payload = {
     'experiment_name': exp_name,
     'status': status,
@@ -72,6 +73,7 @@ with open(path, 'w') as f:
     json.dump(payload, f, indent=2, ensure_ascii=False)
 print(f'[run_via_pool] wrote failure report: {path}', file=sys.stderr)
 "
+    fi
 fi
 
 exit $RC
