@@ -1,6 +1,9 @@
 import argparse
+import glob
 import os
 import random
+import shutil
+import tarfile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -124,6 +127,24 @@ def parse_args():
     return args
 
 
+def _prepare_cifar10(root):
+    """Seed CIFAR-10 from a local tarball (e.g. git-lfs) instead of downloading."""
+    expected_dir = os.path.join(root, 'cifar-10-batches-py')
+    if os.path.isdir(expected_dir):
+        return
+    candidates = glob.glob(os.path.join(os.path.dirname(__file__), '..', '..', 'cifar-10-python.tar.gz'))
+    candidates += glob.glob('cifar-10-python.tar.gz')
+    for cand in candidates:
+        cand = os.path.abspath(cand)
+        if os.path.isfile(cand) and os.path.getsize(cand) > 100_000:
+            os.makedirs(root, exist_ok=True)
+            if not os.path.isfile(os.path.join(root, 'cifar-10-python.tar.gz')):
+                shutil.copy2(cand, root)
+            with tarfile.open(os.path.join(root, 'cifar-10-python.tar.gz'), 'r:gz') as tar:
+                tar.extractall(root)
+            return
+
+
 def get_dataset(dataset, root):
     if dataset=='imagenet':
         dataset_mean = [0.485, 0.456, 0.406]
@@ -146,6 +167,7 @@ def get_dataset(dataset, root):
         train_data = ImageNet(which_split='train', transform=train_transform)
         test_data = ImageNet(which_split='validation', transform=test_transform)
     elif dataset=='cifar10':
+        _prepare_cifar10(root)
         dataset_mean = [0.49139968, 0.48215827, 0.44653124]
         dataset_std = [0.24703233, 0.24348505, 0.26158768]
         normalize = transforms.Normalize(mean=dataset_mean, std=dataset_std)
