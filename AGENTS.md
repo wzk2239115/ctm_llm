@@ -30,3 +30,4 @@
 - **task ID 用微秒+单调序号**, 避免快速批量 submit 时碰撞.
 - **torchrun entry point 必须是 Python 文件**, 不能是 shell 脚本.
 - **pool submit payload 的 `env` 字段会透传给 worker 子进程**, 用于传 `CTM_EXPERIMENT_NAME` 等上下文.
+- **批量 submit 必须加 `--no-wait`**: `experiment_plan*.py submit` 默认 `--wait` 会在每个任务完成后才提交下一个, 1057 个任务要等几天. 加 `--no-wait` 一口气全部入队, workers 自动并行消费. 同理, `cluster_pool.py submit` 的 `--wait` 默认 0 (不等待).
