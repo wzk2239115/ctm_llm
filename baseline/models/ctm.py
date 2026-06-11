@@ -677,7 +677,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             extras['synch_per_tick'] = synch_per_tick
         if use_reflex and reflex_preds:
             extras['reflex_preds'] = torch.stack(reflex_preds, dim=-1)
-        extras['n_steps_used'] = n_steps_used
+        if n_steps_used < self.iterations:
+            extras['n_steps_used'] = n_steps_used
         if draft_pred is not None:
             extras['draft_prediction'] = draft_pred
 
