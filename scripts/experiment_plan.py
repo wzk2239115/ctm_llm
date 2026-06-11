@@ -326,7 +326,7 @@ def is_final_metrics_row(row):
 
 base.configure_plan_defaults(
     metrics_prefix=METRICS_PREFIX,
-    cluster_config="infra/clusters/h100_2nodes.env",
+    cluster_config="infra/clusters/h100_4nodes.env",
     dispatch_block_sparse=False,
     build_plan=build_plan,
     summarize_fn=summarize,

@@ -397,7 +397,7 @@ def build_plan(stage, plan_size="full"):
 
 base.configure_plan_defaults(
     metrics_prefix=METRICS_PREFIX,
-    cluster_config="infra/clusters/h100_2nodes.env",
+    cluster_config="infra/clusters/h100_4nodes.env",
     dispatch_block_sparse=False,
     build_plan=build_plan,
     stages=REGIONAL_STAGES,
