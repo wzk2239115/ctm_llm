@@ -937,16 +937,16 @@ class CTMForCausalLM(BaseCTMForCausalLM):
             valid = shift_labels != -100
             if not valid.any():
                 continue
-            probs = F.softmax(shift_logits, dim=-1)
-            correct_prob = probs.gather(
+            log_correct_prob = F.log_softmax(shift_logits, dim=-1)
+            correct_logit = log_correct_prob.gather(
                 -1, shift_labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
             match = (shift_logits.argmax(-1) == shift_labels).float() * valid.float()
             denom = valid.float().sum(dim=1).clamp(min=1)
-            avg_conf = (correct_prob * valid.float()).sum(dim=1) / denom
+            avg_conf_logit = (correct_logit * valid.float()).sum(dim=1) / denom
             avg_match = match.sum(dim=1) / denom
             slot_commit_losses.append(
-                F.binary_cross_entropy(
-                    avg_conf.clamp(1e-6, 1 - 1e-6), avg_match, reduction='none'))
+                F.binary_cross_entropy_with_logits(
+                    avg_conf_logit, avg_match, reduction='none'))
         if not slot_commit_losses:
             return slot_logits.new_zeros(B)
         return torch.stack(slot_commit_losses, dim=1).mean(dim=1)
