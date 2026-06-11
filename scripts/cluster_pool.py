@@ -669,6 +669,8 @@ def run_worker(args):
                 extra = shlex.split(task.get("extra_args", ""))
                 cmd = ["bash", "scripts/train_cluster.sh", "--config", task["config"], *extra]
                 env = os.environ.copy()
+                if "--train_module" in extra:
+                    env["TRAIN_ENTRY"] = "scripts/run_via_pool.py"
                 env["CTM_NODE_ADDR"] = node_addr
                 env["CTM_POOL_MASTER_PORT"] = str(task.get("master_port") or 29500)
                 if task.get("node_addrs"):
