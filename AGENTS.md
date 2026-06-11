@@ -20,3 +20,13 @@
 - `dataset_data` 和 `model_tokenizer` 是符号链接, 已在 `.gitignore` 中排除, 每台机器需手动创建
 - 训练数据: `sft_t2a_mini.parquet` (515k 条英文对话), 按 `DATA_DOWNLOAD.md` 下载
 - 检查点: `out/ctm_llm_{hidden_size}.pth` (half) + `_resume.pth` (含 optimizer state)
+
+## Pool 并发工程准则
+- **日志路径必须 per-experiment 隔离**, 禁止多任务共享同一日志文件 (会被并发覆盖). 用 `CTM_LOG_DIR` + `{exp_name}.log` 模式.
+- **失败诊断要有 fallback 链**: `.fail.json` → per-experiment `.log` → `pool_last_run.log`, `.fail.json` 中存 `log_path` 便于定位.
+- **`cluster_pool.py` 改动必须重启 server**, worker 通常 auto-pull 无需手动干预.
+- **数据路径不要硬编码** (如 MNIST 的 `"data/"`), 应通过参数/环境变量传入, 避免换环境踩坑.
+- **GPU slot 分配用 `node:gpu` 格式** (如 `ip:0`), bare IP 会导致 `gpu_sets_overlap` 阻塞并行.
+- **task ID 用微秒+单调序号**, 避免快速批量 submit 时碰撞.
+- **torchrun entry point 必须是 Python 文件**, 不能是 shell 脚本.
+- **pool submit payload 的 `env` 字段会透传给 worker 子进程**, 用于传 `CTM_EXPERIMENT_NAME` 等上下文.
