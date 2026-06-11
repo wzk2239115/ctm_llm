@@ -25,6 +25,9 @@ Run on cluster (training + tok/s from trainer):
   python scripts/experiment_plan_real_sparse_compute.py probe-and-run --stage real
 """
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import experiment_plan_impl_validation as base
 
 

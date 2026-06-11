@@ -9,6 +9,9 @@ questions: capacity gradient, variable active compute, dynamic ticks, routing
 regularization, dispatch capacity, and multi-horizon supervision.
 """
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import experiment_plan_impl_validation as base
 
 

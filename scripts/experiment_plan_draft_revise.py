@@ -19,6 +19,9 @@ commands, quick-probe, probe-and-run, run-parallel, run-only, summarize, and
 batch recommendation helpers for the 4-node / 32-GPU pool.
 """
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import experiment_plan_impl_validation as base
 
 

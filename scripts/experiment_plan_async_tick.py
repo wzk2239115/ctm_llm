@@ -14,6 +14,9 @@ This plan uses only runnable training knobs. Stages progress from anchors to
 combined fast/slow/async-proxy stacks.
 """
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import experiment_plan_impl_validation as base
 
 

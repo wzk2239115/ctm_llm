@@ -31,6 +31,9 @@ Stages:
                      (linear schedule from fast-forget to slow-accumulate).
 """
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import experiment_plan_impl_validation as base
 
 FIX_STAGES = (
