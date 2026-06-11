@@ -669,6 +669,8 @@ def run_worker(args):
                 if requested_gpus is not None:
                     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in requested_gpus)
                     env["NPROC_PER_NODE"] = str(len(requested_gpus))
+                for k, v in task.get("env", {}).items():
+                    env[k] = v
                 print(f"[worker] received task {task['task_id']}: {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
                 proc = subprocess.Popen(cmd, env=env)
                 procs[task["task_id"]] = {

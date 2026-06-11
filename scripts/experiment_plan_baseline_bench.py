@@ -1042,6 +1042,10 @@ def submit_to_pool(exp, config, master_addr=None, port=None):
         "config": config,
         "extra_args": exp["command"],
         "node_addrs": node_addrs,
+        "env": {
+            "CTM_EXPERIMENT_NAME": exp["name"],
+            "CTM_METRICS_DIR": "runs/metrics",
+        },
     }
     base = f"http://{master_addr}:{port}"
     data = json.dumps(payload).encode()
