@@ -733,7 +733,7 @@ if __name__=='__main__':
                             attention_tracking_viz.shape[1], -1, att_shape[0], att_shape[1])
 
                         pbar.set_description('Tracking: Neural dynamics plot')
-                        plot_neural_dynamics(post_activations_viz, 100, args.log_dir, axis_snap=True)
+                        plot_neural_dynamics(post_activations_viz, min(100, post_activations_viz.shape[-1]), args.log_dir, axis_snap=True)
 
                         imgi = 0 # Visualize the first image in the batch
                         img_to_gif = np.moveaxis(np.clip(inputs_viz[imgi].detach().cpu().numpy()*np.array(dataset_std).reshape(len(dataset_std), 1, 1) + np.array(dataset_mean).reshape(len(dataset_mean), 1, 1), 0, 1), 0, -1)

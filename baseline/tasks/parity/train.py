@@ -270,7 +270,7 @@ if __name__=='__main__':
                         predictions, certainties, synchronisation = out
                         extras = {}
                     loss = compute_multi_tick_loss(predictions, targets,
-                                                   lambda p, t: parity_loss(p, certainties, t)[0],
+                                                   lambda p, t: parity_loss(p.reshape(p.size(0), -1, 2, p.size(-1)), certainties, t)[0],
                                                    mode=args.tick_loss_mode,
                                                    certainties=certainties,
                                                    weights=args.tick_loss_weights)
@@ -322,7 +322,7 @@ if __name__=='__main__':
                     inputs = reshape_inputs(inputs, args.iterations, grid_size=int(math.sqrt(args.parity_sequence_length)))
 
                     pbar.set_description('Tracking: Neural dynamics')
-                    plot_neural_dynamics(post_activations, 100, args.log_dir, axis_snap=True)
+                    plot_neural_dynamics(post_activations, min(100, post_activations.shape[-1]), args.log_dir, axis_snap=True)
 
                     pbar.set_description('Tracking: Producing attention gif')
 

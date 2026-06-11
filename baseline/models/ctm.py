@@ -591,7 +591,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             if async_mode == 'banded' and async_periods is not None:
                 periods = [int(p) for p in async_periods.split(',')]
                 phases = [int(p) for p in async_phases.split(',')] if async_phases else None
-                async_mask = get_async_tick_mask(stepi, d_model, periods, phases)
+                async_mask = get_async_tick_mask(stepi, d_model, periods, phases, device=device)
 
             # --- Calculate Synchronisation for Input Data Interaction ---
             synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')

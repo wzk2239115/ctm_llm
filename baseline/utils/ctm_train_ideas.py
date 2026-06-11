@@ -15,10 +15,10 @@ def compute_multi_tick_loss(
     total_loss = 0.0
 
     if mode == 'last':
-        return task_loss_fn(predictions[..., -1].squeeze(-1), targets)
+        return task_loss_fn(predictions[..., -1:], targets)
 
     for t in range(T):
-        p = predictions[..., t]
+        p = predictions[..., t:t+1]
         loss_t = task_loss_fn(p, targets)
         if mode == 'mean':
             total_loss = total_loss + loss_t / T

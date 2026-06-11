@@ -13,11 +13,11 @@ def apply_topk_sparsity(x, topk_fraction, stepi):
     return x * mask
 
 
-def get_async_tick_mask(stepi, num_neurons, async_tick_periods, async_tick_phases):
+def get_async_tick_mask(stepi, num_neurons, async_tick_periods, async_tick_phases, device='cpu'):
     """Return boolean mask [num_neurons] indicating which neurons are active at stepi.
     Band 0: always active. Band k: active every periods[k] ticks, starting at phase[k].
     """
-    mask = torch.zeros(num_neurons, dtype=torch.bool)
+    mask = torch.zeros(num_neurons, dtype=torch.bool, device=device)
     bands = len(async_tick_periods)
     neurons_per_band = num_neurons // bands
     for b in range(bands):

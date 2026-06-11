@@ -107,7 +107,7 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
             if async_mode == 'banded' and async_periods is not None:
                 periods = [int(p) for p in async_periods.split(',')]
                 phases = [int(p) for p in async_phases.split(',')] if async_phases else None
-                async_mask = get_async_tick_mask(stepi, d_model, periods, phases)
+                async_mask = get_async_tick_mask(stepi, d_model, periods, phases, device=device)
 
             pre_synapse_input = torch.concatenate((x, activated_state), dim=-1)
             if async_mask is not None:
