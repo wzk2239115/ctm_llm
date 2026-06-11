@@ -2573,15 +2573,15 @@ def export_final_plan(args):
 
 def summarize(args):
     stage_prefix = getattr(args, "stage", "all")
-    rows = [
+
+    def stage_match(name):
+        return stage_prefix == "all" or name.startswith(f"{stage_prefix}_")
+
+    success_rows = [
         row for row in latest_rows(args.metrics_dir)
-        if _ctx.is_final_metrics_row(row)
-        and (
-            stage_prefix == "all"
-            or row.get("experiment_name", "").startswith(f"{stage_prefix}_")
-        )
+        if _ctx.is_final_metrics_row(row) and stage_match(row.get("experiment_name", ""))
     ]
-    for row in rows:
+    for row in success_rows:
         loss = parse_float(row, "loss")
         peak_memory_mb = parse_float(row, "peak_memory_mb")
         tokens_per_sec = parse_float(row, "tokens_per_sec")
@@ -2606,9 +2606,18 @@ def summarize(args):
             )
             else ""
         )
-    rows.sort(key=lambda r: r.get("experiment_name", ""))
+    success_rows.sort(key=lambda r: r.get("experiment_name", ""))
+
+    failures = failure_reports_by_experiment(args.metrics_dir)
+    fail_rows = [
+        report for name, report in failures.items()
+        if stage_match(name)
+    ]
+    fail_rows.sort(key=lambda r: r.get("experiment_name", ""))
+
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    fields = [
+
+    success_fields = [
         "experiment_name", "model_type", "loss", "tokens_per_sec",
         "peak_memory_mb", "best_tick", "conf_tick", "tick_count",
         "effective_tick", "active_cell_fraction",
@@ -2632,10 +2641,22 @@ def summarize(args):
         "metrics_file",
     ]
     with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=success_fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
-    print(f"wrote summary: {args.output}")
+        writer.writerows(success_rows)
+    print(f"wrote summary ({len(success_rows)} ok): {args.output}")
+
+    fail_output = args.output.replace(".csv", "_fail.csv")
+    fail_fields = [
+        "experiment_name", "status", "rank", "error_type", "error",
+        "peak_memory_mb", "world_size", "global_step",
+        "failure_file",
+    ]
+    with open(fail_output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fail_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(fail_rows)
+    print(f"wrote fail summary ({len(fail_rows)} failed): {fail_output}")
 
 
 _ctx.summarize_fn = summarize
