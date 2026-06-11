@@ -36,6 +36,29 @@ class DINOProjectionHead(nn.Module):
         return self.last_layer(x)
 
 
+class CrossTickJEPAPredictor(nn.Module):
+    """Predicts tick_{i+1}'s representation from tick_i's representation.
+
+    JEPA-style predictor: lightweight MLP that maps the source tick's latent
+    to the target tick's latent. Cosine loss + stop-gradient on target prevents
+    representation collapse naturally (different sparse activations per tick
+    create sufficient 'view difference').
+    """
+    def __init__(self, hidden_dim, predictor_hidden_dim, depth=2, dropout=0.1):
+        super().__init__()
+        layers = []
+        dims = [hidden_dim] + [predictor_hidden_dim] * (depth - 1) + [hidden_dim]
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1], bias=False))
+            if i < len(dims) - 2:
+                layers.append(nn.GELU())
+                layers.append(nn.Dropout(dropout))
+        self.predictor = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.predictor(x)
+
+
 class CTMBlock(RegionalMoEMixin, nn.Module):
     def __init__(self, layer_id: int, config: CTMLLMConfig):
         super().__init__()
@@ -868,6 +891,18 @@ class CTMForCausalLM(BaseCTMForCausalLM):
             'sync_dino_center',
             torch.zeros(1, 1, 1), persistent=False,
         )
+
+        self.cross_tick_jepa_enabled = float(config.cross_tick_jepa_weight) > 0
+        self.cross_tick_predictor = None
+        self.last_cross_tick_jepa_loss = 0.0
+        if self.cross_tick_jepa_enabled:
+            self.cross_tick_predictor = CrossTickJEPAPredictor(
+                config.hidden_size,
+                int(config.cross_tick_jepa_hidden_dim),
+                int(config.cross_tick_jepa_predictor_depth),
+                float(config.cross_tick_jepa_dropout),
+            )
+
         self.objective_denoise_head = None
         if objective_enabled(config):
             self.objective_denoise_head = ObjectiveDenoiseHead(config.hidden_size)
@@ -1205,6 +1240,31 @@ class CTMForCausalLM(BaseCTMForCausalLM):
         slow_weight = float(self.config.slow_output_weight)
         base_w = float(self.config.tick_loss_base_weight)
         loss = (base_w + slow_weight) * final_loss + base_w * tick_loss
+
+        jepa_weight = float(self.config.cross_tick_jepa_weight)
+        if jepa_weight > 0 and self.cross_tick_predictor is not None and num_ticks > 1:
+            jepa_total = tick_outs.new_zeros(())
+            jepa_count = 0
+            for t in range(num_ticks - 1):
+                src = tick_outs[..., t]
+                tgt = tick_outs[..., t + 1]
+                if self.config.cross_tick_jepa_target_stop_grad:
+                    tgt = tgt.detach()
+                pred = self.cross_tick_predictor(src)
+                if self.config.cross_tick_jepa_loss == 'cosine':
+                    pred = F.normalize(pred, dim=-1)
+                    tgt = F.normalize(tgt, dim=-1)
+                    jepa_total = jepa_total + (1 - (pred * tgt).sum(dim=-1)).mean()
+                elif self.config.cross_tick_jepa_loss == 'mse':
+                    jepa_total = jepa_total + F.mse_loss(pred, tgt)
+                jepa_count += 1
+            if jepa_count > 0:
+                jepa_total = jepa_total / jepa_count
+            self.last_cross_tick_jepa_loss = float(jepa_total.detach().item())
+            loss = loss + jepa_weight * jepa_total
+        else:
+            self.last_cross_tick_jepa_loss = 0.0
+
         fast_slow_aux = self._fast_slow_output_loss(
             input_ids, labels, tick_outs, final_logits)
         loss = loss + fast_slow_aux

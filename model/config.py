@@ -172,6 +172,13 @@ class CTMLLMConfig:
         self.tick_sync_decay_start = kwargs.get('tick_sync_decay_start', 0.0)
         self.tick_sync_decay_end = kwargs.get('tick_sync_decay_end', 0.0)
 
+        self.cross_tick_jepa_weight = float(kwargs.get('cross_tick_jepa_weight', 0.0))
+        self.cross_tick_jepa_hidden_dim = int(kwargs.get('cross_tick_jepa_hidden_dim', 512))
+        self.cross_tick_jepa_loss = kwargs.get('cross_tick_jepa_loss', 'cosine')
+        self.cross_tick_jepa_predictor_depth = int(kwargs.get('cross_tick_jepa_predictor_depth', 2))
+        self.cross_tick_jepa_dropout = float(kwargs.get('cross_tick_jepa_dropout', 0.1))
+        self.cross_tick_jepa_target_stop_grad = bool(kwargs.get('cross_tick_jepa_target_stop_grad', True))
+
         assert self.d_model >= max(self.n_synch_out, self.n_synch_action), \
             f"d_model({self.d_model}) must >= n_synch_out({self.n_synch_out}) and n_synch_action({self.n_synch_action})"
         assert self.d_input % self.heads == 0, \
