@@ -100,7 +100,7 @@ TASKS = {
         warmup_steps=1, track_every=100, save_every=1000,
         reload=False, device=[0], use_amp=False,
         neuron_select_type="random",
-        data_root="/home/jovyan/h800fast/wangzekai/minimind-o/dataset/",
+        data_root="baseline/data/",
         n_test_batches=1,
         log_dir="/tmp/smoke/qamnist",
     )),
