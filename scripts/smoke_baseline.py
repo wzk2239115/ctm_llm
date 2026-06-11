@@ -101,7 +101,7 @@ TASKS = {
         data_root="baseline/data/",
         n_test_batches=1,
         log_dir="/tmp/smoke/qamnist",
-    ))),
+    )),
 }
 
 
