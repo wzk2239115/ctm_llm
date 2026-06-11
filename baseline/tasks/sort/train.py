@@ -224,7 +224,7 @@ if __name__=='__main__':
     else:
         model.reflex_head = None
 
-    jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
+    jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args).to(device)
     if jepa_predictor is not None:
         model.cross_tick_predictor = jepa_predictor
 
