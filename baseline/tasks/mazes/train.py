@@ -190,9 +190,10 @@ if __name__=='__main__':
             neuron_select_type=args.neuron_select_type,
             n_random_pairing_self=args.n_random_pairing_self,
         ).to(device)
-        jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
-        if jepa_predictor is not None:
-            model.cross_tick_predictor = jepa_predictor.to(device)
+        if hasattr(model, 'synch_representation_size_out'):
+            jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
+            if jepa_predictor is not None:
+                model.cross_tick_predictor = jepa_predictor.to(device)
         # --- Setup CTM ideas ---
         if args.diff_memory:
             mem_lengths = [int(m) for m in args.diff_memory_lengths.split(',')]

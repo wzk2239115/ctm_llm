@@ -160,9 +160,10 @@ if __name__=='__main__':
             ).to(device)
             model.reflex_ticks = args.reflex_ticks
 
-    jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
-    if jepa_predictor is not None:
-        model.cross_tick_predictor = jepa_predictor.to(device)
+    if hasattr(model, 'synch_representation_size_out'):
+        jepa_predictor = build_jepa_predictor(model.synch_representation_size_out, args)
+        if jepa_predictor is not None:
+            model.cross_tick_predictor = jepa_predictor.to(device)
 
     model.train()
 
