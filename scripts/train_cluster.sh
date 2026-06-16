@@ -80,20 +80,16 @@ expand_gpu_spec() {
   (IFS=','; echo "${out[*]}")
 }
 
+NODE_ADDRS=()
 if [[ -n "${CTM_POOL_NODE_ADDRS:-}" ]]; then
   IFS=',' read -r -a CTM_POOL_NODE_SPECS <<< "$CTM_POOL_NODE_ADDRS"
-  NODE_ADDRS=()
   CTM_POOL_LOCAL_GPU_SPEC=""
   for spec in "${CTM_POOL_NODE_SPECS[@]}"; do
     addr="$(parse_pool_node_spec "$spec")"
     NODE_ADDRS+=("$addr")
   done
   MASTER_ADDR="${NODE_ADDRS[0]}"
-fi
-
-if [[ "${#NODE_ADDRS[@]}" -eq 0 ]]; then
-  echo "NODE_ADDRS is empty in $CONFIG" >&2
-  exit 1
+  NNODES="${#NODE_ADDRS[@]}"
 fi
 
 detect_ipv4_addrs() {
@@ -113,29 +109,29 @@ detect_ipv4_addrs() {
   fi
 }
 
-NNODES="${#NODE_ADDRS[@]}"
-MASTER_ADDR="${MASTER_ADDR:-${NODE_ADDRS[0]}}"
 MASTER_PORT="${CTM_POOL_MASTER_PORT:-${MASTER_PORT:-29500}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 TRAIN_ENV="${TRAIN_ENV:-infra/envs/smoke_multinode.env}"
 
-if [[ -z "${NODE_RANK:-}" ]]; then
-  LOCAL_ADDRS="$(detect_ipv4_addrs | sort -u)"
-  NODE_RANK=""
-  for idx in "${!NODE_ADDRS[@]}"; do
-    if echo "$LOCAL_ADDRS" | grep -qx "${NODE_ADDRS[$idx]}"; then
-      NODE_RANK="$idx"
-      break
-    fi
-  done
+if [[ -n "${CTM_POOL_NODE_ADDRS:-}" ]]; then
+  if [[ -z "${NODE_RANK:-}" ]]; then
+    LOCAL_ADDRS="$(detect_ipv4_addrs | sort -u)"
+    NODE_RANK=""
+    for idx in "${!NODE_ADDRS[@]}"; do
+      if echo "$LOCAL_ADDRS" | grep -qx "${NODE_ADDRS[$idx]}"; then
+        NODE_RANK="$idx"
+        break
+      fi
+    done
 
-  if [[ -z "$NODE_RANK" ]]; then
-    echo "Could not auto-detect NODE_RANK." >&2
-    echo "Local IPv4 addresses:" >&2
-    echo "$LOCAL_ADDRS" >&2
-    echo "Cluster NODE_ADDRS: ${NODE_ADDRS[*]}" >&2
-    echo "Set CTM_NODE_ADDR=<one of NODE_ADDRS> or NODE_RANK=<rank>." >&2
-    exit 1
+    if [[ -z "$NODE_RANK" ]]; then
+      echo "Could not auto-detect NODE_RANK." >&2
+      echo "Local IPv4 addresses:" >&2
+      echo "$LOCAL_ADDRS" >&2
+      echo "Cluster NODE_ADDRS: ${NODE_ADDRS[*]}" >&2
+      echo "Set CTM_NODE_ADDR=<one of NODE_ADDRS> or NODE_RANK=<rank>." >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -150,7 +146,9 @@ if [[ -n "${CTM_POOL_NODE_SPECS[*]:-}" ]]; then
   fi
 fi
 
-export NNODES NODE_RANK MASTER_ADDR MASTER_PORT NPROC_PER_NODE
+export NNODES MASTER_ADDR MASTER_PORT NPROC_PER_NODE
+: "${NODE_RANK:=0}"
+export NODE_RANK
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
