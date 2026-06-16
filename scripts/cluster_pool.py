@@ -311,7 +311,6 @@ class PoolHandler(BaseHTTPRequestHandler):
             STATE["nodes"][addr] = payload
         if announce:
             print(f"[pool] node online/update: {addr} status={payload.get('status')}", flush=True)
-            print_pool()
         self._write_json({"ok": True})
 
     def _handle_submit(self, payload):
