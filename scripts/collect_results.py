@@ -23,14 +23,31 @@ def extract_name_and_key(ckpt_path, log_dir):
     return exp_dir, exp_dir
 
 
+TRACKING_KEYS = [
+    "test_accuracies_full_list",
+    "test_accuracies",
+    "val_accuracies",
+    "accuracy",
+]
+
+
 def extract_accuracies(checkpoint):
-    d = checkpoint
-    for key in ("test_accuracies_full_list", "test_accuracies"):
+    d = checkpoint if isinstance(checkpoint, dict) else {}
+    for key in TRACKING_KEYS:
         vals = d.get(key, [])
         if vals and isinstance(vals, (list, tuple)) and len(vals) > 0:
             clean = [v for v in vals if isinstance(v, (int, float))]
             if clean:
                 return clean[-1], len(clean)
+    # nested dicts (parity saves accuracy_means inside)
+    for v in d.values():
+        if isinstance(v, dict):
+            for key2 in TRACKING_KEYS:
+                vals = v.get(key2, [])
+                if vals and isinstance(vals, (list, tuple)) and len(vals) > 0:
+                    clean = [x for x in vals if isinstance(x, (int, float))]
+                    if clean:
+                        return clean[-1], len(clean)
     return None, 0
 
 
@@ -42,6 +59,8 @@ def main():
                         help="Output CSV path")
     parser.add_argument("--fail-only", action="store_true",
                         help="Only show missing/failed experiments")
+    parser.add_argument("--nonzero", action="store_true",
+                        help="Only show experiments with accuracy > 0")
     args = parser.parse_args()
 
     results = []
@@ -76,6 +95,8 @@ def main():
     print(f"  {'Experiment':45s} {'Final Acc':>10s}  {'Checkpts':>7s}")
     print(f"  {'-'*45}  {'-'*10}  {'-'*7}")
     for exp_name, acc, n in results:
+        if args.nonzero and acc == 0.0:
+            continue
         print(f"  {exp_name:45s} {acc:>10.4f}  {n:>7d}")
     if missing and not args.fail_only:
         print(f"\n  {'─'*70}")
