@@ -365,7 +365,11 @@ class PoolHandler(BaseHTTPRequestHandler):
                     task_set_status(t, status)
                     t["return_code"] = rc
                     break
-        print(f"[pool] task {task_id} {status} (rc={rc}) reported by {addr}", flush=True)
+        print(f"[pool] task {task_id} {status} (rc={rc}) {addr}", flush=True)
+        if rc != 0:
+            stderr_tail = payload.get("stderr_tail", [])
+            for line in stderr_tail:
+                print(f"  {line}", flush=True)
         self._write_json({"ok": True})
 
     def _handle_cancel(self, payload):
@@ -612,16 +616,22 @@ def run_worker(args):
         for task_id in finished:
             item = procs.pop(task_id)
             rc = item["proc"].returncode
+            stdout, stderr = item["proc"].communicate()
+            stderr_tail = (stderr or "").strip().splitlines()[-30:]
             print(
                 f"[worker] task {task_id} exited rc={rc} "
                 f"gpus={item.get('gpus') or 'all'}",
                 flush=True,
             )
+            if rc != 0 and stderr_tail:
+                for line in stderr_tail:
+                    print(f"  {line}", flush=True)
             try:
                 post_json(f"{base}/complete", {
                     "node_addr": node_addr,
                     "task_id": task_id,
                     "return_code": rc,
+                    "stderr_tail": stderr_tail,
                 }, timeout=5)
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 print(f"[worker] failed to report completion for {task_id}: {exc}", flush=True)
@@ -724,10 +734,11 @@ def run_worker(args):
                 for k, v in task.get("env", {}).items():
                     env[k] = v
                 print(f"[worker] received task {task['task_id']}: {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
-                proc = subprocess.Popen(cmd, env=env)
+                proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, env=env)
                 procs[task["task_id"]] = {
                     "proc": proc,
                     "gpus": requested_gpus,
+                    "stderr_lines": [],
                 }
                 post_json(f"{base}/ack", {
                     "node_addr": node_addr,
