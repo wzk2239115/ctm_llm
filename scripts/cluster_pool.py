@@ -791,6 +791,13 @@ def run_status(args):
 
 def run_task(args):
     base = f"http://{args.master_addr}:{args.port}"
+
+    if args.task_cmd == "history":
+        return run_task_history(args, base)
+
+    if args.task_cmd == "pending":
+        return run_task_pending(args, base)
+
     if args.task_cmd == "list":
         status = get_json(f"{base}/status")
         tasks = status.get("tasks", [])
@@ -798,15 +805,31 @@ def run_task(args):
             print("no tasks")
             return
         now = time.time()
-        fmt = "{:<22s} {:<12s} {:<8s} {:<6s} {}"
-        print(fmt.format("TASK_ID", "STATUS", "AGE(s)", "RC", "ARGS"))
-        for t in tasks:
-            age = int(now - t.get("created_at", now))
-            rc = str(t.get("return_code", "")) if t.get("return_code") is not None else ""
-            extra = t.get("extra_args", "")
-            if len(extra) > 50:
-                extra = extra[:47] + "..."
-            print(fmt.format(t["task_id"], t.get("status", "?"), str(age), rc, extra))
+        running = [t for t in tasks if t.get("status") == "running"]
+        pending = [t for t in tasks if t.get("status") == "pending"]
+        completed = [t for t in tasks if t.get("status") == "completed"]
+        failed = [t for t in tasks if t.get("status") == "failed"]
+        print(f"\n  TASKS: {len(tasks)} total  ({len(running)} running, {len(pending)} pending, {len(completed)} completed, {len(failed)} failed)")
+        print()
+        if running:
+            print(f"  RUNNING ({len(running)})")
+            for t in running:
+                name = _task_expname(t)
+                age = int(now - t.get("created_at", now))
+                print(f"    {name:50s}  running {age}s")
+            print()
+        if pending:
+            print(f"  PENDING ({len(pending)})")
+            for t in pending:
+                name = _task_expname(t)
+                print(f"    {name}")
+            print()
+        if completed or failed:
+            print(f"  FINISHED ({len(completed)} ok, {len(failed)} failed)")
+            for t in (completed + failed)[-10:]:
+                name = _task_expname(t)
+                print(f"    {name:50s}  {t.get('status')}")
+        return
     elif args.task_cmd == "cancel":
         if not args.task_id:
             print("error: --task_id required", file=sys.stderr)
@@ -852,6 +875,118 @@ def run_task(args):
     else:
         print(f"unknown task command: {args.task_cmd}", file=sys.stderr)
         sys.exit(1)
+
+
+def run_task_history(args, base):
+    status = get_json(f"{base}/status")
+    tasks = status.get("tasks", [])
+    duration = _parse_duration(args.duration)
+    if duration is None:
+        print(f"invalid duration: {args.duration}")
+        return
+    cutoff = time.time() - duration
+    finished = [t for t in tasks if t.get("status") in ("completed", "failed") and t.get("status_changed_at", 0) >= cutoff]
+    finished.sort(key=lambda t: t.get("status_changed_at", 0))
+
+    completed = [t for t in finished if t["status"] == "completed"]
+    failed = [t for t in finished if t["status"] == "failed"]
+    span = _fmt_time(duration)
+    print(f"\n  TASK HISTORY (last {span})")
+    print(f"  Completed: {len(completed)}  Failed: {len(failed)}  Total: {len(finished)}")
+    print()
+
+    if completed:
+        print(f"  COMPLETED")
+        print(f"  {'NAME':40s}  {'DURATION':>8s}  {'RESULT':20s}")
+        print(f"  {'-'*40s}  {'-'*8s}  {'-'*20s}")
+        for t in completed:
+            name = _task_expname(t)
+            dur = t.get("status_changed_at", 0) - t.get("created_at", 0)
+            metrics_dir = getattr(args, "metrics_dir", "runs/metrics")
+            extra = t.get("extra_args", "")
+            info = "?"
+            m = _read_experiment_metrics(metrics_dir, name)
+            if m:
+                info = f"acc={m.get('eval_accuracy','?')}" if m.get('eval_accuracy') else f"loss={m.get('loss','?')}"
+            print(f"  {name:40s}  {_fmt_time(dur):>8s}  {info}")
+
+    if failed:
+        print(f"\n  FAILED")
+        print(f"  {'NAME':40s}  {'DURATION':>8s}  {'REASON':30s}")
+        print(f"  {'-'*40s}  {'-'*8s}  {'-'*30s}")
+        for t in failed:
+            name = _task_expname(t)
+            dur = t.get("status_changed_at", 0) - t.get("created_at", 0)
+            rc = t.get("return_code")
+            fail_info = _read_failure(getattr(args, "metrics_dir", "runs/metrics"), name) if name else None
+            reason = fail_info.get("error_type", f"rc={rc}") if fail_info else f"rc={rc}" if rc is not None else "?"
+            print(f"  {name:40s}  {_fmt_time(dur):>8s}  {reason}")
+
+    if not finished:
+        print("  (no tasks finished in this window)")
+    print()
+
+
+def run_task_pending(args, base):
+    status = get_json(f"{base}/status")
+    tasks = status.get("tasks", [])
+    pending = [t for t in tasks if t.get("status") == "pending"]
+    if not pending:
+        print("  no pending tasks")
+        return
+    print(f"\n  PENDING ({len(pending)})")
+    for t in pending:
+        extra = t.get("extra_args", "")
+        name = _task_expname(t, extra)
+        age = time.time() - t.get("created_at", time.time())
+        print(f"  {name:50s}  queued {_fmt_time(age)}")
+    print()
+
+
+def _parse_duration(s):
+    s = str(s).strip().lower()
+    unit = 1
+    if s.endswith("h"):
+        unit = 3600
+        s = s[:-1]
+    elif s.endswith("m"):
+        unit = 60
+        s = s[:-1]
+    elif s.endswith("s"):
+        unit = 1
+        s = s[:-1]
+    try:
+        return float(s) * unit
+    except ValueError:
+        return None
+
+
+def _parse_gpu_list(ack_message):
+    if not ack_message:
+        return None
+    m = re.search(r"gpus=\[([^\]]*)\]|gpus=all", ack_message)
+    if not m:
+        return None
+    inner = m.group(1)
+    if inner is None:
+        return "all"
+    return [int(x) for x in inner.split(",") if x.strip().isdigit()]
+
+
+def _task_expname(task, extra=None):
+    env = task.get("env", {})
+    name = env.get("CTM_EXPERIMENT_NAME", "") if isinstance(env, dict) else ""
+    if name:
+        return name
+    exp = extra or task.get("extra_args", "")
+    for kw in ["--experiment_name", "--experiment-name"]:
+        idx = exp.find(kw)
+        if idx >= 0:
+            rest = exp[idx + len(kw) :].strip()
+            nrest = rest.split(None, 1)
+            if nrest:
+                return nrest[0]
+    return task["task_id"]
 
 
 def _fmt_time(seconds):
@@ -936,28 +1071,38 @@ def run_kanban(args):
         total_gpus = 0
         idle_gpus = 0
         node_lines = []
+
+        # Build GPU→task mapping from acks
+        gpu_task = {}
+        for t in tasks:
+            tid = t["task_id"]
+            e = _task_expname(t)
+            for addr, ack in acks.get(tid, {}).items():
+                gpu_list = _parse_gpu_list(ack.get("message", ""))
+                if gpu_list == "all":
+                    gpu_task.setdefault(addr, {})["all"] = e
+                elif gpu_list:
+                    for g in gpu_list:
+                        gpu_task.setdefault(addr, {})[str(g)] = e
+
         for addr, node in sorted(nodes.items()):
-            age = now - node.get("last_seen", now)
-            gpus = node.get("gpus", 0)
-            total_gpus += gpus
-            busy = node.get("busy_gpus", [])
-            idle = gpus - len(busy)
-            idle_gpus += idle
-            gpu_sum = node.get("gpu_summary", f"{gpus} GPU(s)")
             host = node.get("hostname", "?")
-            nodestatus = node.get("status", "?")
-            running = node.get("running_tasks", [])
-            run_str = ",".join(running) if running else "idle"
-            busy_str = ",".join(str(g) for g in busy) if busy else "-"
-            node_lines.append(
-                f"  {addr:20s} {host:12s} {gpu_sum:30s} "
-                f"busy=[{busy_str:10s}] {run_str}"
-            )
+            gpu_sum = node.get("gpu_summary", f"{node.get('gpus', '?')} GPU(s)")
+            node_gpu_map = gpu_task.get(addr, {})
+
+            total_gpus += node.get("gpus", 0)
+            lines.append(f"  {addr}  {host}  {gpu_sum}")
+
+            for gi in range(node.get("gpus", 0)):
+                task_name = node_gpu_map.get(str(gi), "-")
+                if task_name == "-":
+                    idle_gpus += 1
+                    lines.append(f"    GPU {gi:<2d}  idle")
+                else:
+                    lines.append(f"    GPU {gi:<2d}  {task_name}")
+
         n_nodes = len(nodes)
-        lines.append(f"  NODES: {n_nodes}   TOTAL GPUS: {total_gpus}   IDLE GPUS: {idle_gpus}")
-        if node_lines:
-            lines.append(thin)
-            lines.extend(node_lines)
+        lines.append(f"  NODES: {n_nodes}  TOTAL GPUS: {total_gpus}  IDLE GPUS: {idle_gpus}")
 
         lines.append(sep)
         lines.append("  TASK QUEUE")
@@ -987,38 +1132,7 @@ def run_kanban(args):
             created = t.get("created_at", now)
             elapsed = now - created
 
-            exp_name = ""
-            extra_args_for_module = extra
-            parts = extra.split(None, 1)
-            if len(parts) >= 2:
-                possible_module = parts[0]
-                if possible_module.startswith("baseline.") or possible_module.startswith("scripts."):
-                    extra_args_for_module = parts[1] if len(parts) > 1 else ""
-            elif len(parts) == 1:
-                extra_args_for_module = ""
-
-            for kw in ["--experiment_name", "--experiment-name"]:
-                idx_kw = extra_args_for_module.find(kw)
-                if idx_kw >= 0:
-                    rest = extra_args_for_module[idx_kw + len(kw):].strip()
-                    nrest = rest.split(None, 1)
-                    if nrest:
-                        exp_name = nrest[0]
-                    break
-
-            if not exp_name:
-                for kw in ["--metrics_path", "--metrics-path"]:
-                    idx_kw = extra.find(kw)
-                    if idx_kw >= 0:
-                        rest = extra[idx_kw + len(kw):].strip()
-                        nrest = rest.split(None, 1)
-                        if nrest:
-                            mpath = nrest[0]
-                            exp_name = os.path.splitext(os.path.basename(mpath))[0]
-                        break
-
-            if not exp_name:
-                exp_name = f"task_{tid}"
+            exp_name = _task_expname(t, extra)
 
             metrics = _read_experiment_metrics(metrics_dir, exp_name)
             max_steps = 0
@@ -1086,30 +1200,7 @@ def run_kanban(args):
 
             extra_label = extra[:50] + "..." if len(extra) > 50 else extra
 
-            exp_name = ""
-            for kw in ["--experiment_name", "--experiment-name"]:
-                idx_kw = extra.find(kw)
-                if idx_kw >= 0:
-                    rest = extra[idx_kw + len(kw):].strip()
-                    nrest = rest.split(None, 1)
-                    if nrest:
-                        exp_name = nrest[0]
-                    break
-            if not exp_name:
-                for kw in ["--metrics_path", "--metrics-path"]:
-                    idx_kw = extra.find(kw)
-                    if idx_kw >= 0:
-                        rest = extra[idx_kw + len(kw):].strip()
-                        nrest = rest.split(None, 1)
-                        if nrest:
-                            exp_name = os.path.splitext(os.path.basename(nrest[0]))[0]
-                        break
-
-            if not exp_name:
-                parts = extra.split(None, 1)
-                if parts:
-                    module = parts[0]
-                    exp_name = module.split(".")[-1] if "." in module else module
+            exp_name = _task_expname(t, extra)
 
             fail_info = None
             if st == "failed" and exp_name:
@@ -1190,8 +1281,12 @@ def main():
     p.set_defaults(func=run_status)
 
     p = sub.add_parser("task")
-    p.add_argument("task_cmd", choices=["list", "cancel", "cancel-pending", "clear", "info"])
+    p.add_argument("task_cmd", choices=["list", "cancel", "cancel-pending", "clear", "info", "history", "pending"])
     p.add_argument("--task_id", default=None)
+    p.add_argument("--duration", default="1h",
+                   help="Time window for history: e.g. 1h, 2h, 4h, 8h, 16h")
+    p.add_argument("--metrics_dir", default="runs/metrics",
+                   help="Metrics directory for reading accuracy/loss")
     p.add_argument("--master_addr", default="11.131.210.78")
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=run_task)
