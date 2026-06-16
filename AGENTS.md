@@ -32,3 +32,16 @@
 - **pool submit payload 的 `env` 字段会透传给 worker 子进程**, 用于传 `CTM_EXPERIMENT_NAME` 等上下文.
 - **批量 submit 必须加 `--no-wait`**: `experiment_plan*.py submit` 默认 `--wait` 会在每个任务完成后才提交下一个, 1057 个任务要等几天. 加 `--no-wait` 一口气全部入队, workers 自动并行消费. 同理, `cluster_pool.py submit` 的 `--wait` 默认 0 (不等待).
 - **GPU slots 自动计算**: `--gpu-slots 0` (默认) 会根据显存和 d_model 自动算并发数. 80GB H100 + d_model=512 ≈ 16 slots/卡, d_model=1024 ≈ 8 slots/卡. 也可手动指定 `--gpu-slots N` 覆盖.
+- **启动 pool**: server 只需 `--port`, worker 只需 `--master-addr` (不再需要 `--config` 集群文件). Worker 自动注册到 server 并被发现.
+
+### Pool 启动命令
+```bash
+# 任选一台起 server
+python scripts/cluster_pool.py server --port 8765
+
+# 所有节点起 worker (自动连 server)
+python scripts/cluster_pool.py worker --master-addr 11.131.210.78 --port 8765
+
+# 提交任务
+python scripts/experiment_plan_ctm_paper.py submit --stage all --no-wait
+```

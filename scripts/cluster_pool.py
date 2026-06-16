@@ -106,8 +106,10 @@ def node_can_accept_task(node, task, addr):
 def load_cluster_config(path):
     data = {}
     node_addrs = []
+    if not path:
+        return data
     if not os.path.exists(path):
-        raise FileNotFoundError(path)
+        return data
 
     in_nodes = False
     with open(path, "r", encoding="utf-8") as f:
@@ -588,9 +590,9 @@ def auto_gpu_slots(gpus, config):
 
 
 def run_worker(args):
-    config = load_cluster_config(args.config)
-    node_addr = args.node_addr or detect_node_addr(config)
-    rank = config.get("NODE_ADDRS", []).index(node_addr) if node_addr in config.get("NODE_ADDRS", []) else "?"
+    config = load_cluster_config(getattr(args, 'config', None))
+    node_addr = args.node_addr or detect_node_addr(config) or socket.gethostname()
+    rank = "?"
     base = f"http://{args.master_addr}:{args.port}"
     hostname = socket.gethostname()
     gpus = gpu_inventory()
@@ -754,7 +756,8 @@ def run_submit(args):
         for item in args.nodes:
             raw_nodes.extend(part for part in item.split(",") if part)
         node_addrs = [node.strip() for node in raw_nodes if node.strip()]
-    payload = {"config": args.config, "extra_args": extra_args, "node_addrs": node_addrs}
+    config_path = getattr(args, 'config', None) or ""
+    payload = {"config": config_path, "extra_args": extra_args, "node_addrs": node_addrs}
     resp = post_json(f"http://{args.master_addr}:{args.port}/submit", payload)
     task = resp["task"]
     print(f"submitted task {task['task_id']}: {task.get('extra_args', '')}")
@@ -762,8 +765,7 @@ def run_submit(args):
     if args.wait <= 0:
         return
 
-    config = load_cluster_config(args.config)
-    expected = {parse_node_spec(spec)[0] for spec in (node_addrs or config.get("NODE_ADDRS", []))}
+    expected = {parse_node_spec(spec)[0] for spec in node_addrs} if node_addrs else set()
     deadline = time.time() + args.wait
     seen = set()
     while time.time() < deadline:
@@ -1158,7 +1160,8 @@ def main():
     p.set_defaults(func=run_server)
 
     p = sub.add_parser("worker")
-    p.add_argument("--config", default="infra/clusters/h100_2nodes.env")
+    p.add_argument("--config", default=None,
+                   help="Cluster env file (optional, for git proxy/NCCL settings)")
     p.add_argument("--master_addr", default="11.131.210.78")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--node_addr", default=None)
@@ -1171,7 +1174,8 @@ def main():
     p.set_defaults(func=run_worker)
 
     p = sub.add_parser("submit")
-    p.add_argument("--config", default="infra/clusters/h100_2nodes.env")
+    p.add_argument("--config", default="",
+                   help="Task config env file (optional, e.g. infra/envs/h100_baseline.env)")
     p.add_argument("--master_addr", default="11.131.210.78")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--wait", type=float, default=30.0)
