@@ -180,5 +180,5 @@ class LSTMBaseline(nn.Module):
 
         # --- Return Values ---
         if track:
-            return predictions, certainties, None, np.array(activations_tracking), np.array(activations_tracking), np.array(attention_tracking), np.array(embedding_tracking)
+            return predictions, certainties, None, np.array(activations_tracking), np.array(activations_tracking), np.array(attention_tracking), np.array(embedding_tracking), {}
         return predictions, certainties, None

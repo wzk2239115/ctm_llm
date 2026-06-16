@@ -59,3 +59,7 @@ python scripts/experiment_plan_ctm_paper.py submit --stage all --no-wait
 1. **本地先跑** (快速看错误): `python scripts/smoke_baseline.py --iterations 10 --local`
 2. **再跑 pool** (测集群基建): `python scripts/smoke_baseline.py --iterations 10`
 3. 两轮都过了再正式 submit 实验计划
+
+### 算力机调试注意
+- **`.fail.json` 和 per-experiment `.log` 文件在算力机上生成**, 开发机无法直接访问. 需要用户从算力机手动复制到开发机 (或粘贴内容) 才能诊断失败原因.
+- 调试失败任务时, 请用户提供: `runs/metrics/{exp_name}.fail.json` 内容 + 对应的 `logs/{exp_name}.log` 末尾 traceback.

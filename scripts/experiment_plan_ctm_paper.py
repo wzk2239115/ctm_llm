@@ -261,6 +261,22 @@ def build_st01_architecture_sweep(plan):
             cfg["neuron_select_type"] = nst
             if nst == "random-pairing":
                 cfg["n_random_pairing_self"] = 0
+            # first-last needs d_model >= n_synch_out + n_synch_action
+            if nst == "first-last":
+                d_model = cfg.get("d_model", 512)
+                n_out = cfg.get("n_synch_out", 32)
+                n_act = cfg.get("n_synch_action", 32)
+                if d_model < n_out + n_act:
+                    print(f"  [skip] st01_{task_name}_nst_{nst}: d_model({d_model}) < n_synch_out({n_out})+n_synch_action({n_act})")
+                    continue
+            # random/first-last create O(n^2) sync sizes; skip if too large
+            if nst in ("random", "first-last"):
+                n_out = cfg.get("n_synch_out", 32)
+                n_act = cfg.get("n_synch_action", 32)
+                max_sync = max(n_out * (n_out + 1) // 2, n_act * (n_act + 1) // 2)
+                if max_sync > 10000:
+                    print(f"  [skip] st01_{task_name}_nst_{nst}: sync size {max_sync} too large (n_out={n_out}, n_act={n_act})")
+                    continue
             plan.append(exp(
                 f"st01_{task_name}_nst_{nst}",
                 f"{task_name}: neuron_select={nst}",
