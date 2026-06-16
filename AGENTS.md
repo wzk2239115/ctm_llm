@@ -17,6 +17,11 @@
 - `model_tokenizer` 同理, 指向各自路径下的 `minimind-o/model/`
 
 ## 注意事项
+- **算力机启动 server/worker 前必须设代理** (否则 huggingface/datasets 下载会卡):
+  ```bash
+  export http_proxy="http://public-proxy.qihoo.net:3128"
+  export https_proxy="http://public-proxy.qihoo.net:3128"
+  ```
 - `dataset_data` 和 `model_tokenizer` 是符号链接, 已在 `.gitignore` 中排除, 每台机器需手动创建
 - 训练数据: `sft_t2a_mini.parquet` (515k 条英文对话), 按 `DATA_DOWNLOAD.md` 下载
 - 检查点: `out/ctm_llm_{hidden_size}.pth` (half) + `_resume.pth` (含 optimizer state)
@@ -36,6 +41,10 @@
 
 ### Pool 启动命令
 ```bash
+# 算力机必须先设代理, 否则 huggingface/datasets 下载会卡住:
+export http_proxy="http://public-proxy.qihoo.net:3128"
+export https_proxy="http://public-proxy.qihoo.net:3128"
+
 # 任选一台起 server
 python scripts/cluster_pool.py server --port 8765
 
