@@ -706,7 +706,18 @@ def run_worker(args):
                         )
                         if pull.get("restart_needed") and args.restart_on_update:
                             restart_worker_process()
-                    else:
+    elif args.task_cmd == "clean-fail":
+        import glob
+        metrics_dir = args.metrics_dir
+        pattern = os.path.join(metrics_dir, "*.fail.json")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            print("no .fail.json files found")
+            return
+        for f in files:
+            os.remove(f)
+        print(f"cleaned {len(files)} .fail.json file(s)")
+    else:
                         msg = f"git update failed: {pull['output']}"
                         print(f"[worker] task {task['task_id']} rejected: {msg}", flush=True)
                         post_json(f"{base}/ack", {
@@ -1283,7 +1294,7 @@ def main():
     p.set_defaults(func=run_status)
 
     p = sub.add_parser("task")
-    p.add_argument("task_cmd", choices=["list", "cancel", "cancel-pending", "clear", "info", "history", "pending"])
+    p.add_argument("task_cmd", choices=["list", "cancel", "cancel-pending", "clear", "info", "history", "pending", "clean-fail"])
     p.add_argument("--task_id", default=None)
     p.add_argument("--duration", default="1h",
                    help="Time window for history: e.g. 1h, 2h, 4h, 8h, 16h")
