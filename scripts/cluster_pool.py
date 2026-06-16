@@ -898,14 +898,12 @@ def run_task_history(args, base):
     if completed:
         print(f"  COMPLETED")
         print(f"  {'NAME':40s}  {'DURATION':>8s}  {'RESULT':20s}")
-        print(f"  {'-'*40s}  {'-'*8s}  {'-'*20s}")
+        print(f"  {'-' * 40}  {'-' * 8}  {'-' * 20}")
         for t in completed:
             name = _task_expname(t)
             dur = t.get("status_changed_at", 0) - t.get("created_at", 0)
-            metrics_dir = getattr(args, "metrics_dir", "runs/metrics")
-            extra = t.get("extra_args", "")
             info = "?"
-            m = _read_experiment_metrics(metrics_dir, name)
+            m = _read_experiment_metrics(getattr(args, "metrics_dir", "runs/metrics"), name)
             if m:
                 info = f"acc={m.get('eval_accuracy','?')}" if m.get('eval_accuracy') else f"loss={m.get('loss','?')}"
             print(f"  {name:40s}  {_fmt_time(dur):>8s}  {info}")
@@ -913,7 +911,7 @@ def run_task_history(args, base):
     if failed:
         print(f"\n  FAILED")
         print(f"  {'NAME':40s}  {'DURATION':>8s}  {'REASON':30s}")
-        print(f"  {'-'*40s}  {'-'*8s}  {'-'*30s}")
+        print(f"  {'-' * 40}  {'-' * 8}  {'-' * 30}")
         for t in failed:
             name = _task_expname(t)
             dur = t.get("status_changed_at", 0) - t.get("created_at", 0)
