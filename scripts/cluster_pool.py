@@ -354,7 +354,6 @@ class PoolHandler(BaseHTTPRequestHandler):
                     task_set_status(t, "running")
                     break
         print(f"[pool] ack from {addr}: {payload.get('status')} {payload.get('message', '')}", flush=True)
-        print_pool()
         self._write_json({"ok": True})
 
     def _handle_complete(self, payload):
@@ -369,7 +368,6 @@ class PoolHandler(BaseHTTPRequestHandler):
                     t["return_code"] = rc
                     break
         print(f"[pool] task {task_id} {status} (rc={rc}) reported by {addr}", flush=True)
-        print_pool()
         self._write_json({"ok": True})
 
     def _handle_cancel(self, payload):
@@ -387,8 +385,6 @@ class PoolHandler(BaseHTTPRequestHandler):
                         cancelled.append(t)
         for t in cancelled:
             print(f"[pool] task {t['task_id']} cancelled", flush=True)
-        if cancelled:
-            print_pool()
         self._write_json({"ok": True, "cancelled": [t["task_id"] for t in cancelled]})
 
     def do_POST(self):

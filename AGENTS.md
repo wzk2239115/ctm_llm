@@ -45,3 +45,8 @@ python scripts/cluster_pool.py worker --master-addr 11.131.210.78 --port 8765
 # 提交任务
 python scripts/experiment_plan_ctm_paper.py submit --stage all --no-wait
 ```
+
+### Smoke 测试流程
+1. **本地先跑** (快速看错误): `python scripts/smoke_baseline.py --iterations 10 --local`
+2. **再跑 pool** (测集群基建): `python scripts/smoke_baseline.py --iterations 10`
+3. 两轮都过了再正式 submit 实验计划
