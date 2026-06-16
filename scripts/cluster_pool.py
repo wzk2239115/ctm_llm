@@ -706,18 +706,7 @@ def run_worker(args):
                         )
                         if pull.get("restart_needed") and args.restart_on_update:
                             restart_worker_process()
-    elif args.task_cmd == "clean-fail":
-        import glob
-        metrics_dir = args.metrics_dir
-        pattern = os.path.join(metrics_dir, "*.fail.json")
-        files = sorted(glob.glob(pattern))
-        if not files:
-            print("no .fail.json files found")
-            return
-        for f in files:
-            os.remove(f)
-        print(f"cleaned {len(files)} .fail.json file(s)")
-    else:
+                    else:
                         msg = f"git update failed: {pull['output']}"
                         print(f"[worker] task {task['task_id']} rejected: {msg}", flush=True)
                         post_json(f"{base}/ack", {
@@ -887,6 +876,16 @@ def run_task(args):
             print("acks:")
             for addr, ack in sorted(acks.items()):
                 print(f"  {addr}: {ack.get('status')} {ack.get('message', '')}")
+    elif args.task_cmd == "clean-fail":
+        import glob
+        pattern = os.path.join(args.metrics_dir, "*.fail.json")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            print("no .fail.json files found")
+            return
+        for f in files:
+            os.remove(f)
+        print(f"cleaned {len(files)} .fail.json file(s)")
     else:
         print(f"unknown task command: {args.task_cmd}", file=sys.stderr)
         sys.exit(1)
