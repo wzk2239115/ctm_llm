@@ -31,8 +31,7 @@ STAGES_ORDERED = [
     "st00", "st01", "st02", "st03", "st04", "st05", "st06",
     "st07", "st08", "st09", "st10", "st11", "st12",
     "st13", "st14", "st15", "st16", "st17", "st18",
-    "st19", "st20", "st21", "st22", "st23", "st24",
-    "st25", "st26", "st27",
+    "st19", "st20", "st21", "st22",     "st23", "st24",
 ]
 ALL_STAGES = STAGES_ORDERED + ["all"]
 
@@ -829,9 +828,6 @@ STAGE_BUILDERS = {
     "st22": build_st22_sparsity_multitick,
     "st23": build_st23_async_multitick,
     "st24": build_st24_jepa_halt_sparsity,
-    "st25": build_st25_scale_2x,
-    "st26": build_st26_scale_2x_ideas,
-    "st27": build_st27_scale_max,
 }
 
 STAGE_DESCRIPTIONS = {
@@ -860,9 +856,6 @@ STAGE_DESCRIPTIONS = {
     "st22": "Sparsity + multi-tick loss (ready)",
     "st23": "Async ticks + multi-tick loss (ready)",
     "st24": "JEPA + halt + sparsity triple combo (ready)",
-    "st25": "Scaling: 2x d_model plain CTM on all 5 tasks (ready)",
-    "st26": "Scaling: 2x d_model + JEPA+halt+sparsity on all 5 tasks (ready)",
-    "st27": "Scaling: 4x d_model on sort/parity + 2x cifar10, both plain & ideas (ready)",
 }
 
 
