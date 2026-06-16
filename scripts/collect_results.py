@@ -19,8 +19,8 @@ def find_checkpoints(log_dir):
 def extract_name_and_key(ckpt_path, log_dir):
     rel = os.path.relpath(ckpt_path, log_dir)
     parts = rel.split(os.sep)
-    exp_dir = parts[0] if len(parts) >= 1 else rel
-    return exp_dir, exp_dir
+    name = parts[-2]  # dir containing the checkpoint
+    return name, name
 
 
 TRACKING_KEYS = [
@@ -55,13 +55,16 @@ def main():
     parser = argparse.ArgumentParser(description="Collect baseline task results")
     parser.add_argument("--log-dir", default="logs/ctm_scaling",
                         help="Root dir containing experiment subdirs with checkpoints")
-    parser.add_argument("--csv", default="runs/metrics/ctm_scaling_results.csv",
-                        help="Output CSV path")
+    parser.add_argument("--csv", default=None,
+                        help="Output CSV path (default: runs/metrics/{log_dir_slug}_results.csv)")
     parser.add_argument("--fail-only", action="store_true",
                         help="Only show missing/failed experiments")
     parser.add_argument("--nonzero", action="store_true",
                         help="Only show experiments with accuracy > 0")
     args = parser.parse_args()
+    if args.csv is None:
+        slug = args.log_dir.strip("/").replace("/", "_")
+        args.csv = f"runs/metrics/{slug}_results.csv"
 
     results = []
     missing = []
@@ -85,7 +88,7 @@ def main():
         else:
             results.append((exp_name, acc, n))
 
-    results.sort(key=lambda x: x[0])
+    results.sort(key=lambda x: (x[0].split("_")[0] if "_" in x[0] else "", x[0]))
     missing.sort(key=lambda x: x[0])
 
     print(f"\n{'='*70}")
