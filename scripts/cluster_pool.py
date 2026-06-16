@@ -340,8 +340,7 @@ class PoolHandler(BaseHTTPRequestHandler):
             STATE.setdefault("tasks", []).append(task)
             STATE["acks"].setdefault(task_id, {})
         nodes = ",".join(task["node_addrs"]) if task["node_addrs"] else "all"
-        print(f"[pool] new task: {task_id} status=pending nodes={nodes} {task['extra_args']}", flush=True)
-        print_pool()
+        print(f"[pool] new task: {task_id} ({nodes})", flush=True)
         self._write_json({"ok": True, "task": task})
 
     def _handle_ack(self, payload):
@@ -353,7 +352,6 @@ class PoolHandler(BaseHTTPRequestHandler):
                 if t["task_id"] == task_id and t["status"] == "pending":
                     task_set_status(t, "running")
                     break
-        print(f"[pool] ack from {addr}: {payload.get('status')} {payload.get('message', '')}", flush=True)
         self._write_json({"ok": True})
 
     def _handle_complete(self, payload):
