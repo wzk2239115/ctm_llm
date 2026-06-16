@@ -1,9 +1,8 @@
 
 import numpy as np
-import cv2
 import torch
 import os
-import imageio
+# lazy: import imageio  # installed on some machines
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib import patheffects
@@ -491,4 +490,5 @@ def make_classification_gif(image, target, predictions, certainties, post_activa
             plt.close(fig)
             pbar_inner.update(1)
         pbar_inner.set_description('Saving gif')
+        import imageio
         imageio.mimsave(save_location, frames, fps=15, loop=100)
