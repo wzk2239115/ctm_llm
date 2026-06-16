@@ -607,7 +607,7 @@ def estimate_task_gb(train_args):
     m = re.search(r'--d_model\s+(\d+)', train_args)
     if m:
         d_model = int(m.group(1))
-    gb = max(2.0, d_model * 0.008)
+    gb = max(2.0, d_model * 0.01)
     m2 = re.search(r'--cross_tick_jepa_weight\s+(\S+)', train_args)
     if m2 and float(m2.group(1)) > 0:
         gb *= 1.3
@@ -717,17 +717,20 @@ def run_worker(args):
                 reject = True
                 reject_msg = f"busy gpus={busy_gpus}, requested=all"
             if not reject:
-                free_mb = gpu_free_memory()
-                if free_mb:
-                    task_gb = estimate_task_gb(task.get("extra_args", ""))
-                    task_mb = int(task_gb * 1024)
-                    gpus_to_check = requested_gpus if requested_gpus is not None else list(range(len(gpus)))
-                    for gpu in gpus_to_check:
-                        free = free_mb.get(gpu, 0)
-                        if free < task_mb:
-                            reject = True
-                            reject_msg = f"OOM risk gpu={gpu} free={free/1024:.1f}GB need={task_gb:.1f}GB"
-                            break
+                task_gb = estimate_task_gb(task.get("extra_args", ""))
+                total_gpu_gb = gpus[0]["memory_mb"] / 1024 if gpus else 80.0
+                mem_cap = total_gpu_gb * 0.85
+                gpus_to_check = requested_gpus if requested_gpus is not None else list(range(len(gpus)))
+                for gpu in gpus_to_check:
+                    est_usage = sum(
+                        item.get("est_gb", 0)
+                        for item in procs.values()
+                        if gpu in (item.get("gpus") or [])
+                    )
+                    if est_usage + task_gb > mem_cap:
+                        reject = True
+                        reject_msg = f"mem budget gpu={gpu} est={est_usage:.1f}+{task_gb:.1f}GB cap={mem_cap:.1f}GB"
+                        break
             if reject:
                 print(f"[worker] task {task['task_id']} ignored: {reject_msg}", flush=True)
                 post_json(f"{base}/ack", {
@@ -778,6 +781,7 @@ def run_worker(args):
                     "proc": proc,
                     "gpus": requested_gpus,
                     "stderr_lines": [],
+                    "est_gb": task_gb,
                 }
                 post_json(f"{base}/ack", {
                     "node_addr": node_addr,
