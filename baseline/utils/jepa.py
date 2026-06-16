@@ -5,6 +5,7 @@ tick_{i+1}'s synch is predicted from tick_i's synch via a lightweight
 predictor. Cosine/MSE loss + stop-gradient on target prevents collapse.
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,7 +42,8 @@ def add_jepa_args(parser):
                        help='Number of predictor MLP layers.')
     group.add_argument('--cross_tick_jepa_dropout', type=float, default=0.1,
                        help='Predictor dropout.')
-    group.add_argument('--cross_tick_jepa_target_stop_grad', action='store_true', default=True,
+    group.add_argument('--cross_tick_jepa_target_stop_grad',
+                       action=argparse.BooleanOptionalAction, default=True,
                        help='Stop gradient on target synch.')
     return parser
 

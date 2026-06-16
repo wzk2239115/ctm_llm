@@ -259,6 +259,8 @@ def build_st01_architecture_sweep(plan):
         for nst in ["random", "first-last", "random-pairing"]:
             cfg = dict(with_seed(base, 0))
             cfg["neuron_select_type"] = nst
+            if nst == "random-pairing":
+                cfg["n_random_pairing_self"] = 0
             plan.append(exp(
                 f"st01_{task_name}_nst_{nst}",
                 f"{task_name}: neuron_select={nst}",
