@@ -212,7 +212,7 @@ def build_st_plain(plan):
             cfg_i = scale_cfg(base, f)
             cfg_i["tick_halt_mode"] = "threshold"
             cfg_i["tick_halt_threshold"] = 0.6
-            cfg_i["topk_neurons"] = max(8, int(cfg_i["d_model"] * 0.5))
+            cfg_i["topk_neurons"] = 0.5
             cfg_i.update(jepa)
             plan.append(exp(
                 f"st_ideas_{task_name}_{f}x",

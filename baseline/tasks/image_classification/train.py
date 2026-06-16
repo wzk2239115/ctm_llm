@@ -467,7 +467,7 @@ if __name__=='__main__':
                     ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
                                     args.tick_loss_mode != 'last' or args.reflex_head or
                                     args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
-                                    args.ema_distill_weight > 0 or args.model != 'ctm')
+                                    args.ema_distill_weight > 0 or args.model != 'ctm' or args.draft_revise_weight > 0)
                     if ideas_active and args.model == 'ctm':
                         out = model(inputs, return_per_tick_synch=(args.cross_tick_jepa_weight > 0))
                         if isinstance(out[-1], dict):

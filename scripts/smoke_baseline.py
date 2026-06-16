@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
-Parallel smoke test across all GPUs.
-Usage: python scripts/smoke_baseline.py [--iterations 2]
+Smoke test: submits to 32-GPU pool. Fallback to local --local mode.
+
+Usage:
+  python scripts/smoke_baseline.py --iterations 2                           # pool mode
+  python scripts/smoke_baseline.py --local --iterations 2                    # local subprocess
+  python scripts/smoke_baseline.py --master_addr 10.10.10.1 --port 21999     # custom pool
 """
 import argparse
-import concurrent.futures
+import json
+import os
+import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
-ROOT = "/home/jovyan/h800fast/wangzekai/ctm_llm"
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, ".."))
+SMOKE_LOG_DIR = "/tmp/smoke"
 
 TASKS = {
     "sort": ("baseline.tasks.sort.train", dict(
@@ -25,7 +35,7 @@ TASKS = {
         warmup_steps=1, use_scheduler=False,
         weight_decay=0.0, gradient_clipping=-1,
         track_every=100, save_every=1000,
-        reload=False, log_dir="/tmp/smoke/sort",
+        reload=False, log_dir=f"{SMOKE_LOG_DIR}/sort",
     )),
     "parity": ("baseline.tasks.parity.train", dict(
         seed=0, iterations=2, memory_length=5,
@@ -44,7 +54,7 @@ TASKS = {
         save_every=1000, reload=False,
         use_amp=False,
         neuron_select_type="random", n_test_batches=1,
-        log_dir="/tmp/smoke/parity",
+        log_dir=f"{SMOKE_LOG_DIR}/parity",
     )),
     "mazes": ("baseline.tasks.mazes.train", dict(
         model="ctm", neuron_select_type="first-last",
@@ -66,7 +76,7 @@ TASKS = {
         reload=False,
         n_test_batches=1,
         data_root="baseline/data/mazes",
-        log_dir="/tmp/smoke/mazes",
+        log_dir=f"{SMOKE_LOG_DIR}/mazes",
     )),
     "cifar10": ("baseline.tasks.image_classification.train", dict(
         model="ctm", dataset="cifar10",
@@ -83,7 +93,7 @@ TASKS = {
         save_every=100, track_every=100, n_test_batches=1,
         batch_size=16, batch_size_test=16,
         lr=1e-4, seed=1,
-        log_dir="/tmp/smoke/cifar10",
+        log_dir=f"{SMOKE_LOG_DIR}/cifar10",
     )),
     "qamnist": ("baseline.tasks.qamnist.train", dict(
         seed=0, model_type="ctm", memory_length=5,
@@ -100,13 +110,25 @@ TASKS = {
         neuron_select_type="random",
         data_root="baseline/data/",
         n_test_batches=1,
-        log_dir="/tmp/smoke/qamnist",
+        log_dir=f"{SMOKE_LOG_DIR}/qamnist",
     )),
 }
 
 
-def _cmd(module, cfg):
-    parts = [sys.executable, "-m", module]
+def _load_pool_config():
+    path = os.path.join(ROOT, "infra", "envs", "h100_baseline.env")
+    config = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                config[k] = v
+    return config
+
+
+def _build_extra_args(module, cfg):
+    parts = [module]
     for k, v in cfg.items():
         if v is None:
             continue
@@ -118,19 +140,7 @@ def _cmd(module, cfg):
         else:
             parts.append(f"--{k}")
             parts.append(str(v))
-    return parts
-
-
-def run_test(name, cmd, device):
-    start = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    elapsed = time.time() - start
-    ok = result.returncode == 0
-    tag = f"  {'✅' if ok else '❌'} {name} (GPU {device}, {elapsed:.1f}s)"
-    if not ok:
-        tag += "\n" + "\n".join("     " + l for l in (result.stderr or "").split("\n")[-8:] if l.strip())
-    print(tag, flush=True)
-    return name, ok
+    return " ".join(shlex.quote(p) for p in parts)
 
 
 def build_specs(iterations):
@@ -184,37 +194,130 @@ def build_specs(iterations):
     return specs
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--iterations", type=int, default=2)
-    parser.add_argument("--gpus", type=int, default=None, help="Number of GPUs (default: auto-detect)")
-    args = parser.parse_args()
+def submit_via_pool(specs, master_addr, port, config_path):
+    base_url = f"http://{master_addr}:{port}"
+    config_path = os.path.abspath(config_path)
 
+    task_ids = {}
+    for name, module, cfg in specs:
+        extra_args = _build_extra_args(module, cfg)
+        payload = {
+            "config": config_path,
+            "extra_args": extra_args,
+            "env": {"CTM_EXPERIMENT_NAME": name},
+        }
+        req = urllib.request.Request(
+            f"{base_url}/submit",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+            tid = result["task"]["task_id"]
+            task_ids[tid] = name
+            print(f"  submitted {name:20s} → {tid}")
+        except Exception as e:
+            print(f"  ❌ {name:20s} submit failed: {e}")
+
+    if not task_ids:
+        print("\n  No tasks submitted!")
+        return [], {}
+
+    print(f"\n  Waiting for {len(task_ids)} tasks...")
+    deadline = time.time() + 600
+    completed = {}
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base_url}/status", timeout=10) as resp:
+                status = json.loads(resp.read())
+        except Exception:
+            time.sleep(5)
+            continue
+
+        for t in status.get("tasks", []):
+            tid = t["task_id"]
+            if tid in task_ids and tid not in completed:
+                st = t.get("status")
+                if st in ("completed", "failed", "cancelled"):
+                    rc = t.get("return_code")
+                    completed[tid] = (st, rc)
+                    tag = "✅" if st == "completed" and rc == 0 else "❌"
+                    print(f"  {tag} {task_ids[tid]:20s} {st} (rc={rc})")
+
+        done = len(completed)
+        total = len(task_ids)
+        if done == total:
+            break
+        remaining = ", ".join(task_ids[tid] for tid in task_ids if tid not in completed)
+        print(f"\r  [{done}/{total}] waiting... ({remaining})", end="", flush=True)
+        time.sleep(5)
+
+    results = [(task_ids[tid], st == "completed" and rc == 0) for tid, (st, rc) in completed.items()]
+    return results, completed
+
+
+def run_local(specs):
+    import concurrent.futures
     import torch
-    num_gpus = args.gpus or torch.cuda.device_count()
-    if num_gpus == 0:
-        print("No GPUs found, defaulting to CPU")
-        num_gpus = 1
 
-    specs = build_specs(args.iterations)
-    print(f"  Launching {len(specs)} tests across {num_gpus} GPUs...\n")
+    num_gpus = torch.cuda.device_count() or 1
+    print(f"  Local mode: {len(specs)} tests across {num_gpus} GPUs")
+
+    def _run(name, cmd, dev):
+        start = time.time()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        elapsed = time.time() - start
+        ok = r.returncode == 0
+        tag = f"  {'✅' if ok else '❌'} {name} (GPU {dev}, {elapsed:.1f}s)"
+        if not ok:
+            tag += "\n" + "\n".join("     " + l for l in (r.stderr or "").split("\n")[-8:] if l.strip())
+        print(tag, flush=True)
+        return name, ok
 
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as pool:
         futures = {}
         for i, (name, module, cfg) in enumerate(specs):
             cfg = dict(cfg, device=[i % num_gpus])
-            cmd = _cmd(module, cfg)
-            futures[pool.submit(run_test, name, cmd, i % num_gpus)] = name
-
+            cmd = [sys.executable, "-m", module] + sum(
+                ([f"--{k}"] if isinstance(v, bool) and v else
+                 [f"--no-{k}"] if isinstance(v, bool) else
+                 [f"--{k}", str(v)] if not isinstance(v, (list, tuple)) else
+                 [f"--{k}"] + [str(x) for x in v]
+                 for k, v in cfg.items() if v is not None), [])
+            futures[pool.submit(_run, name, cmd, i % num_gpus)] = name
         for future in concurrent.futures.as_completed(futures):
-            name, ok = future.result()
-            results.append((name, ok))
+            results.append(future.result())
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--iterations", type=int, default=2)
+    parser.add_argument("--local", action="store_true", help="Run locally instead of via pool")
+    parser.add_argument("--master_addr", type=str, default=None, help="Pool server address")
+    parser.add_argument("--port", type=int, default=None, help="Pool server port")
+    parser.add_argument("--config", type=str, default=None, help="Pool cluster config env")
+    args = parser.parse_args()
+
+    specs = build_specs(args.iterations)
+    print(f"  Smoke: {len(specs)} tests, {args.iterations} iterations each\n")
+
+    if args.local:
+        results = run_local(specs)
+    else:
+        cfg = args.config or os.path.join(ROOT, "infra", "envs", "h100_baseline.env")
+        pool_cfg = _load_pool_config()
+        addr = args.master_addr or pool_cfg.get("MASTER_ADDR", "127.0.0.1")
+        port = args.port or int(pool_cfg.get("MASTER_PORT", 21999))
+        print(f"  Pool: {addr}:{port}  config={cfg}")
+        results, _ = submit_via_pool(specs, addr, port, cfg)
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
     print(f"\n{'='*60}")
-    print(f"  SMOKE TEST RESULTS: {passed}/{total} passed")
+    print(f"  SMOKE RESULTS: {passed}/{total} passed")
     for name, ok in sorted(results, key=lambda x: x[0]):
         print(f"    {'✅' if ok else '❌'} {name}")
     print(f"{'='*60}")

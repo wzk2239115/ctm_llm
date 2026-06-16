@@ -32,6 +32,7 @@ STAGES_ORDERED = [
     "st07", "st08", "st09", "st10", "st11", "st12",
     "st13", "st14", "st15", "st16", "st17", "st18",
     "st19", "st20", "st21", "st22", "st23", "st24",
+    "st25", "st26", "st27",
 ]
 ALL_STAGES = STAGES_ORDERED + ["all"]
 
@@ -470,14 +471,12 @@ def build_st07_multi_tick_loss(plan):
 def build_st08_cell_sparsity(plan):
     """Top-k neuron sparsity: only activate top-k neurons per tick."""
     for task_name, (module, base, _) in TASKS.items():
-        d = base.get("d_model", 512)
         for frac in [0.25, 0.50, 0.75]:
-            topk = max(8, int(d * frac))
             cfg = dict(with_seed(base, 0))
-            cfg["topk_neurons"] = topk
+            cfg["topk_neurons"] = frac
             plan.append(exp(
                 f"st08_{task_name}_sparsity{str(frac).replace('.','p')}",
-                f"{task_name}: top-k={topk} ({frac})",
+                f"{task_name}: top-k={frac}",
                 _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st08/{task_name}_sparsity{frac}"}),
                 tags=[task_name, "sparsity"],
                 impl_status="ready",
@@ -606,15 +605,13 @@ def build_st14_jepa_sparsity(plan):
     """JEPA + top-k sparsity."""
     jepa = _jepa_defaults()
     for task_name, (module, base, _) in TASKS.items():
-        d = base.get("d_model", 512)
         for frac in [0.5, 0.75]:
-            topk = max(8, int(d * frac))
             cfg = dict(with_seed(base, 0))
-            cfg["topk_neurons"] = topk
+            cfg["topk_neurons"] = frac
             cfg.update(jepa)
             plan.append(exp(
                 f"st14_{task_name}_jepa_sparsity{str(frac).replace('.','p')}",
-                f"{task_name}: JEPA+sparsity topk={topk}",
+                f"{task_name}: JEPA+sparsity topk={frac}",
                 _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st14/{task_name}_jepa_sparsity"}),
                 tags=[task_name, "jepa", "sparsity"],
             ))
@@ -624,16 +621,14 @@ def build_st14_jepa_sparsity(plan):
 def build_st15_halt_sparsity(plan):
     """Tick halt + top-k sparsity."""
     for task_name, (module, base, _) in TASKS.items():
-        d = base.get("d_model", 512)
         for frac in [0.5, 0.75]:
-            topk = max(8, int(d * frac))
             cfg = dict(with_seed(base, 0))
             cfg["tick_halt_mode"] = "threshold"
             cfg["tick_halt_threshold"] = 0.6
-            cfg["topk_neurons"] = topk
+            cfg["topk_neurons"] = frac
             plan.append(exp(
                 f"st15_{task_name}_halt_sparsity{str(frac).replace('.','p')}",
-                f"{task_name}: halt@0.6+sparsity topk={topk}",
+                f"{task_name}: halt@0.6+sparsity topk={frac}",
                 _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st15/{task_name}_halt_sparsity"}),
                 tags=[task_name, "tick-halt", "sparsity"],
             ))
@@ -681,17 +676,15 @@ def build_st18_sparsity_async(plan):
     for task_name, (module, base, _) in TASKS.items():
         if task_name in ("qamnist",):
             continue
-        d = base.get("d_model", 512)
         for frac in [0.5, 0.75]:
-            topk = max(8, int(d * frac))
             for periods in ["1,2,4", "1,2,4,8"]:
                 cfg = dict(with_seed(base, 0))
-                cfg["topk_neurons"] = topk
+                cfg["topk_neurons"] = frac
                 cfg["async_tick_mode"] = "banded"
                 cfg["async_tick_periods"] = periods
                 plan.append(exp(
                     f"st18_{task_name}_sparsity{str(frac).replace('.','p')}_async_{periods.replace(',','_')}",
-                    f"{task_name}: sparsity topk={topk}+async periods={periods}",
+                    f"{task_name}: sparsity topk={frac}+async periods={periods}",
                     _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st18/{task_name}_sparsity_async"}),
                     tags=[task_name, "sparsity", "async-ticks"],
                 ))
@@ -755,15 +748,13 @@ def build_st21_jepa_reflex(plan):
 def build_st22_sparsity_multitick(plan):
     """Sparsity + multi-tick loss."""
     for task_name, (module, base, _) in TASKS.items():
-        d = base.get("d_model", 512)
         for frac in [0.5, 0.75]:
-            topk = max(8, int(d * frac))
             cfg = dict(with_seed(base, 0))
-            cfg["topk_neurons"] = topk
+            cfg["topk_neurons"] = frac
             cfg["tick_loss_mode"] = "mean"
             plan.append(exp(
                 f"st22_{task_name}_sparsity{str(frac).replace('.','p')}_multitick",
-                f"{task_name}: sparsity topk={topk}+multi-tick",
+                f"{task_name}: sparsity topk={frac}+multi-tick",
                 _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st22/{task_name}_sparsity_multitick"}),
                 tags=[task_name, "sparsity", "multi-tick-loss"],
             ))
@@ -795,13 +786,11 @@ def build_st24_jepa_halt_sparsity(plan):
     for task_name, (module, base, _) in TASKS.items():
         if task_name in ("mazes", "qamnist"):
             continue
-        d = base.get("d_model", 512)
         for frac in [0.5]:
-            topk = max(8, int(d * frac))
             cfg = dict(with_seed(base, 0))
             cfg["tick_halt_mode"] = "threshold"
             cfg["tick_halt_threshold"] = 0.6
-            cfg["topk_neurons"] = topk
+            cfg["topk_neurons"] = frac
             cfg.update(jepa)
             plan.append(exp(
                 f"st24_{task_name}_jepa_halt_sparsity",
@@ -840,6 +829,9 @@ STAGE_BUILDERS = {
     "st22": build_st22_sparsity_multitick,
     "st23": build_st23_async_multitick,
     "st24": build_st24_jepa_halt_sparsity,
+    "st25": build_st25_scale_2x,
+    "st26": build_st26_scale_2x_ideas,
+    "st27": build_st27_scale_max,
 }
 
 STAGE_DESCRIPTIONS = {
@@ -868,6 +860,9 @@ STAGE_DESCRIPTIONS = {
     "st22": "Sparsity + multi-tick loss (ready)",
     "st23": "Async ticks + multi-tick loss (ready)",
     "st24": "JEPA + halt + sparsity triple combo (ready)",
+    "st25": "Scaling: 2x d_model plain CTM on all 5 tasks (ready)",
+    "st26": "Scaling: 2x d_model + JEPA+halt+sparsity on all 5 tasks (ready)",
+    "st27": "Scaling: 4x d_model on sort/parity + 2x cifar10, both plain & ideas (ready)",
 }
 
 
