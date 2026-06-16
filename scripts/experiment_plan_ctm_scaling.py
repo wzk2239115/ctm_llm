@@ -176,11 +176,38 @@ SCALE_FACTORS = {
 
 
 def scale_cfg(base, factor):
+    """Scale model config by factor. Reduces batch_size to prevent OOM."""
     c = dict(base)
     c["d_model"] = int(base["d_model"] * factor)
-    for k in ("d_input", "heads", "memory_hidden_dims", "n_synch_out", "n_synch_action"):
+
+    # Scale d_input proportionally
+    if "d_input" in base:
+        c["d_input"] = max(16, int(base["d_input"] * factor))
+
+    # Scale heads but cap at 32
+    if "heads" in base:
+        c["heads"] = min(32, max(1, int(base["heads"] * factor)))
+
+    # Scale memory_hidden_dims but cap at 128
+    if "memory_hidden_dims" in base:
+        c["memory_hidden_dims"] = min(128, max(1, int(base["memory_hidden_dims"] * factor)))
+
+    # Scale n_synch_out / n_synch_action
+    nst = base.get("neuron_select_type", "random-pairing")
+    for k in ("n_synch_out", "n_synch_action"):
         if k in base:
-            c[k] = max(1, int(base[k] * factor))
+            scaled = max(1, int(base[k] * factor))
+            if nst in ("random", "first-last"):
+                # sync_size = n*(n+1)/2 — cap n to avoid OOM from outer product
+                scaled = min(scaled, 128)
+            c[k] = scaled
+
+    # Reduce batch_size inversely with scale to fit in GPU memory
+    if "batch_size" in base:
+        c["batch_size"] = max(4, base["batch_size"] // factor)
+    if "batch_size_test" in base:
+        c["batch_size_test"] = max(8, base["batch_size_test"] // factor)
+
     return c
 
 
