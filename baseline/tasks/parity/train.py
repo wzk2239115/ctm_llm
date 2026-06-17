@@ -166,6 +166,8 @@ if __name__=='__main__':
             model.q_head = torch.nn.Linear(model.synch_representation_size_out, 2).to(device)
             torch.nn.init.zeros_(model.q_head.weight)
             model.q_head.bias.data.fill_(-5.0)
+            model.halt_max_steps = min(args.halt_max_steps, args.iterations)
+            model.halt_exploration_prob = args.halt_exploration_prob
         if args.gated_attention:
             import torch.nn as nn
             model.attn_gate = nn.Linear(args.d_input, args.d_input).to(device)
