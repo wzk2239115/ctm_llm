@@ -24,6 +24,7 @@ from baseline.models.utils import reshape_predictions, get_latest_checkpoint
 from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
+from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args
 
 
 
@@ -115,6 +116,7 @@ def parse_args():
     add_jepa_args(parser)
     add_all_idea_args(parser)
     add_train_idea_args(parser)
+    add_hrm_idea_args(parser)
     args = parser.parse_args()
     return args
 
@@ -188,6 +190,10 @@ if __name__=='__main__':
         model.tick_halt_mode = args.tick_halt_mode
         model.tick_halt_threshold = args.tick_halt_threshold
         model.tick_min_ticks = args.tick_min_ticks
+
+        # --- HRM-inspired attributes ---
+        model.bp_steps = args.bp_steps
+        model.detach_every = args.detach_every
         if args.reflex_head:
             model.reflex_head = ReflexHead(
                 synch_size=model.synch_representation_size_out,
@@ -207,10 +213,13 @@ if __name__=='__main__':
     
 
     # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), 
-                                  lr=args.lr, 
-                                  eps=1e-8, 
-                                  weight_decay=args.weight_decay)
+    if getattr(args, 'optimizer_type', 'adam') == 'adam_atan2':
+        optimizer = build_optimizer_from_args(model.parameters(), args)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), 
+                                      lr=args.lr, 
+                                      eps=1e-8, 
+                                      weight_decay=args.weight_decay)
     
     warmup_schedule = warmup(args.warmup_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_schedule.step)

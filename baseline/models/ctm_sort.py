@@ -76,6 +76,17 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         use_reflex = hasattr(self, 'reflex_head') and self.reflex_head is not None
         nlm_diff = getattr(self, 'nlm_differentiated', None)
 
+        # --- HRM-inspired config ---
+        bp_steps_cfg = getattr(self, 'bp_steps', 0)
+        detach_every = getattr(self, 'detach_every', 0)
+        effective_bp_steps = min(bp_steps_cfg, self.iterations) if bp_steps_cfg > 0 else self.iterations
+        h_cycles = getattr(self, 'h_cycles', 1)
+        l_cycles = getattr(self, 'l_cycles', 0)
+        h_synapse = getattr(self, 'h_synapse', None)
+        use_hierarchical = h_cycles > 1 and h_synapse is not None
+        q_head = getattr(self, 'q_head', None)
+        act_halt = getattr(self, 'act_halt', False)
+
         # --- Tracking Initialization ---
         pre_activations_tracking = []
         post_activations_tracking = []
@@ -97,72 +108,94 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         reflex_preds = []
         draft_pred = None
         draft_mode = getattr(self, 'draft_mode', 'none')
+        q_logits_all = [] if (act_halt and q_head is not None) else None
 
         r_out = torch.exp(-torch.clamp(self.decay_params_out, 0, 15)).unsqueeze(0).repeat(B, 1)
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
 
+        # --- Hierarchical: initialize H-level state ---
+        z_H = torch.zeros_like(activated_state) if use_hierarchical else None
+        eff_l_cycles = l_cycles if l_cycles > 0 else max(1, self.iterations // max(1, h_cycles))
+
         for stepi in range(self.iterations):
 
-            async_mask = None
-            if async_mode == 'banded' and async_periods is not None:
-                periods = [int(p) for p in async_periods.split(',')]
-                phases = [int(p) for p in async_phases.split(',')] if async_phases else None
-                async_mask = get_async_tick_mask(stepi, d_model, periods, phases, device=device)
+            # --- Truncated BPTT + State detach ---
+            if detach_every > 0 and stepi > 0 and stepi % detach_every == 0:
+                state_trace = state_trace.detach()
+                activated_state = activated_state.detach()
+            grad_enabled_this_tick = stepi >= self.iterations - effective_bp_steps
+            with torch.set_grad_enabled(torch.is_grad_enabled() and grad_enabled_this_tick):
 
-            pre_synapse_input = torch.concatenate((x, activated_state), dim=-1)
-            if async_mask is not None:
-                pre_synapse_input = torch.concatenate((x, activated_state * async_mask.unsqueeze(0).float()), dim=-1)
+                async_mask = None
+                if async_mode == 'banded' and async_periods is not None:
+                    periods = [int(p) for p in async_periods.split(',')]
+                    phases = [int(p) for p in async_phases.split(',')] if async_phases else None
+                    async_mask = get_async_tick_mask(stepi, d_model, periods, phases, device=device)
 
-            state = self.synapses(pre_synapse_input)
-            if async_mask is not None:
-                state = state * async_mask.unsqueeze(0).float()
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+                # --- Hierarchical: inject H-level state ---
+                state_for_syn = activated_state + z_H if z_H is not None else activated_state
+                if async_mask is not None:
+                    state_for_syn = state_for_syn * async_mask.unsqueeze(0).float()
+                pre_synapse_input = torch.concatenate((x, state_for_syn), dim=-1)
 
-            if nlm_diff is not None:
-                activated_state = nlm_diff(state_trace)
-            else:
-                activated_state = self.trace_processor(state_trace)
-            if async_mask is not None:
-                activated_state = activated_state * async_mask.unsqueeze(0).float()
+                state = self.synapses(pre_synapse_input)
+                if async_mask is not None:
+                    state = state * async_mask.unsqueeze(0).float()
+                state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
-            if topk < 1.0:
-                activated_state = apply_topk_sparsity(activated_state, topk, stepi)
+                if nlm_diff is not None:
+                    activated_state = nlm_diff(state_trace)
+                else:
+                    activated_state = self.trace_processor(state_trace)
+                if async_mask is not None:
+                    activated_state = activated_state * async_mask.unsqueeze(0).float()
 
-            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
+                if topk < 1.0:
+                    activated_state = apply_topk_sparsity(activated_state, topk, stepi)
 
-            current_prediction = self.output_projector(synchronisation_out)
-            current_certainty = self.compute_certainty(current_prediction)
+                # --- Hierarchical: H-level update every l_cycles ticks ---
+                if z_H is not None and (stepi + 1) % eff_l_cycles == 0:
+                    z_H = z_H + h_synapse(activated_state)
 
-            predictions[..., stepi] = current_prediction
-            certainties[..., stepi] = current_certainty
+                synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
 
-            # Draft-revise: save draft at block boundary, corrupt state
-            if draft_mode == 'revise':
-                from baseline.utils.ctm_model_ideas import apply_draft_revise_corruption
-                draft_block_size = getattr(self, 'draft_block_size', 2)
-                corrupt_prob = getattr(self, 'draft_corrupt_prob', 0.0)
-                _saved, activated_state = apply_draft_revise_corruption(
-                    stepi, draft_block_size, activated_state, corrupt_prob)
-                if _saved:
-                    draft_pred = current_prediction.detach()
+                current_prediction = self.output_projector(synchronisation_out)
+                current_certainty = self.compute_certainty(current_prediction)
 
-            if return_per_tick_synch:
-                synch_per_tick.append(synchronisation_out)
+                predictions[..., stepi] = current_prediction
+                certainties[..., stepi] = current_certainty
 
-            if use_reflex and stepi < getattr(self, 'reflex_ticks', 1):
-                rp = self.reflex_head(synchronisation_out)
-                reflex_preds.append(rp)
+                # --- ACT Q-learning: compute Q-head logits ---
+                if q_logits_all is not None:
+                    q_logits_all.append(q_head(synchronisation_out))
 
-            if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
-                n_steps_used = stepi + 1
-                if stepi + 1 < self.iterations:
-                    predictions[..., stepi+1:] = 0
-                break
+                # Draft-revise: save draft at block boundary, corrupt state
+                if draft_mode == 'revise':
+                    from baseline.utils.ctm_model_ideas import apply_draft_revise_corruption
+                    draft_block_size = getattr(self, 'draft_block_size', 2)
+                    corrupt_prob = getattr(self, 'draft_corrupt_prob', 0.0)
+                    _saved, activated_state = apply_draft_revise_corruption(
+                        stepi, draft_block_size, activated_state, corrupt_prob)
+                    if _saved:
+                        draft_pred = current_prediction.detach()
 
-            if track:
-                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
-                post_activations_tracking.append(activated_state.detach().cpu().numpy())
-                synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
+                if return_per_tick_synch:
+                    synch_per_tick.append(synchronisation_out)
+
+                if use_reflex and stepi < getattr(self, 'reflex_ticks', 1):
+                    rp = self.reflex_head(synchronisation_out)
+                    reflex_preds.append(rp)
+
+                if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
+                    n_steps_used = stepi + 1
+                    if stepi + 1 < self.iterations:
+                        predictions[..., stepi+1:] = 0
+                    break
+
+                if track:
+                    pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
+                    post_activations_tracking.append(activated_state.detach().cpu().numpy())
+                    synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
 
         extras = {}
         if return_per_tick_synch:
@@ -171,6 +204,8 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
             extras['reflex_preds'] = torch.stack(reflex_preds, dim=-1)
         if draft_pred is not None:
             extras['draft_prediction'] = draft_pred
+        if q_logits_all is not None:
+            extras['q_logits'] = torch.stack(q_logits_all, dim=-1)
         if n_steps_used < self.iterations:
             extras['n_steps_used'] = n_steps_used
 

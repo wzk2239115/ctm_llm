@@ -215,7 +215,21 @@ def collect(cli):
                     for k in KEY_ARGS:
                         row[k] = a.get(k, "")
                 if cli.curves and "test_acc_curve" in s:
+                    meta = {
+                        "stage": stage,
+                        "task": task,
+                        "sweep": sweep,
+                        "seed": seed,
+                        "best_test_acc": s["best_test_acc"],
+                        "final_test_acc": s["final_test_acc"],
+                        "final_iter": s["final_iter"],
+                    }
+                    if not cli.no_args:
+                        a = s["args"]
+                        for k in KEY_ARGS:
+                            meta[k] = a.get(k, "")
                     curves[f"{stage}/{exp_dir.name}"] = {
+                        "meta": meta,
                         "iters": s.get("iters_curve", []),
                         "test_acc": s["test_acc_curve"],
                     }

@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""Plot CTM paper sweep results from extracted curves.json + summary.csv.
+
+Generates 4 key figures (filtered to drop incomplete seeds):
+  1. st02 tick sweep   - best_test_acc vs n_ticks (4 tasks, errorbar)
+  2. st01 capacity sweep - bar chart per task (d_model / heads / mh / sd / nst)
+  3. most_certain vs final test acc scatter (CTM most-certain tick value)
+  4. convergence curves for cifar10 + mazes tick sweep
+
+Usage:
+    python scripts/plot_ctm_paper_results.py
+    python scripts/plot_ctm_paper_results.py --min-iter 100000
+    python scripts/plot_ctm_paper_results.py --data-dir csv_data  # default
+"""
+
+import argparse
+import json
+import math
+import re
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.ticker import MaxNLocator
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DATA = ROOT / "csv_data"
+DEFAULT_OUT = ROOT / "runs" / "figures" / "ctm_paper"
+
+# baseline reference accs from st00 (paper config) for horizontal lines
+BASELINE_PAPER = {
+    "cifar10": 0.6443,
+    "mazes": 0.8028,
+    "parity": 0.6797,
+    "qamnist": 0.2341,
+    "sort": 0.7146,
+}
+# ff (feed-forward) baseline for cifar10
+BASELINE_FF = {"cifar10": 0.8407}
+
+TASK_COLORS = {
+    "cifar10": "#1f77b4",
+    "mazes": "#ff7f0e",
+    "parity": "#2ca02c",
+    "qamnist": "#d62728",
+    "sort": "#9467bd",
+}
+TASK_ORDER = ["cifar10", "mazes", "parity", "sort"]
+
+
+def load_data(data_dir):
+    curves_path = data_dir / "ctm_paper_curves.json"
+    summary_path = data_dir / "ctm_paper_summary.csv"
+    with open(curves_path) as f:
+        curves = json.load(f)
+    df = pd.read_csv(summary_path)
+    # coerce numeric cols
+    for c in ["final_iter", "best_test_acc", "final_test_acc",
+              "best_test_acc_mc", "final_test_acc_mc", "n_points", "seed"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df, curves
+
+
+def filter_complete(df, min_iter):
+    """Drop seeds that didn't reach min_iter (interrupted / OOM half-runs)."""
+    return df[df["final_iter"].fillna(0) >= min_iter].copy()
+
+
+def agg_sweep(df_sub):
+    """Group by (stage, task, sweep), return per-group mean/std + seed count."""
+    g = df_sub.groupby(["stage", "task", "sweep"])
+    out = []
+    for (stage, task, sweep), grp in g:
+        rec = {
+            "stage": stage, "task": task, "sweep": sweep,
+            "n_seeds": len(grp),
+            "best_mean": grp["best_test_acc"].mean(),
+            "best_std": grp["best_test_acc"].std(ddof=1) if len(grp) > 1 else 0.0,
+            "final_mean": grp["final_test_acc"].mean(),
+            "bmc_mean": grp["best_test_acc_mc"].dropna().mean() if grp["best_test_acc_mc"].notna().any() else None,
+        }
+        out.append(rec)
+    return pd.DataFrame(out)
+
+
+# ---------------------------- Figure 1: tick sweep ----------------------------
+
+def parse_tick(sweep):
+    """tick1 -> 1, tick25 -> 25. qamnist uses 'repeat' instead."""
+    m = re.match(r"tick(\d+)$", sweep)
+    return int(m.group(1)) if m else None
+
+
+def fig_tick_sweep(df_complete, out_dir, min_iter):
+    """st02 tick sweep: 2x2 grid, errorbar over seeds, baseline lines."""
+    sub = df_complete[df_complete["stage"] == "st02"].copy()
+    sub["tick"] = sub["sweep"].apply(parse_tick)
+    sub = sub.dropna(subset=["tick"])
+    if sub.empty:
+        print("[fig1] no st02 tick data")
+        return
+    agg = agg_sweep(sub)
+    agg["tick"] = agg["sweep"].apply(parse_tick)
+
+    tasks = [t for t in TASK_ORDER if t in agg["task"].unique()]
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    axes = axes.flatten()
+    for i, task in enumerate(tasks):
+        ax = axes[i]
+        a = agg[agg["task"] == task].sort_values("tick")
+        x = a["tick"].values
+        y = a["best_mean"].values * 100
+        yerr = a["best_std"].values * 100
+        ax.errorbar(x, y, yerr=yerr, marker="o", capsize=4, linewidth=2,
+                    markersize=8, color=TASK_COLORS[task])
+        # baseline lines
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color="gray", linestyle="--",
+                       alpha=0.6, label="st00 paper baseline")
+        if task in BASELINE_FF:
+            ax.axhline(BASELINE_FF[task] * 100, color="red", linestyle=":",
+                       alpha=0.5, label="st00 ff baseline")
+        # annotate seed count (warn if low)
+        for xi, yi, n in zip(x, y, a["n_seeds"].values):
+            label = f"n={n}" + ("!" if n < 2 else "")
+            ax.annotate(label, (xi, yi), textcoords="offset points",
+                        xytext=(0, 8), ha="center", fontsize=7, color="red" if n < 2 else "black")
+        ax.set_xscale("log")
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(int(v)) for v in x])
+        ax.set_title(f"{task} — st02 tick sweep (seeds with iter≥{min_iter//1000}k)",
+                     fontsize=11)
+        ax.set_xlabel("n_ticks (log scale)")
+        ax.set_ylabel("best test acc (%)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc="lower right")
+    # hide unused
+    for j in range(len(tasks), 4):
+        axes[j].axis("off")
+    fig.suptitle("CTM Paper — st02: How many 'thought ticks' does each task need?",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    path = out_dir / "fig1_tick_sweep.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig1] -> {path}")
+
+
+# ------------------------ Figure 2: capacity sweep ----------------------------
+
+SWEEP_PREFIXES = [
+    ("d_model", "d_model"),
+    ("headsh", "heads"),
+    ("memory_hidden_dims", "memory_hidden_dims"),
+    ("synapse_depth", "synapse_depth"),
+    ("nst", "neuron_select_type"),
+]
+DEFAULTS = {
+    "cifar10": dict(d_model=256, heads=16, memory_hidden_dims=64,
+                    synapse_depth=5, neuron_select_type="random-pairing"),
+    "mazes": dict(d_model=2048, heads=16, memory_hidden_dims=32,
+                  synapse_depth=8, neuron_select_type="first-last"),
+    "parity": dict(d_model=1024, heads=8, memory_hidden_dims=16,
+                   synapse_depth=1, neuron_select_type="random"),
+    "sort": dict(d_model=512, heads=4, memory_hidden_dims=4,
+                 synapse_depth=4, neuron_select_type="random-pairing"),
+}
+
+
+def parse_capacity_sweep(sweep, task):
+    """Return (var_name, value_str) for a st01 sweep name."""
+    for prefix, var in SWEEP_PREFIXES:
+        if sweep.startswith(prefix):
+            val = sweep[len(prefix):].lstrip("s")  # 'headsh16' -> '16', 'synapse_depthsd2' -> 'd2'->'2'
+            # special: synapse_depthsd2 -> strip leading 'd', 'sd2' handled by prefix 'synapse_depth' -> 'sd2'->'d2'? fix
+            if var == "synapse_depth" and val.startswith("d"):
+                val = val[1:]
+            if var == "memory_hidden_dims" and val.startswith("mh"):
+                val = val[2:]
+            if var == "neuron_select_type":
+                val = sweep[len("nst"):]
+                if not val:
+                    val = "default"
+            return var, val
+    return None, None
+
+
+def fig_capacity_sweep(df_complete, out_dir, min_iter):
+    """st01 capacity sweep: bar chart, normalised to baseline."""
+    sub = df_complete[df_complete["stage"] == "st01"].copy()
+    if sub.empty:
+        print("[fig2] no st01 data")
+        return
+    agg = agg_sweep(sub)
+
+    tasks = [t for t in TASK_ORDER if t in agg["task"].unique()]
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    axes = axes.flatten()
+    for i, task in enumerate(tasks):
+        ax = axes[i]
+        a = agg[agg["task"] == task].copy()
+        # parse (var, val)
+        parsed = a["sweep"].apply(lambda s: parse_capacity_sweep(s, task))
+        a["var"] = parsed.apply(lambda p: p[0])
+        a["val"] = parsed.apply(lambda p: p[1])
+        a = a.dropna(subset=["var"])
+        # group by var, plot each variant
+        a["label"] = a["var"] + "=" + a["val"].astype(str)
+        a = a.sort_values(["var", "val"])
+        labels = a["label"].tolist()
+        means = a["best_mean"].values * 100
+        stds = a["best_std"].values * 100
+        colors = [plt.cm.tab20(j % 20) for j in range(len(labels))]
+        bars = ax.bar(range(len(labels)), means, yerr=stds, capsize=3,
+                      color=colors, alpha=0.85)
+        # baseline
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color="gray", linestyle="--",
+                       alpha=0.7, label="st00 paper baseline")
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        ax.set_title(f"{task} — st01 capacity sweep", fontsize=11)
+        ax.set_ylabel("best test acc (%)")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(fontsize=8, loc="upper right")
+    for j in range(len(tasks), 4):
+        axes[j].axis("off")
+    fig.suptitle("CTM Paper — st01: Capacity / structural sweeps",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    path = out_dir / "fig2_capacity_sweep.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig2] -> {path}")
+
+
+# ------------------- Figure 3: most_certain vs final --------------------------
+
+def fig_mc_vs_final(df_complete, out_dir):
+    """Scatter: best_test_acc_mc (y) vs final_test_acc (x). CTM most-certain tick value."""
+    sub = df_complete.dropna(subset=["best_test_acc_mc", "final_test_acc"]).copy()
+    sub = sub[(sub["best_test_acc_mc"] > 0) & (sub["final_test_acc"] > 0)]
+    # exclude st00 baselines (keep only sweeps)
+    sub = sub[sub["stage"].isin([f"st{n:02d}" for n in range(1, 25)])]
+    if sub.empty:
+        print("[fig3] no mc data")
+        return
+    fig, ax = plt.subplots(figsize=(9, 8))
+    for task, grp in sub.groupby("task"):
+        ax.scatter(grp["final_test_acc"] * 100, grp["best_test_acc_mc"] * 100,
+                   label=task, color=TASK_COLORS.get(task, "gray"),
+                   alpha=0.7, s=55, edgecolors="white", linewidths=0.5)
+    # diagonal
+    lo, hi = 0, 100
+    ax.plot([lo, hi], [lo, hi], "k--", alpha=0.4, label="y=x (no most-certain gain)")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("final test acc (%)  —  using only the LAST tick's prediction")
+    ax.set_ylabel("best test acc_mc (%)  —  using the MOST CERTAIN tick")
+    ax.set_title("CTM most-certain tick selection: per-sample best tick >> final tick\n"
+                 "(points above the diagonal = most-certain tick helps)",
+                 fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    path = out_dir / "fig3_mc_vs_final.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig3] -> {path}")
+
+
+# ----------------------- Figure 4: convergence curves ------------------------
+
+def fig_convergence(df_complete, curves, out_dir, min_iter):
+    """cifar10 + mazes tick-sweep convergence curves overlay.
+
+    Uses key name ('st02/cifar10_tick1') + df_complete lookup, so works even
+    when curves.json lacks a 'meta' field (older extract versions).
+    """
+    # index df_complete by (stage, exp) for fast lookup
+    df_idx = df_complete.set_index(["stage", "exp"])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
+    for idx, task in enumerate(["cifar10", "mazes"]):
+        ax = axes[idx]
+        runs = []
+        for key, v in curves.items():
+            parts = key.split("/", 1)
+            if len(parts) != 2:
+                continue
+            stage, exp_name = parts
+            if stage != "st02":
+                continue
+            if (stage, exp_name) not in df_idx.index:
+                continue
+            row = df_idx.loc[(stage, exp_name)]
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            if row["task"] != task:
+                continue
+            fi = row.get("final_iter", 0)
+            if pd.isna(fi) or fi < min_iter:
+                continue
+            tick = parse_tick(row["sweep"])
+            if tick is None:
+                continue
+            iters = v.get("iters", [])
+            accs = v.get("test_acc", [])
+            if len(iters) != len(accs) or len(iters) < 2:
+                continue
+            runs.append((tick, iters, accs))
+        # average over seeds per tick
+        by_tick = {}
+        for tick, iters, accs in runs:
+            by_tick.setdefault(tick, []).append((iters, accs))
+        cmap = plt.cm.viridis
+        n_ticks = len(by_tick)
+        if n_ticks == 0:
+            ax.text(0.5, 0.5, f"no complete {task} tick runs\n(iter≥{min_iter//1000}k)",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=12)
+            ax.set_title(f"{task} — no data", fontsize=11)
+            continue
+        for i, tick in enumerate(sorted(by_tick.keys())):
+            seed_runs = by_tick[tick]
+            max_iter = max(max(it) for it, _ in seed_runs)
+            grid = np.linspace(0, max_iter, 100)
+            interp_accs = []
+            for it, ac in seed_runs:
+                if len(it) >= 2:
+                    interp = np.interp(grid, it, ac)
+                    interp_accs.append(interp)
+            if not interp_accs:
+                continue
+            mean_curve = np.mean(interp_accs, axis=0) * 100
+            color = cmap(i / max(n_ticks - 1, 1))
+            ax.plot(grid, mean_curve, color=color, linewidth=2,
+                    label=f"tick={tick} (n={len(interp_accs)})")
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color="gray", linestyle="--",
+                       alpha=0.6, label="st00 paper baseline")
+        ax.set_xlabel("training iteration")
+        ax.set_ylabel("test acc (%)")
+        ax.set_title(f"{task} — st02 tick sweep convergence (seeds iter≥{min_iter//1000}k)",
+                     fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc="lower right")
+    fig.suptitle("Convergence: more ticks ≠ faster learning on cifar10",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    path = out_dir / "fig4_convergence.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig4] -> {path}")
+
+
+# -------------------------- Figure 5: jepa weight sweep -----------------------
+
+def parse_jepa_weight(sweep):
+    """jepa_w0.1 -> 0.1, jepa_w1.0 -> 1.0."""
+    m = re.match(r"jepa_w(\d+\.\d+)$", sweep)
+    return float(m.group(1)) if m else None
+
+
+def fig_jepa_weight(df_complete, out_dir):
+    """st04 jepa_weight scan (0.1, 0.5, 1.0): one line per task."""
+    sub = df_complete[df_complete["stage"] == "st04"].copy()
+    sub["weight"] = sub["sweep"].apply(parse_jepa_weight)
+    sub = sub.dropna(subset=["weight"])
+    if sub.empty:
+        print("[fig5] no st04 jepa_weight data")
+        return
+
+    tasks = [t for t in ["cifar10", "mazes", "qamnist", "sort", "parity"]
+             if t in sub["task"].unique()]
+    fig, ax = plt.subplots(figsize=(9, 6.5))
+    for task in tasks:
+        grp = sub[sub["task"] == task]
+        agg = grp.groupby("weight").agg(
+            mean=("best_test_acc", "mean"),
+            std=("best_test_acc", "std"),
+            n=("best_test_acc", "count"),
+        ).reset_index().sort_values("weight")
+        x = agg["weight"].values
+        y = agg["mean"].values * 100
+        yerr = agg["std"].fillna(0).values * 100
+        ax.errorbar(x, y, yerr=yerr, marker="o", capsize=5, linewidth=2,
+                    markersize=9, color=TASK_COLORS.get(task, "gray"),
+                    label=f"{task}")
+        for xi, yi, n in zip(x, y, agg["n"].values):
+            ax.annotate(f"n={int(n)}", (xi, yi), textcoords="offset points",
+                        xytext=(8, -2), fontsize=7,
+                        color=TASK_COLORS.get(task, "gray"))
+    ax.set_xscale("log")
+    ax.set_xticks([0.1, 0.5, 1.0])
+    ax.set_xticklabels(["0.1", "0.5", "1.0"])
+    ax.set_xlabel("jepa_weight (auxiliary loss weight, log scale)")
+    ax.set_ylabel("best test acc (%)")
+    ax.set_title("st04: JEPA auxiliary loss weight sweep\n"
+                 "(lower weight = less JEPA regularisation)",
+                 fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9)
+    fig.tight_layout()
+    path = out_dir / "fig5_jepa_weight.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig5] -> {path}")
+
+
+# -------------------------- Figure 6: jepa variants ---------------------------
+
+VARIANT_MAP = {
+    "jepa_w0.1": "w0.1\n(default)",
+    "jepa_mse": "mse loss",
+    "jepa_nostopgrad": "no\nstop-grad",
+    "jepa_pd1": "predict_\ndelta=1",
+    "jepa_pd4": "predict_\ndelta=4",
+}
+VARIANT_ORDER = ["jepa_w0.1", "jepa_mse", "jepa_nostopgrad", "jepa_pd1", "jepa_pd4"]
+
+
+def fig_jepa_variants(df_complete, out_dir):
+    """st04 jepa variant comparison: bar chart per task (2x2)."""
+    sub = df_complete[df_complete["stage"] == "st04"].copy()
+    sub = sub[sub["sweep"].isin(VARIANT_MAP.keys())]
+    if sub.empty:
+        print("[fig6] no st04 jepa variant data")
+        return
+
+    tasks = [t for t in ["cifar10", "mazes", "qamnist", "sort"]
+             if t in sub["task"].unique()]
+    n_tasks = len(tasks)
+    nrows = (n_tasks + 1) // 2
+    fig, axes = plt.subplots(nrows, 2, figsize=(13, 4.5 * nrows), squeeze=False)
+    axes = axes.flatten()
+    for i, task in enumerate(tasks):
+        ax = axes[i]
+        agg = agg_sweep(sub[sub["task"] == task]).set_index("sweep")
+        labels, means, stds, colors = [], [], [], []
+        present = []
+        for j, sw in enumerate(VARIANT_ORDER):
+            if sw not in agg.index:
+                continue
+            row = agg.loc[sw]
+            labels.append(VARIANT_MAP[sw])
+            means.append(row["best_mean"] * 100)
+            stds.append(row["best_std"] * 100)
+            present.append(sw)
+            colors.append(plt.cm.Set2(j / len(VARIANT_ORDER)))
+        x = np.arange(len(labels))
+        bars = ax.bar(x, means, yerr=stds, capsize=4, color=colors,
+                      alpha=0.85, edgecolor="black", linewidth=0.5)
+        # annotate values + n_seeds
+        for xi, yi, sw in zip(x, means, present):
+            n = int(agg.loc[sw, "n_seeds"])
+            ax.annotate(f"{yi:.1f}%\n(n={n})", (xi, yi), textcoords="offset points",
+                        xytext=(0, 6), ha="center", fontsize=7.5)
+        # baseline
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color="gray", linestyle="--",
+                       alpha=0.7, label="st00 paper baseline")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_title(f"{task} — st04 JEPA variants", fontsize=11)
+        ax.set_ylabel("best test acc (%)")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(fontsize=8, loc="upper right")
+    for j in range(n_tasks, len(axes)):
+        axes[j].axis("off")
+    fig.suptitle("st04: JEPA auxiliary loss — does each component help?",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    path = out_dir / "fig6_jepa_variants.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig6] -> {path}")
+
+
+# ------------------------------ main -----------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-dir", default=str(DEFAULT_DATA))
+    ap.add_argument("--out-dir", default=str(DEFAULT_OUT))
+    ap.add_argument("--min-iter", type=int, default=50000,
+                    help="drop seeds with final_iter below this (default 50000)")
+    cli = ap.parse_args()
+
+    data_dir = Path(cli.data_dir)
+    out_dir = Path(cli.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df, curves = load_data(data_dir)
+    print(f"Loaded summary.csv: {len(df)} rows")
+    print(f"Loaded curves.json: {len(curves)} runs")
+
+    df_complete = filter_complete(df, cli.min_iter)
+    n_dropped = len(df) - len(df_complete)
+    print(f"Filter: dropped {n_dropped} seeds with final_iter < {cli.min_iter}")
+    print(f"  → {len(df_complete)} complete seeds remain")
+
+    # report stage coverage after filter
+    cov = df_complete.groupby("stage").size()
+    print("Complete seeds per stage:")
+    print(cov.to_string())
+
+    fig_tick_sweep(df_complete, out_dir, cli.min_iter)
+    fig_capacity_sweep(df_complete, out_dir, cli.min_iter)
+    fig_mc_vs_final(df_complete, out_dir)
+    fig_convergence(df_complete, curves, out_dir, cli.min_iter)
+    fig_jepa_weight(df_complete, out_dir)
+    fig_jepa_variants(df_complete, out_dir)
+
+    print(f"\nAll figures saved to: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()

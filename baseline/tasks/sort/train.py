@@ -22,6 +22,7 @@ from baseline.tasks.sort.utils import compute_ctc_accuracy, decode_predictions
 from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
+from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args, compute_bp_steps, EMATracker, compute_act_q_loss
 
 import torchvision
 torchvision.disable_beta_transforms_warning()
@@ -124,6 +125,7 @@ def parse_args():
     add_jepa_args(parser)
     add_all_idea_args(parser)
     add_train_idea_args(parser)
+    add_hrm_idea_args(parser)
     args = parser.parse_args()
     return args
 
@@ -214,6 +216,29 @@ if __name__=='__main__':
     model.tick_halt_threshold = args.tick_halt_threshold
     model.tick_min_ticks = args.tick_min_ticks
 
+    # --- HRM-inspired attributes ---
+    model.bp_steps = args.bp_steps
+    model.detach_every = args.detach_every
+
+    # --- ACT Q-learning halting ---
+    if args.act_halt:
+        model.act_halt = True
+        model.q_head = torch.nn.Linear(model.synch_representation_size_out, 2).to(device)
+        torch.nn.init.zeros_(model.q_head.weight)
+        model.q_head.bias.data.fill_(-5.0)
+
+    # --- Hierarchical recurrence (HRM core) ---
+    if args.h_cycles > 1:
+        model.h_cycles = args.h_cycles
+        model.l_cycles = args.l_cycles if args.l_cycles > 0 else (args.iterations // args.h_cycles)
+        import torch.nn as nn
+        model.h_synapse = nn.Sequential(
+            nn.LayerNorm(args.d_model),
+            nn.Linear(args.d_model, args.d_model * 2),
+            nn.GLU(),
+            nn.LayerNorm(args.d_model),
+        ).to(device)
+
     # Reflex head
     if args.reflex_head:
         model.reflex_head = ReflexHead(
@@ -256,7 +281,9 @@ if __name__=='__main__':
         print(f'WARNING, excluding: {no_decay_names}')
 
     # Optimizer and scheduler (Common setup)
-    if len(no_decay_names) and args.weight_decay!=0:
+    if getattr(args, 'optimizer_type', 'adam') == 'adam_atan2':
+        optimizer = build_optimizer_from_args(model.parameters(), args)
+    elif len(no_decay_names) and args.weight_decay!=0:
         optimizer = torch.optim.AdamW([{'params': decay_params, 'weight_decay':args.weight_decay},
                                        {'params': no_decay_params, 'weight_decay':0}],
                                   lr=args.lr,
@@ -329,11 +356,22 @@ if __name__=='__main__':
         model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
         model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True)
     
+    # --- EMA weight tracker (HRM-Text style) ---
+    ema_tracker = None
+    if args.ema_decay > 0:
+        ema_tracker = EMATracker(model, decay=args.ema_decay)
+
     # Training
     iterator = iter(trainloader)  # Not training in epochs, but rather iterations. Need to reset this from time to time
     with tqdm(total=args.training_iterations, initial=start_iter, leave=False, position=0, dynamic_ncols=True) as pbar:
         for bi in range(start_iter, args.training_iterations):
             current_lr = optimizer.param_groups[-1]['lr']
+
+            # --- BP warmup: dynamically update bp_steps ---
+            if args.bp_warmup_ratio > 0:
+                model.bp_steps = compute_bp_steps(bi, args.training_iterations,
+                                                   args.bp_warmup_ratio,
+                                                   args.bp_min_steps, args.bp_max_steps)
 
             
             
@@ -351,7 +389,8 @@ if __name__=='__main__':
                 ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
                                 args.tick_loss_mode != 'last' or args.reflex_head or
                                 args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
-                                args.ema_distill_weight > 0 or args.draft_revise_weight > 0)
+                                args.ema_distill_weight > 0 or args.draft_revise_weight > 0 or
+                                args.act_halt)
                 if ideas_active:
                     out = model(inputs, return_per_tick_synch=(args.cross_tick_jepa_weight > 0))
                     if isinstance(out[-1], dict):
@@ -361,6 +400,11 @@ if __name__=='__main__':
                         predictions, certainties, synchronisation = out
                         extras = {}
                     loss = compute_multi_tick_loss(predictions, targets, sort_loss,
+                                                   mode=args.tick_loss_mode,
+                                                   certainties=certainties,
+                                                   weights=args.tick_loss_weights) if args.loss_type == 'softmax_ce' else \
+                           compute_multi_tick_loss(predictions, targets,
+                                                   lambda p, t: sort_loss(p, t, loss_type=args.loss_type),
                                                    mode=args.tick_loss_mode,
                                                    certainties=certainties,
                                                    weights=args.tick_loss_weights)
@@ -381,13 +425,23 @@ if __name__=='__main__':
                         dp = extras['draft_prediction']
                         draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
                         loss = loss + args.draft_revise_weight * draft_loss
+                    # ACT Q-learning loss
+                    if args.act_halt and 'q_logits' in extras:
+                        from baseline.tasks.sort.utils import decode_predictions
+                        decoded = decode_predictions(predictions, blank_label=predictions.size(1)-1)
+                        is_correct = torch.tensor(
+                            [1.0 if (len(d) == len(t) and torch.equal(d, t.to(d.device))) else 0.0
+                             for d, t in zip(decoded, targets)],
+                            device=predictions.device)
+                        is_correct = is_correct.unsqueeze(1).expand(-1, predictions.size(-1))
+                        loss = loss + compute_act_q_loss(extras['q_logits'], is_correct, weight=args.halt_q_weight)
                 else:
                     out = model(inputs)
                     if isinstance(out[-1], dict):
                         predictions, certainties, synchronisation = out[:-1]
                     else:
                         predictions, certainties, synchronisation = out
-                    loss = sort_loss(predictions, targets)
+                    loss = sort_loss(predictions, targets, loss_type=args.loss_type)
             
                         
             scaler.scale(loss).backward()
@@ -402,6 +456,10 @@ if __name__=='__main__':
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+
+            # --- EMA weight update ---
+            if ema_tracker is not None:
+                ema_tracker.update(model)
 
             accuracy = compute_ctc_accuracy(predictions, targets, predictions.shape[1]-1)
             pbar.set_description(f'Sorting {args.N_to_sort} real numbers. Loss={loss.item():0.3f}. Accuracy={accuracy:0.3f}. LR={current_lr:0.6f}')

@@ -151,6 +151,17 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # --- Output Procesing ---
         self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
 
+        # --- HRM-Inspired Attributes (set by training script, None = disabled) ---
+        self.bp_steps = 0              # Truncated BPTT: 0=full
+        self.detach_every = 0          # State detach every K ticks: 0=never
+        self.input_injection = 'concat'  # 'concat', 'additive', 'gru_gate'
+        self.gated_attention = False
+        self.attn_gate = None          # nn.Linear, set by training script
+        self.gru_gate_module = None    # GRUGate, set by training script
+        self.h_cycles = 1              # Hierarchical: outer loop count. 1=flat
+        self.l_cycles = 0              # Hierarchical: inner loop count. 0=iterations/h_cycles
+        self.h_synapse = None          # nn.Module for H-level update, set by training script
+
     @classmethod
     def _from_pretrained(
         cls,
@@ -525,7 +536,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
 
 
-    def forward(self, x, track=False, return_per_tick_synch=False):
+    def forward(self, x, track=False, return_per_tick_synch=False, current_train_step=0, total_train_steps=1):
         B = x.size(0)
         device = x.device
 
@@ -538,6 +549,20 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         halt_threshold = getattr(self, 'tick_halt_threshold', 0.0)
         min_ticks = getattr(self, 'tick_min_ticks', 1)
         use_reflex = hasattr(self, 'reflex_head') and self.reflex_head is not None
+
+        # --- HRM-inspired config ---
+        bp_steps_cfg = getattr(self, 'bp_steps', 0)
+        detach_every = getattr(self, 'detach_every', 0)
+        input_injection = getattr(self, 'input_injection', 'concat')
+        use_gated_attn = getattr(self, 'gated_attention', False)
+        attn_gate = getattr(self, 'attn_gate', None)
+        gru_gate_module = getattr(self, 'gru_gate_module', None)
+        h_cycles = getattr(self, 'h_cycles', 1)
+        l_cycles = getattr(self, 'l_cycles', 0)
+        h_synapse = getattr(self, 'h_synapse', None)
+        use_hierarchical = h_cycles > 1 and h_synapse is not None
+        q_head = getattr(self, 'q_head', None)
+        act_halt = getattr(self, 'act_halt', False)
 
         # --- Tracking Initialization ---
         pre_activations_tracking = []
@@ -566,6 +591,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
         certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
         n_steps_used = self.iterations
+        q_logits_all = [] if (act_halt and q_head is not None) else None
 
         # --- Reflex head output storage ---
         reflex_preds = []
@@ -583,87 +609,133 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
 
+        # --- Compute effective BP steps (truncated BPTT) ---
+        if bp_steps_cfg > 0:
+            effective_bp_steps = min(bp_steps_cfg, self.iterations)
+        else:
+            effective_bp_steps = self.iterations
+
+        # --- Hierarchical: initialize H-level state ---
+        z_H = torch.zeros_like(activated_state) if use_hierarchical else None
+        eff_l_cycles = l_cycles if l_cycles > 0 else max(1, self.iterations // max(1, h_cycles))
+
         # --- Recurrent Loop  ---
         for stepi in range(self.iterations):
 
-            # --- Async Tick Mask: determine which neurons are active ---
-            async_mask = None
-            if async_mode == 'banded' and async_periods is not None:
-                periods = [int(p) for p in async_periods.split(',')]
-                phases = [int(p) for p in async_phases.split(',')] if async_phases else None
-                async_mask = get_async_tick_mask(stepi, d_model, periods, phases, device=device)
+            # --- Truncated BPTT: only build graph for last N ticks ---
+            grad_enabled_this_tick = stepi >= self.iterations - effective_bp_steps
 
-            # --- Calculate Synchronisation for Input Data Interaction ---
-            synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
+            # --- State detach: cut gradient every K ticks ---
+            if detach_every > 0 and stepi > 0 and stepi % detach_every == 0:
+                state_trace = state_trace.detach()
+                activated_state = activated_state.detach()
 
-            # --- Interact with Data via Attention ---
-            q = self.q_proj(synchronisation_action).unsqueeze(1)
-            attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
-            attn_out = attn_out.squeeze(1)
-            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1) if async_mask is None else torch.concatenate((attn_out, activated_state * async_mask.unsqueeze(0).float()), dim=-1)
+            with torch.set_grad_enabled(torch.is_grad_enabled() and grad_enabled_this_tick):
 
-            # --- Apply Synapses ---
-            state = self.synapses(pre_synapse_input)
-            if async_mask is not None:
-                state = state * async_mask.unsqueeze(0).float()
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+                # --- Async Tick Mask: determine which neurons are active ---
+                async_mask = None
+                if async_mode == 'banded' and async_periods is not None:
+                    periods = [int(p) for p in async_periods.split(',')]
+                    phases = [int(p) for p in async_phases.split(',')] if async_phases else None
+                    async_mask = get_async_tick_mask(stepi, d_model, periods, phases, device=device)
 
-            # --- Apply Neuron-Level Models (standard or differentiated) ---
-            if nlm_diff is not None:
-                activated_state = nlm_diff(state_trace)
-            else:
-                activated_state = trace_proc(state_trace)
-            if async_mask is not None:
-                activated_state = activated_state * async_mask.unsqueeze(0).float()
+                # --- Calculate Synchronisation for Input Data Interaction ---
+                synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
 
-            # --- Top-k Sparsity ---
-            if topk < 1.0:
-                activated_state = apply_topk_sparsity(activated_state, topk, stepi)
+                # --- Interact with Data via Attention ---
+                q = self.q_proj(synchronisation_action).unsqueeze(1)
+                attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
+                attn_out = attn_out.squeeze(1)
 
-            # --- Calculate Synchronisation for Output Predictions ---
-            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
+                # --- Gated Attention (HRM-Text style) ---
+                if use_gated_attn and attn_gate is not None:
+                    attn_out = attn_out * torch.sigmoid(attn_gate(attn_out))
 
-            # --- Get Predictions and Certainties ---
-            current_prediction = self.output_projector(synchronisation_out)
-            current_certainty = self.compute_certainty(current_prediction)
+                # --- Input Injection: combine attn_out with activated_state ---
+                state_for_synapse = activated_state
+                if async_mask is not None:
+                    state_for_synapse = activated_state * async_mask.unsqueeze(0).float()
 
-            predictions[..., stepi] = current_prediction
-            certainties[..., stepi] = current_certainty
+                # --- Hierarchical: inject H-level state (HRM-style) ---
+                if z_H is not None:
+                    state_for_synapse = state_for_synapse + z_H
 
-            # 8b. Draft-revise: save draft at block boundary, corrupt state
-            if draft_mode == 'revise':
-                from baseline.utils.ctm_model_ideas import apply_draft_revise_corruption
-                draft_block_size = getattr(self, 'draft_block_size', 2)
-                corrupt_prob = getattr(self, 'draft_corrupt_prob', 0.0)
-                _saved, activated_state = apply_draft_revise_corruption(
-                    stepi, draft_block_size, activated_state, corrupt_prob)
-                if _saved:
-                    draft_pred = current_prediction.detach()
+                if input_injection == 'additive':
+                    pre_synapse_input = attn_out + state_for_synapse
+                elif input_injection == 'gru_gate' and gru_gate_module is not None:
+                    pre_synapse_input = gru_gate_module(attn_out, state_for_synapse)
+                else:
+                    pre_synapse_input = torch.concatenate((attn_out, state_for_synapse), dim=-1)
 
-            # --- Reflex Head: produce early output ---
-            if use_reflex and stepi < getattr(self, 'reflex_ticks', 1):
-                rp = self.reflex_head(synchronisation_out)
-                reflex_preds.append(rp)
+                # --- Apply Synapses ---
+                state = self.synapses(pre_synapse_input)
+                if async_mask is not None:
+                    state = state * async_mask.unsqueeze(0).float()
+                state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
-            # --- Per-tick synch tracking for JEPA ---
-            if return_per_tick_synch:
-                synch_per_tick.append(synchronisation_out)
+                # --- Apply Neuron-Level Models (standard or differentiated) ---
+                if nlm_diff is not None:
+                    activated_state = nlm_diff(state_trace)
+                else:
+                    activated_state = trace_proc(state_trace)
+                if async_mask is not None:
+                    activated_state = activated_state * async_mask.unsqueeze(0).float()
 
-            # --- Tick Halt: early exit ---
-            if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
-                n_steps_used = stepi + 1
-                # Zero out unused tick slots
-                if stepi + 1 < self.iterations:
-                    predictions[..., stepi+1:] = 0
-                break
+                # --- Top-k Sparsity ---
+                if topk < 1.0:
+                    activated_state = apply_topk_sparsity(activated_state, topk, stepi)
 
-            # --- Tracking ---
-            if track:
-                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
-                post_activations_tracking.append(activated_state.detach().cpu().numpy())
-                attention_tracking.append(attn_weights.detach().cpu().numpy())
-                synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
-                synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
+                # --- Hierarchical: H-level update every l_cycles ticks ---
+                if z_H is not None and (stepi + 1) % eff_l_cycles == 0:
+                    z_H = z_H + h_synapse(activated_state)
+
+                # --- Calculate Synchronisation for Output Predictions ---
+                synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
+
+                # --- Get Predictions and Certainties ---
+                current_prediction = self.output_projector(synchronisation_out)
+                current_certainty = self.compute_certainty(current_prediction)
+
+                predictions[..., stepi] = current_prediction
+                certainties[..., stepi] = current_certainty
+
+                # --- ACT Q-learning: compute Q-head logits ---
+                if q_logits_all is not None:
+                    q_logits_all.append(q_head(synchronisation_out))
+
+                # 8b. Draft-revise: save draft at block boundary, corrupt state
+                if draft_mode == 'revise':
+                    from baseline.utils.ctm_model_ideas import apply_draft_revise_corruption
+                    draft_block_size = getattr(self, 'draft_block_size', 2)
+                    corrupt_prob = getattr(self, 'draft_corrupt_prob', 0.0)
+                    _saved, activated_state = apply_draft_revise_corruption(
+                        stepi, draft_block_size, activated_state, corrupt_prob)
+                    if _saved:
+                        draft_pred = current_prediction.detach()
+
+                # --- Reflex Head: produce early output ---
+                if use_reflex and stepi < getattr(self, 'reflex_ticks', 1):
+                    rp = self.reflex_head(synchronisation_out)
+                    reflex_preds.append(rp)
+
+                # --- Per-tick synch tracking for JEPA ---
+                if return_per_tick_synch:
+                    synch_per_tick.append(synchronisation_out)
+
+                # --- Tick Halt: early exit ---
+                if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
+                    n_steps_used = stepi + 1
+                    if stepi + 1 < self.iterations:
+                        predictions[..., stepi+1:] = 0
+                    break
+
+                # --- Tracking ---
+                if track:
+                    pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
+                    post_activations_tracking.append(activated_state.detach().cpu().numpy())
+                    attention_tracking.append(attn_weights.detach().cpu().numpy())
+                    synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
+                    synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
 
         # --- Build return tuple ---
         ret = (predictions, certainties, synchronisation_out)
@@ -681,6 +753,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             extras['n_steps_used'] = n_steps_used
         if draft_pred is not None:
             extras['draft_prediction'] = draft_pred
+        if q_logits_all is not None:
+            extras['q_logits'] = torch.stack(q_logits_all, dim=-1)  # (B, 2, T)
 
         if track:
             base = (predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)),

@@ -36,6 +36,58 @@ def task_set_status(task, status):
     task["status_changed_at"] = time.time()
 
 
+_TQDM_RE = re.compile(r'(\d+)%\|[^|]*\|\s*(\d+)/(\d+)')
+_TQDM_RATE_RE = re.compile(r'([\d.]+)\s*(it/s|s/it)')
+_TQDM_LOSS_RE = re.compile(r'(?:loss|Loss)[=:]?\s*(\d+\.?\d*(?:[eE][+-]?\d+)?)')
+
+
+def _parse_tqdm_line(line):
+    m = _TQDM_RE.search(line)
+    if not m:
+        return None
+    pct, cur, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    info = {"cur_step": cur, "max_steps": total, "pct": pct}
+    rm = _TQDM_RATE_RE.search(line)
+    if rm:
+        info["rate"] = float(rm.group(1))
+    lm = _TQDM_LOSS_RE.search(line)
+    if lm:
+        try:
+            info["loss"] = float(lm.group(1))
+        except ValueError:
+            pass
+    return info
+
+
+def _stderr_reader(proc, item):
+    """Background thread: read stderr in real-time, parse tqdm progress."""
+    buf = ""
+    lines = item.setdefault("stderr_lines", [])
+    try:
+        while True:
+            chunk = proc.stderr.read(256)
+            if not chunk:
+                break
+            buf += chunk
+            segments = re.split(r'[\r\n]', buf)
+            buf = segments[-1]
+            for seg in segments[:-1]:
+                seg = seg.strip()
+                if not seg:
+                    continue
+                lines.append(seg)
+                parsed = _parse_tqdm_line(seg)
+                if parsed:
+                    item["progress"] = parsed
+    except (OSError, ValueError):
+        pass
+    if buf.strip():
+        lines.append(buf.strip())
+        parsed = _parse_tqdm_line(buf)
+        if parsed:
+            item["progress"] = parsed
+
+
 def parse_gpu_spec(spec):
     if not spec:
         return None
@@ -304,11 +356,18 @@ class PoolHandler(BaseHTTPRequestHandler):
     def _handle_heartbeat(self, payload):
         addr = payload["node_addr"]
         announce = False
+        task_progress = payload.get("task_progress", {})
         with LOCK:
             old = STATE["nodes"].get(addr)
             announce = old is None or old.get("status") != payload.get("status")
             payload["last_seen"] = time.time()
             STATE["nodes"][addr] = payload
+            if task_progress:
+                for tid, prog in task_progress.items():
+                    for t in STATE.get("tasks", []):
+                        if t["task_id"] == tid and t["status"] == "running":
+                            t["progress"] = prog
+                            break
         if announce:
             print(f"[pool] node online/update: {addr} status={payload.get('status')}", flush=True)
         self._write_json({"ok": True})
@@ -643,8 +702,10 @@ def run_worker(args):
         for task_id in finished:
             item = procs.pop(task_id)
             rc = item["proc"].returncode
-            stdout, stderr = item["proc"].communicate()
-            stderr_tail = (stderr or "").strip().splitlines()[-30:]
+            stderr_thread = item.get("stderr_thread")
+            if stderr_thread and stderr_thread.is_alive():
+                stderr_thread.join(timeout=3)
+            stderr_tail = (item.get("stderr_lines") or [])[-30:]
             print(
                 f"[worker] task {task_id} exited rc={rc} "
                 f"gpus={item.get('gpus') or 'all'}",
@@ -690,6 +751,11 @@ def run_worker(args):
             "pid": next(iter(procs.values()))["proc"].pid if procs else None,
             "gpu_slots_config": gpu_slots_config,
             "gpu_slots_used": gpu_slots_used,
+            "task_progress": {
+                tid: item.get("progress", {})
+                for tid, item in procs.items()
+                if item.get("progress")
+            },
         }
         try:
             post_json(f"{base}/heartbeat", heartbeat, timeout=5)
@@ -777,12 +843,17 @@ def run_worker(args):
                     env[k] = v
                 print(f"[worker] received task {task['task_id']}: {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
                 proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, env=env)
-                procs[task["task_id"]] = {
+                item = {
                     "proc": proc,
                     "gpus": requested_gpus,
                     "stderr_lines": [],
                     "est_gb": task_gb,
+                    "progress": {},
                 }
+                procs[task["task_id"]] = item
+                t = threading.Thread(target=_stderr_reader, args=(proc, item), daemon=True)
+                item["stderr_thread"] = t
+                t.start()
                 post_json(f"{base}/ack", {
                     "node_addr": node_addr,
                     "task_id": task["task_id"],
@@ -961,9 +1032,13 @@ def run_task_history(args, base):
             name = _task_expname(t)
             dur = t.get("status_changed_at", 0) - t.get("created_at", 0)
             info = "?"
-            m = _read_experiment_metrics(getattr(args, "metrics_dir", "runs/metrics"), name)
-            if m:
-                info = f"acc={m.get('eval_accuracy','?')}" if m.get('eval_accuracy') else f"loss={m.get('loss','?')}"
+            progress = t.get("progress", {})
+            if progress.get("loss"):
+                info = f"loss={progress['loss']:.4f}"
+            else:
+                m = _read_experiment_metrics(getattr(args, "metrics_dir", "runs/metrics"), name)
+                if m:
+                    info = f"acc={m.get('eval_accuracy','?')}" if m.get('eval_accuracy') else f"loss={m.get('loss','?')}"
             print(f"  {name:40s}  {_fmt_time(dur):>8s}  {info}")
 
     if failed:
@@ -1190,29 +1265,24 @@ def run_kanban(args):
 
             exp_name = _task_expname(t, extra)
 
-            metrics = _read_experiment_metrics(metrics_dir, exp_name)
-            max_steps = 0
-            cur_step = 0
-            step_rate = 0
-            loss_val = ""
-            if metrics:
-                try:
-                    cur_step = float(metrics.get("global_step", 0))
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    max_steps = float(metrics.get("max_steps", 0))
-                except (TypeError, ValueError):
-                    pass
-                loss_val = metrics.get("loss", "")
+            progress = t.get("progress", {})
+            max_steps = progress.get("max_steps", 0)
+            cur_step = progress.get("cur_step", 0)
+            step_rate = progress.get("rate", 0)
+            loss_val = progress.get("loss", "")
 
             ratio = cur_step / max_steps if max_steps > 0 else -1
             bar = _fmt_progress_bar(ratio)
             step_str = f"{int(cur_step):>6}/{int(max_steps):<6}" if max_steps > 0 else "   -/   - "
 
             if max_steps > 0 and cur_step > 0:
-                step_rate = cur_step / elapsed
-                remaining = (max_steps - cur_step) / step_rate if step_rate > 0 else -1
+                if step_rate and step_rate > 0:
+                    remaining = (max_steps - cur_step) / step_rate
+                elif elapsed > 0:
+                    avg_rate = cur_step / elapsed
+                    remaining = (max_steps - cur_step) / avg_rate if avg_rate > 0 else -1
+                else:
+                    remaining = -1
             else:
                 remaining = -1
 
@@ -1220,6 +1290,10 @@ def run_kanban(args):
             eta_s = _fmt_time(remaining)
 
             info_parts = []
+            if exp_name:
+                info_parts.append(exp_name)
+            if step_rate and step_rate > 0:
+                info_parts.append(f"{step_rate:.1f}it/s")
             if loss_val and loss_val not in ("", "nan", "inf"):
                 info_parts.append(f"loss={float(loss_val):.4f}")
             lines.append(
@@ -1264,12 +1338,19 @@ def run_kanban(args):
 
             status_label = st.upper()
             info_parts = []
-            if st == "completed" and exp_name:
-                metrics = _read_experiment_metrics(metrics_dir, exp_name)
-                if metrics:
-                    lv = metrics.get("loss", "")
-                    if lv and lv not in ("", "nan", "inf"):
-                        info_parts.append(f"loss={float(lv):.4f}")
+            if st == "completed":
+                progress = t.get("progress", {})
+                lv = progress.get("loss", "")
+                if lv and lv not in ("", "nan", "inf"):
+                    info_parts.append(f"loss={float(lv):.4f}")
+                elif exp_name:
+                    metrics = _read_experiment_metrics(metrics_dir, exp_name)
+                    if metrics:
+                        lv = metrics.get("loss", "")
+                        if lv and lv not in ("", "nan", "inf"):
+                            info_parts.append(f"loss={float(lv):.4f}")
+                if exp_name:
+                    info_parts.append(exp_name)
             elif st == "failed":
                 if fail_info:
                     err_type = fail_info.get("error_type", "")

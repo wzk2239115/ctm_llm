@@ -28,6 +28,7 @@ from baseline.utils.losses import parity_loss
 from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
+from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args, GRUGate, compute_bp_steps, EMATracker, compute_act_q_loss
 from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 
 torchvision.disable_beta_transforms_warning()
@@ -87,6 +88,7 @@ def parse_args():
     add_jepa_args(parser)
     add_all_idea_args(parser)
     add_train_idea_args(parser)
+    add_hrm_idea_args(parser)
     args = parser.parse_args()
     return args
 
@@ -152,6 +154,36 @@ if __name__=='__main__':
         model.tick_halt_threshold = args.tick_halt_threshold
         model.tick_min_ticks = args.tick_min_ticks
 
+        # --- HRM-inspired attributes ---
+        model.bp_steps = args.bp_steps
+        model.detach_every = args.detach_every
+        model.input_injection = args.input_injection
+        model.gated_attention = args.gated_attention
+
+        # --- ACT Q-learning halting ---
+        if args.act_halt:
+            model.act_halt = True
+            model.q_head = torch.nn.Linear(model.synch_representation_size_out, 2).to(device)
+            torch.nn.init.zeros_(model.q_head.weight)
+            model.q_head.bias.data.fill_(-5.0)
+        if args.gated_attention:
+            import torch.nn as nn
+            model.attn_gate = nn.Linear(args.d_input, args.d_input).to(device)
+        if args.input_injection == 'gru_gate':
+            model.gru_gate_module = GRUGate(args.d_model, args.d_input).to(device)
+
+        # --- Hierarchical recurrence (HRM core) ---
+        if args.h_cycles > 1:
+            model.h_cycles = args.h_cycles
+            model.l_cycles = args.l_cycles if args.l_cycles > 0 else (args.iterations // args.h_cycles)
+            import torch.nn as nn
+            model.h_synapse = nn.Sequential(
+                nn.LayerNorm(args.d_model),
+                nn.Linear(args.d_model, args.d_model * 2),
+                nn.GLU(),
+                nn.LayerNorm(args.d_model),
+            ).to(device)
+
         if args.reflex_head:
             from baseline.utils.ctm_model_ideas import ReflexHead
             model.reflex_head = ReflexHead(
@@ -174,10 +206,13 @@ if __name__=='__main__':
     print(f'Total params: {sum(p.numel() for p in model.parameters())}')
     
     # Optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), 
-                                  lr=args.lr, 
-                                  eps=1e-8, 
-                                  weight_decay=args.weight_decay)
+    if getattr(args, 'optimizer_type', 'adam') == 'adam_atan2':
+        optimizer = build_optimizer_from_args(model.parameters(), args)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), 
+                                      lr=args.lr, 
+                                      eps=1e-8, 
+                                      weight_decay=args.weight_decay)
     if args.gradient_clipping!=-1:  # Not using, but handy to have
         optimizer = QuantileClip.as_optimizer(optimizer=optimizer, quantile=args.gradient_clipping, history_length=1000)
     
@@ -242,11 +277,22 @@ if __name__=='__main__':
             torch.cuda.empty_cache()
     
     
+    # --- EMA weight tracker (HRM-Text style) ---
+    ema_tracker = None
+    if args.ema_decay > 0:
+        ema_tracker = EMATracker(model, decay=args.ema_decay)
+
     # Training
     iterator = iter(trainloader)  # Not training in epochs, but rather iterations. Need to reset this from time to time
     with tqdm(total=args.training_iterations, initial=start_iter, leave=False, position=0, dynamic_ncols=True) as pbar:
         for bi in range(start_iter, args.training_iterations):
             current_lr = optimizer.param_groups[-1]['lr']
+
+            # --- BP warmup: dynamically update bp_steps ---
+            if args.bp_warmup_ratio > 0 and args.model_type == 'ctm':
+                model.bp_steps = compute_bp_steps(bi, args.training_iterations,
+                                                   args.bp_warmup_ratio,
+                                                   args.bp_min_steps, args.bp_max_steps)
 
             try:
                 inputs, targets = next(iterator)
@@ -261,7 +307,8 @@ if __name__=='__main__':
                 ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
                                 args.tick_loss_mode != 'last' or args.reflex_head or args.model_type != 'ctm' or
                                 args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
-                                args.ema_distill_weight > 0 or args.draft_revise_weight > 0)
+                                args.ema_distill_weight > 0 or args.draft_revise_weight > 0 or
+                                args.act_halt)
                 if ideas_active and args.model_type == 'ctm':
                     out = model(inputs, return_per_tick_synch=(args.cross_tick_jepa_weight > 0))
                     if isinstance(out[-1], dict):
@@ -271,7 +318,7 @@ if __name__=='__main__':
                         predictions, certainties, synchronisation = out
                         extras = {}
                     loss = compute_multi_tick_loss(predictions, targets,
-                                                   lambda p, t: parity_loss(p.reshape(p.size(0), -1, 2, p.size(-1)), certainties, t)[0],
+                                                   lambda p, t: parity_loss(p.reshape(p.size(0), -1, 2, p.size(-1)), certainties, t, loss_type=args.loss_type)[0],
                                                    mode=args.tick_loss_mode,
                                                    certainties=certainties,
                                                    weights=args.tick_loss_weights)
@@ -290,6 +337,11 @@ if __name__=='__main__':
                         dp = extras['draft_prediction']
                         draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
                         loss = loss + args.draft_revise_weight * draft_loss
+                    # ACT Q-learning loss
+                    if args.act_halt and 'q_logits' in extras:
+                        pred_4d = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
+                        pred_correct = (pred_4d.argmax(dim=2) == targets.unsqueeze(-1)).all(dim=1).float()
+                        loss = loss + compute_act_q_loss(extras['q_logits'], pred_correct, weight=args.halt_q_weight)
                     # Compute where_most_certain for accuracy tracking
                     predictions = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
                     _, where_most_certain = parity_loss(predictions, certainties, targets, use_most_certain=args.use_most_certain)
@@ -300,13 +352,17 @@ if __name__=='__main__':
                     else:
                         predictions, certainties, synchronisation = out
                     predictions = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
-                    loss, where_most_certain = parity_loss(predictions, certainties, targets, use_most_certain=args.use_most_certain)
+                    loss, where_most_certain = parity_loss(predictions, certainties, targets, use_most_certain=args.use_most_certain, loss_type=args.loss_type)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+
+            # --- EMA weight update ---
+            if ema_tracker is not None:
+                ema_tracker.update(model)
 
             accuracy_finegrained = (predictions.argmax(2)[torch.arange(predictions.size(0), device=predictions.device),:,where_most_certain] == targets).float().mean().item()
             pbar.set_description(f'Dataset=Parity. Loss={loss.item():0.3f}. Accuracy={accuracy_finegrained:0.3f}. LR={current_lr:0.6f}. Where_certain={where_most_certain.float().mean().item():0.2f}+-{where_most_certain.float().std().item():0.2f} ({where_most_certain.min().item():d}<->{where_most_certain.max().item():d})')

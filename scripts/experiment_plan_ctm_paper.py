@@ -287,7 +287,21 @@ def build_st01_architecture_sweep(plan):
 
 
 def build_st02_tick_sweep(plan):
-    """Tick count sweep: 1, 2, 5, 10, 25, 50."""
+    """Tick count sweep: 1, 2, 5, 10, 25, 50.
+
+    BUG (2026-06-17): this couples memory_length = max(2, t//2) with the tick
+    count, so the sweep has TWO independent variables changing at once and
+    the acc-vs-ticks curve cannot be attributed to thinking time alone.
+    Most visible on sort: tick1-25 collapse to ~0.3% because memory_length
+    drops to 2-12 (sort needs >=25), while tick50 happens to match the
+    default (memory_length=25) and works fine. cifar10/mazes/parity trends
+    look plausible but absolute numbers are still confounded.
+
+    FIX: see scripts/fix_bug_st02_memory_length.py — re-runs the same sweep
+    as stage 'st02b' with memory_length held at each task's base default.
+    Original st02 results are kept for side-by-side comparison; do NOT use
+    them alone when drawing conclusions about n_ticks.
+    """
     tick_values = [1, 2, 5, 10, 25, 50]
     for task_name, (module, base, _) in TASKS.items():
         if task_name == "qamnist":
@@ -295,6 +309,8 @@ def build_st02_tick_sweep(plan):
         for t in tick_values:
             cfg = dict(with_seed(base, 0))
             cfg["iterations"] = t
+            # NOTE: BUG — memory_length should stay at base default; coupling
+            # it to t confounds the sweep. See fix_bug_st02_memory_length.py.
             cfg["memory_length"] = max(2, t // 2)
             plan.append(exp(
                 f"st02_{task_name}_tick{t}",

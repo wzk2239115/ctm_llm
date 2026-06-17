@@ -2,30 +2,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from baseline.utils.hrm_ideas import stablemax_cross_entropy, _log_stablemax
 
-def compute_ctc_loss(predictions, targets, blank_label=0):
+
+def _ce_loss(predictions, targets_expanded, loss_type='softmax_ce'):
+    """Cross-entropy loss with optional stablemax. Returns per-element loss (reduction='none')."""
+    if loss_type == 'stablemax_ce':
+        B, C, T = predictions.shape
+        losses = stablemax_cross_entropy(
+            predictions.permute(0, 2, 1).reshape(-1, C),  # (B*T, C)
+            targets_expanded.reshape(-1)  # (B*T,)
+        ).reshape(B, T)
+    else:
+        losses = F.cross_entropy(predictions, targets_expanded, reduction='none')
+    return losses
+
+
+def compute_ctc_loss(predictions, targets, blank_label=0, loss_type='softmax_ce'):
     """
     Computes the Connectionist Temporal Classification (CTC) loss.
-
-    Args:
-        predictions: A tensor of shape [B, C, L] representing the logits of the 
-                     predicted sequences.  B is the batch size, C is the number
-                     of classes (including the blank label), and L is the sequence
-                     length of the predictions.
-        targets: A tensor of shape [B, T] representing the target sequences.
-                 B is the batch size and T is the target sequence length.
-                 Note that T can vary within the batch.
-        blank_label: The index of the blank label.  Defaults to 0.
-
-    Returns:
-        The CTC loss (a scalar tensor).
     """
-
     batch_size, num_classes, prediction_length = predictions.shape
     _, target_length = targets.shape
 
-    # 1. Log softmax on predictions:  Crucially, CTC loss requires log probabilities.
-    log_probs = F.log_softmax(predictions, dim=1)  # Shape: [B, C, L]
+    if loss_type == 'stablemax_ce':
+        log_probs = _log_stablemax(predictions, dim=1)
+    else:
+        log_probs = F.log_softmax(predictions, dim=1)
 
     # 2.  Prepare inputs for torch.nn.CTCLoss:
     #    a.  Convert log_probs to shape (L, B, C):  CTCLoss expects time first.
@@ -48,14 +51,14 @@ def compute_ctc_loss(predictions, targets, blank_label=0):
 
     return loss
 
-def sort_loss(predictions, targets):
+def sort_loss(predictions, targets, loss_type='softmax_ce'):
     """
     The sort task was used partly to show that ctc loss can work.
     """
-    loss = compute_ctc_loss(predictions, targets, blank_label=predictions.shape[1]-1)
+    loss = compute_ctc_loss(predictions, targets, blank_label=predictions.shape[1]-1, loss_type=loss_type)
     return loss
 
-def image_classification_loss(predictions, certainties, targets, use_most_certain=True):
+def image_classification_loss(predictions, certainties, targets, use_most_certain=True, loss_type='softmax_ce'):
     """
     Computes the maze loss with auto-extending cirriculum.
 
@@ -68,7 +71,7 @@ def image_classification_loss(predictions, certainties, targets, use_most_certai
     """
     targets_expanded = torch.repeat_interleave(targets.unsqueeze(-1), predictions.size(-1), -1)
     # Losses are of shape [B, internal_ticks]
-    losses = nn.CrossEntropyLoss(reduction='none')(predictions, targets_expanded)
+    losses = _ce_loss(predictions, targets_expanded, loss_type)
         
     loss_index_1 = losses.argmin(dim=1)
     loss_index_2 = certainties[:,1].argmax(-1)
@@ -82,7 +85,7 @@ def image_classification_loss(predictions, certainties, targets, use_most_certai
     loss = (loss_minimum_ce + loss_selected)/2
     return loss, loss_index_2
 
-def maze_loss(predictions, certainties, targets, cirriculum_lookahead=5, use_most_certain=True):
+def maze_loss(predictions, certainties, targets, cirriculum_lookahead=5, use_most_certain=True, loss_type='softmax_ce'):
     """
     Computes the maze loss with auto-extending cirriculum.
 
@@ -105,7 +108,7 @@ def maze_loss(predictions, certainties, targets, cirriculum_lookahead=5, use_mos
                                                predictions.size(-1), -1).flatten(0,1).long()
     
     # Losses are of shape [B, route_length, internal_ticks]
-    losses = nn.CrossEntropyLoss(reduction='none')(predictions_reshaped, targets_reshaped)
+    losses = _ce_loss(predictions_reshaped, targets_reshaped, loss_type)
     losses = losses.reshape(predictions[:,:,0].shape)
     
     # Below is the code for auto-cirriculum
@@ -136,7 +139,7 @@ def maze_loss(predictions, certainties, targets, cirriculum_lookahead=5, use_mos
     loss = ((loss_minimum_ce + loss_selected)/2).mean()
     return loss, loss_index_2, upto_where.detach().cpu().numpy()
 
-def parity_loss(predictions, certainties, targets, use_most_certain=True):
+def parity_loss(predictions, certainties, targets, use_most_certain=True, loss_type='softmax_ce'):
     """
     Computes the parity loss.
 
@@ -151,9 +154,10 @@ def parity_loss(predictions, certainties, targets, use_most_certain=True):
     """
 
     # Losses are of shape [B, parity_sequence_length, internal_ticks]
-    losses = nn.CrossEntropyLoss(reduction='none')(predictions.flatten(0,1), 
-                                                   torch.repeat_interleave(targets.unsqueeze(-1), 
-                                                                           predictions.size(-1), -1).flatten(0,1).long()).reshape(predictions[:,:,0].shape)
+    losses = _ce_loss(predictions.flatten(0,1),
+                      torch.repeat_interleave(targets.unsqueeze(-1),
+                                              predictions.size(-1), -1).flatten(0,1).long(),
+                      loss_type).reshape(predictions[:,:,0].shape)
 
     # Average the loss over the parity sequenece dimension
     losses = losses.mean(1)
@@ -171,7 +175,7 @@ def parity_loss(predictions, certainties, targets, use_most_certain=True):
     return loss, loss_index_2
 
 
-def qamnist_loss(predictions, certainties, targets, use_most_certain=True):
+def qamnist_loss(predictions, certainties, targets, use_most_certain=True, loss_type='softmax_ce'):
     """
     Computes the qamnist loss over the last num_answer_steps steps.
 
@@ -184,8 +188,9 @@ def qamnist_loss(predictions, certainties, targets, use_most_certain=True):
     use_most_certain will select either the most certain point or the final point. 
     """
 
-    losses = nn.CrossEntropyLoss(reduction='none')(predictions, 
-                                                   torch.repeat_interleave(targets.unsqueeze(-1), predictions.size(-1), -1))
+    losses = _ce_loss(predictions,
+                      torch.repeat_interleave(targets.unsqueeze(-1), predictions.size(-1), -1),
+                      loss_type)
         
     loss_index_1 = losses.argmin(dim=1)
     loss_index_2 = certainties[:,1].argmax(-1)

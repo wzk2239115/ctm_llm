@@ -10,6 +10,7 @@ import torch
 if torch.cuda.is_available():
     # For faster
     torch.set_float32_matmul_precision('high')
+import torch.nn as nn
 from tqdm.auto import tqdm
 
 from baseline.data.custom_datasets import MazeImageFolder
@@ -23,6 +24,7 @@ from baseline.utils.losses import maze_loss
 from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
+from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args, GRUGate, compute_bp_steps, EMATracker
 from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 
 import torchvision
@@ -132,6 +134,7 @@ def parse_args():
     add_jepa_args(parser)
     add_all_idea_args(parser)
     add_train_idea_args(parser)
+    add_hrm_idea_args(parser)
     args = parser.parse_args()
     return args
 
@@ -211,6 +214,28 @@ if __name__=='__main__':
         model.tick_halt_mode = args.tick_halt_mode
         model.tick_halt_threshold = args.tick_halt_threshold
         model.tick_min_ticks = args.tick_min_ticks
+
+        # --- HRM-inspired attributes ---
+        model.bp_steps = args.bp_steps
+        model.detach_every = args.detach_every
+        model.input_injection = args.input_injection
+        model.gated_attention = args.gated_attention
+        if args.gated_attention:
+            import torch.nn as nn
+            model.attn_gate = nn.Linear(args.d_input, args.d_input).to(device)
+        if args.input_injection == 'gru_gate':
+            model.gru_gate_module = GRUGate(args.d_model, args.d_input).to(device)
+
+        # --- Hierarchical recurrence (HRM core) ---
+        if args.h_cycles > 1:
+            model.h_cycles = args.h_cycles
+            model.l_cycles = args.l_cycles if args.l_cycles > 0 else (args.iterations // args.h_cycles)
+            model.h_synapse = nn.Sequential(
+                nn.LayerNorm(args.d_model),
+                nn.Linear(args.d_model, args.d_model * 2),
+                nn.GLU(),
+                nn.LayerNorm(args.d_model),
+            ).to(device)
         if args.reflex_head:
             model.reflex_head = ReflexHead(
                 synch_size=model.synch_representation_size_out,
@@ -285,7 +310,9 @@ if __name__=='__main__':
         print(f'WARNING, excluding: {no_decay_names}')
 
     # Optimizer and scheduler (Common setup)
-    if len(no_decay_names) and args.weight_decay!=0:
+    if getattr(args, 'optimizer_type', 'adam') == 'adam_atan2':
+        optimizer = build_optimizer_from_args(model.parameters(), args)
+    elif len(no_decay_names) and args.weight_decay!=0:
         optimizer = torch.optim.AdamW([{'params': decay_params, 'weight_decay':args.weight_decay},
                                        {'params': no_decay_params, 'weight_decay':0}],
                                   lr=args.lr,
@@ -372,11 +399,22 @@ if __name__=='__main__':
         if args.model == 'ctm':
             model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
 
+    # --- EMA weight tracker (HRM-Text style) ---
+    ema_tracker = None
+    if args.ema_decay > 0:
+        ema_tracker = EMATracker(model, decay=args.ema_decay)
+
     # Training
     iterator = iter(trainloader)
     with tqdm(total=args.training_iterations, initial=start_iter, leave=False, position=0, dynamic_ncols=True) as pbar:
         for bi in range(start_iter, args.training_iterations):
             current_lr = optimizer.param_groups[-1]['lr']
+
+            # --- BP warmup: dynamically update bp_steps ---
+            if args.bp_warmup_ratio > 0:
+                model.bp_steps = compute_bp_steps(bi, args.training_iterations,
+                                                   args.bp_warmup_ratio,
+                                                   args.bp_min_steps, args.bp_max_steps)
 
             try:
                 inputs, targets = next(iterator)
@@ -500,6 +538,10 @@ if __name__=='__main__':
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+
+            # --- EMA weight update ---
+            if ema_tracker is not None:
+                ema_tracker.update(model)
 
             # Conditional Tqdm Description
             pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}. LR={current_lr:0.6f}.'
