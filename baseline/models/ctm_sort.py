@@ -86,6 +86,8 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         use_hierarchical = h_cycles > 1 and h_synapse is not None
         q_head = getattr(self, 'q_head', None)
         act_halt = getattr(self, 'act_halt', False)
+        halt_max_steps = getattr(self, 'halt_max_steps', self.iterations)
+        halt_exploration_prob = getattr(self, 'halt_exploration_prob', 0.0)
 
         # --- Tracking Initialization ---
         pre_activations_tracking = []
@@ -109,6 +111,8 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         draft_pred = None
         draft_mode = getattr(self, 'draft_mode', 'none')
         q_logits_all = [] if (act_halt and q_head is not None) else None
+        halted_mask = torch.zeros(B, dtype=torch.bool, device=device) if act_halt else None
+        halt_step = torch.full((B,), self.iterations, dtype=torch.long, device=device) if act_halt else None
 
         r_out = torch.exp(-torch.clamp(self.decay_params_out, 0, 15)).unsqueeze(0).repeat(B, 1)
         _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
@@ -167,7 +171,25 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
 
                 # --- ACT Q-learning: compute Q-head logits ---
                 if q_logits_all is not None:
-                    q_logits_all.append(q_head(synchronisation_out))
+                    q_logits_t = q_head(synchronisation_out)  # (B, 2)
+                    q_logits_all.append(q_logits_t)
+
+                    # --- Q-learning halting decision (training only) ---
+                    if self.training and halt_max_steps > 1:
+                        q_halt_logit = q_logits_t[:, 0]
+                        q_continue_logit = q_logits_t[:, 1]
+                        halt_decision = q_halt_logit > q_continue_logit
+
+                        if halt_exploration_prob > 0:
+                            min_halt = torch.randint(2, halt_max_steps + 1, (B,), device=device)
+                            explore = (torch.rand(B, device=device) < halt_exploration_prob) & (stepi >= min_halt)
+                            halt_decision = halt_decision | explore
+
+                        halt_decision = halt_decision | (stepi >= halt_max_steps - 1)
+
+                        newly_halted = halt_decision & (~halted_mask)
+                        halted_mask = halted_mask | newly_halted
+                        halt_step[newly_halted] = stepi
 
                 # Draft-revise: save draft at block boundary, corrupt state
                 if draft_mode == 'revise':
@@ -186,7 +208,14 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
                     rp = self.reflex_head(synchronisation_out)
                     reflex_preds.append(rp)
 
-                if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
+                # --- Tick Halt ---
+                if act_halt and halted_mask is not None:
+                    if self.training and halted_mask.all():
+                        n_steps_used = stepi + 1
+                        if stepi + 1 < self.iterations:
+                            predictions[..., stepi+1:] = 0
+                        break
+                elif should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
                     n_steps_used = stepi + 1
                     if stepi + 1 < self.iterations:
                         predictions[..., stepi+1:] = 0
@@ -206,6 +235,9 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
             extras['draft_prediction'] = draft_pred
         if q_logits_all is not None:
             extras['q_logits'] = torch.stack(q_logits_all, dim=-1)
+        if halt_step is not None:
+            extras['halt_step'] = halt_step
+            extras['halted_mask'] = halted_mask
         if n_steps_used < self.iterations:
             extras['n_steps_used'] = n_steps_used
 

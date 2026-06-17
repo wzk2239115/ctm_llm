@@ -619,6 +619,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         z_H = torch.zeros_like(activated_state) if use_hierarchical else None
         eff_l_cycles = l_cycles if l_cycles > 0 else max(1, self.iterations // max(1, h_cycles))
 
+        # --- ACT Q-learning halting state ---
+        halt_max_steps = getattr(self, 'halt_max_steps', self.iterations)
+        halt_exploration_prob = getattr(self, 'halt_exploration_prob', 0.0)
+        halted_mask = torch.zeros(B, dtype=torch.bool, device=device) if act_halt else None
+        halt_step = torch.full((B,), self.iterations, dtype=torch.long, device=device) if act_halt else None
+
         # --- Recurrent Loop  ---
         for stepi in range(self.iterations):
 
@@ -701,7 +707,28 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
                 # --- ACT Q-learning: compute Q-head logits ---
                 if q_logits_all is not None:
-                    q_logits_all.append(q_head(synchronisation_out))
+                    q_logits_t = q_head(synchronisation_out)  # (B, 2)
+                    q_logits_all.append(q_logits_t)
+
+                    # --- Q-learning halting decision (training only) ---
+                    if self.training and halt_max_steps > 1:
+                        q_halt_logit = q_logits_t[:, 0]
+                        q_continue_logit = q_logits_t[:, 1]
+                        halt_decision = q_halt_logit > q_continue_logit
+
+                        # Exploration: randomly allow early halting
+                        if halt_exploration_prob > 0:
+                            min_halt = torch.randint(2, halt_max_steps + 1, (B,), device=device)
+                            explore = (torch.rand(B, device=device) < halt_exploration_prob) & (stepi >= min_halt)
+                            halt_decision = halt_decision | explore
+
+                        # Force halt at max steps
+                        halt_decision = halt_decision | (stepi >= halt_max_steps - 1)
+
+                        # Update masks (only for samples not yet halted)
+                        newly_halted = halt_decision & (~halted_mask)
+                        halted_mask = halted_mask | newly_halted
+                        halt_step[newly_halted] = stepi
 
                 # 8b. Draft-revise: save draft at block boundary, corrupt state
                 if draft_mode == 'revise':
@@ -723,7 +750,15 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                     synch_per_tick.append(synchronisation_out)
 
                 # --- Tick Halt: early exit ---
-                if should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
+                if act_halt and halted_mask is not None:
+                    # Q-learning halting: break when ALL samples have halted
+                    if self.training and halted_mask.all():
+                        n_steps_used = stepi + 1
+                        if stepi + 1 < self.iterations:
+                            predictions[..., stepi+1:] = 0
+                        break
+                elif should_halt(certainties, stepi, min_ticks, halt_threshold, halt_mode):
+                    # Certainty-based halting (existing)
                     n_steps_used = stepi + 1
                     if stepi + 1 < self.iterations:
                         predictions[..., stepi+1:] = 0
@@ -755,6 +790,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             extras['draft_prediction'] = draft_pred
         if q_logits_all is not None:
             extras['q_logits'] = torch.stack(q_logits_all, dim=-1)  # (B, 2, T)
+        if halt_step is not None:
+            extras['halt_step'] = halt_step
+            extras['halted_mask'] = halted_mask
 
         if track:
             base = (predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)),
