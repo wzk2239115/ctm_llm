@@ -54,22 +54,40 @@ def find_ckpt(exp_dir: Path):
     return None
 
 
+def _to_scalar(x):
+    """Coerce x (int/float/tensor/0-d or 1-d array/length-1 list) to float, else None."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    try:
+        return float(x)  # tensor scalar, numpy 0-d, length-1 array
+    except (TypeError, ValueError):
+        pass
+    try:
+        if hasattr(x, "__len__") and len(x) == 1:
+            return float(x[0])
+    except (TypeError, ValueError):
+        pass
+    try:
+        import numpy as np
+        return float(np.asarray(x).mean())
+    except Exception:
+        return None
+
+
 def _last(xs):
     if not xs:
         return None
-    try:
-        return float(xs[-1])
-    except (TypeError, ValueError):
-        return None
+    return _to_scalar(xs[-1])
 
 
 def _best(xs):
     if not xs:
         return None
-    try:
-        return float(max(xs))
-    except (TypeError, ValueError):
-        return None
+    scalars = [_to_scalar(x) for x in xs]
+    scalars = [s for s in scalars if s is not None]
+    return max(scalars) if scalars else None
 
 
 def load_summary(ckpt_path: Path):
@@ -111,8 +129,8 @@ def load_summary(ckpt_path: Path):
         "args": args_d,
     }
     if len(test_acc) > 1:
-        out["test_acc_curve"] = [float(x) for x in test_acc]
-        out["iters_curve"] = [float(x) for x in iters] if len(iters) == len(test_acc) else []
+        out["test_acc_curve"] = [_to_scalar(x) for x in test_acc]
+        out["iters_curve"] = [_to_scalar(x) for x in iters] if len(iters) == len(test_acc) else []
     return out
 
 
