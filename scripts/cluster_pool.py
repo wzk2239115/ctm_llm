@@ -828,9 +828,22 @@ def run_worker(args):
                         reject = True
                         reject_msg = f"slot full gpu={gpu} used={used}/{gpu_slots_config}"
                         break
-            elif busy_gpus:
-                reject = True
-                reject_msg = f"busy gpus={busy_gpus}, requested=all"
+            else:
+                # Task didn't pin specific GPUs — auto-assign ONE free GPU
+                # so multiple tasks run in parallel across the node's GPUs.
+                # (Previously this treated None as "needs ALL GPUs" and only
+                # allowed 1 task per node — a major parallelism bottleneck.)
+                assigned = None
+                for gpu in range(len(gpus)):
+                    used = gpu_slots_used.get(str(gpu), 0)
+                    if used < gpu_slots_config:
+                        assigned = [gpu]
+                        break
+                if assigned is None:
+                    reject = True
+                    reject_msg = f"all {len(gpus)} gpus full ({gpu_slots_config} slots each)"
+                else:
+                    requested_gpus = assigned
             if not reject:
                 task_gb = estimate_task_gb(task.get("extra_args", ""))
                 total_gpu_gb = gpus[0]["memory_mb"] / 1024 if gpus else 80.0
