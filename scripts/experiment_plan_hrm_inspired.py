@@ -19,13 +19,14 @@ Usage:
 """
 
 import json, os, re, shlex, subprocess, sys, time, urllib.request
+import _pool_config
+MASTER_ADDR = _pool_config.MASTER_ADDR
+PORT = _pool_config.PORT
+BASELINE_NODES = _pool_config.BASELINE_NODES
+POOL_CONFIG = _pool_config.POOL_CONFIG
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-POOL_CONFIG = "infra/envs/h100_baseline.env"
-MASTER_ADDR = "11.131.210.78"
-PORT = 8765
-BASELINE_NODES = ("11.131.209.154", "11.131.210.3", "11.131.210.78", "11.131.211.9")
 GPUS_PER_NODE = 8
 _slot_idx = [0]
 
@@ -44,6 +45,8 @@ ALL_STAGES = STAGES_ORDERED + ["all"]
 def _next_slot():
     i = _slot_idx[0]
     _slot_idx[0] += 1
+    if not BASELINE_NODES:
+        return None
     node = BASELINE_NODES[i // GPUS_PER_NODE % len(BASELINE_NODES)]
     gpu = i % GPUS_PER_NODE
     return f"{node}:{gpu}"
@@ -794,11 +797,10 @@ def print_plan(plan):
 # ─── Pool submission (same infrastructure as paper plan) ───
 
 def submit_to_pool(exp_entry, config, master_addr=None, port=None):
-    node_addrs = [exp_entry.get("node_addr")]
     payload = {
         "config": config,
         "extra_args": exp_entry["command"],
-        "node_addrs": node_addrs,
+        "node_addrs": [],
         "env": {
             "CTM_EXPERIMENT_NAME": exp_entry["name"],
             "CTM_METRICS_DIR": "runs/metrics",

@@ -1146,9 +1146,9 @@ def prepare_probe_run_args(args):
         if getattr(args, "fallback_batch_size", None) is None:
             args.fallback_batch_size = min(batch_sizes)
     if args.cmd in ("probe-and-run", "quick-probe") and args.master_addr is None:
-        args.master_addr = "11.131.210.78"
+        args.master_addr = __import__("_pool_config").MASTER_ADDR
     if args.cmd in ("probe-and-run", "quick-probe") and args.port is None:
-        args.port = 8765
+        args.port = __import__("_pool_config").PORT
 
 
 def print_execution_plan(args, base_plan, *, mode, probe_targets=None, profile=None, profile_meta=None):
@@ -2856,9 +2856,9 @@ def parse_args():
             args.batch_profile = metrics_path("batch_profile.csv")
     if args.cmd in ("run", "run-parallel", "quick-probe", "probe-and-run", "run-only"):
         if args.master_addr is None:
-            args.master_addr = "11.131.210.78"
+            args.master_addr = __import__("_pool_config").MASTER_ADDR
         if args.port is None:
-            args.port = 8765
+            args.port = __import__("_pool_config").PORT
     if args.cmd == "final-plan" and getattr(args, "batch_profile", None) is None:
         args.batch_profile = metrics_path("batch_profile.csv")
     return args

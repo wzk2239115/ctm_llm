@@ -1448,7 +1448,7 @@ def main():
     p = sub.add_parser("worker")
     p.add_argument("--config", default=None,
                    help="Cluster env file (optional, for git proxy/NCCL settings)")
-    p.add_argument("--master_addr", default="11.131.210.78")
+    p.add_argument("--master_addr", default=__import__("_pool_config").MASTER_ADDR)
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--node_addr", default=None)
     p.add_argument("--interval", type=float, default=5.0)
@@ -1462,7 +1462,7 @@ def main():
     p = sub.add_parser("submit")
     p.add_argument("--config", default="",
                    help="Task config env file (optional, e.g. infra/envs/h100_baseline.env)")
-    p.add_argument("--master_addr", default="11.131.210.78")
+    p.add_argument("--master_addr", default=__import__("_pool_config").MASTER_ADDR)
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--wait", type=float, default=30.0)
     p.add_argument("--nodes", nargs="+", default=None,
@@ -1471,7 +1471,7 @@ def main():
     p.set_defaults(func=run_submit)
 
     p = sub.add_parser("status")
-    p.add_argument("--master_addr", default="11.131.210.78")
+    p.add_argument("--master_addr", default=__import__("_pool_config").MASTER_ADDR)
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=run_status)
 
@@ -1482,12 +1482,12 @@ def main():
                    help="Time window for history: e.g. 1h, 2h, 4h, 8h, 16h")
     p.add_argument("--metrics_dir", default="runs/metrics",
                    help="Metrics directory for reading accuracy/loss")
-    p.add_argument("--master_addr", default="11.131.210.78")
+    p.add_argument("--master_addr", default=__import__("_pool_config").MASTER_ADDR)
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=run_task)
 
     p = sub.add_parser("kanban")
-    p.add_argument("--master_addr", default="11.131.210.78")
+    p.add_argument("--master_addr", default=__import__("_pool_config").MASTER_ADDR)
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--metrics_dir", default="runs/metrics")
     p.add_argument("--refresh", type=float, default=5.0, help="Refresh interval in seconds")
