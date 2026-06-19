@@ -856,7 +856,9 @@ def cmd_submit(args):
         print("No experiments to submit.")
         return
 
-    print(f"Submitting {len(to_submit)} experiments to pool at {MASTER_ADDR}:{PORT}")
+    master = args.master_addr
+    port = args.port
+    print(f"Submitting {len(to_submit)} experiments to pool at {master}:{port}")
     for e in to_submit:
         status = "ready" if e.get("impl_status") == "ready" else "NEEDS_IMPL"
         print(f"  [{status}] {e['name']}")
@@ -866,14 +868,14 @@ def cmd_submit(args):
 
     for e in to_submit:
         print(f"Submitting {e['name']}...")
-        result = submit_to_pool(e, POOL_CONFIG, MASTER_ADDR, PORT)
+        result = submit_to_pool(e, POOL_CONFIG, master, port)
         if result is None:
             print(f"  FAILED to submit {e['name']}")
             continue
         task_id = result if isinstance(result, str) else result.get("task_id", "")
         print(f"  task_id={task_id}")
         if args.wait:
-            final_status = wait_until_idle(MASTER_ADDR, PORT, task_id)
+            final_status = wait_until_idle(master, port, task_id)
             print(f"  -> {final_status}")
             if final_status == "failed" and args.stop_on_fail:
                 print("Stopping due to failure.")
