@@ -13,6 +13,12 @@ trainer/swanlog/
 # External data (symlink to minimind-o/dataset, ~17GB parquet)
 dataset_data
 
+# Downloaded multimodal datasets (~17GB, not version-controlled)
+dataset/MCAP-Housing/
+dataset/MSR-VTT/
+dataset/TartanRGBT/
+dataset/flickr30k/
+
 # Reference tokenizer (symlink to minimind-o/model)
 model_tokenizer
 

@@ -358,6 +358,166 @@ def fig_convergence(df_complete, curves, out_dir, min_iter):
     print(f"[fig4] -> {path}")
 
 
+# ---------------------- Figure 7: compute cost vs n_ticks ----------------------
+
+# default training_iterations budget per task (from experiment_plan_ctm_paper.py)
+PLANNED_ITERS = {
+    "cifar10": 200001,
+    "mazes": 100001,
+    "parity": 200001,
+    "qamnist": 200001,
+    "sort": 100001,
+}
+
+
+def fig_compute_cost(df_complete, out_dir, min_iter):
+    """Compute-cost dependency for st02 tick sweep (cifar10 + mazes).
+
+    Three side-by-side panels explain why convergence curves in fig4 have
+    uneven lengths:
+      1. iterations actually completed vs n_ticks  (shows truncation)
+      2. total compute proxy = final_iter * n_ticks vs n_ticks  (fairness check)
+      3. best test acc vs total compute  (does compute explain acc gaps?)
+
+    Compute proxy assumes cost scales linearly with n_ticks (each tick adds one
+    full recurrent step in the CTM). No wall-clock data is available, so this is
+    an approximate but useful proxy.
+    """
+    sub = df_complete[df_complete["stage"] == "st02"].copy()
+    sub["tick"] = sub["sweep"].apply(parse_tick)
+    sub = sub.dropna(subset=["tick"])
+    sub = sub[sub["task"].isin(["cifar10", "mazes"])]
+    if sub.empty:
+        print("[fig7] no st02 tick data for cifar10/mazes")
+        return
+
+    # aggregate over seeds per (task, tick)
+    agg = (
+        sub.groupby(["task", "tick"])
+        .agg(
+            iter_mean=("final_iter", "mean"),
+            iter_std=("final_iter", "std"),
+            acc_mean=("best_test_acc", "mean"),
+            acc_std=("best_test_acc", "std"),
+            n_seeds=("exp", "size"),
+        )
+        .reset_index()
+    )
+    # fill std=0 when only 1 seed
+    agg["iter_std"] = agg["iter_std"].fillna(0)
+    agg["acc_std"] = agg["acc_std"].fillna(0)
+    # total compute proxy = iterations * ticks
+    agg["compute_mean"] = agg["iter_mean"] * agg["tick"]
+    # planned total compute = training_iterations * n_ticks
+    agg["compute_planned"] = agg["task"].map(PLANNED_ITERS) * agg["tick"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.5))
+
+    # --- Panel 1: iters completed vs n_ticks ---
+    ax = axes[0]
+    width = 0.35
+    tasks_here = [t for t in ["cifar10", "mazes"] if t in agg["task"].unique()]
+    for i, task in enumerate(tasks_here):
+        a = agg[agg["task"] == task].sort_values("tick")
+        x = a["tick"].values
+        # offset bars side by side (log-scale x -> use index positioning)
+        xpos = np.arange(len(x)) + (i - 0.5 * (len(tasks_here) - 1)) * width
+        ax.bar(
+            xpos, a["iter_mean"].values / 1000, width=width,
+            yerr=a["iter_std"].values / 1000, capsize=3,
+            color=TASK_COLORS[task], alpha=0.8, label=task,
+            edgecolor="black", linewidth=0.5,
+        )
+        # planned-iter line (per task, dashed horizontal markers per tick)
+        planned_k = PLANNED_ITERS[task] / 1000
+        ax.axhline(planned_k, color=TASK_COLORS[task], linestyle="--",
+                   alpha=0.4, linewidth=1)
+        # annotate n_seeds
+        for xi, yi, n in zip(xpos, a["iter_mean"].values / 1000, a["n_seeds"].values):
+            ax.annotate(f"n={int(n)}", (xi, yi), textcoords="offset points",
+                        xytext=(0, 6), ha="center", fontsize=7,
+                        color="red" if n < 2 else "black")
+    # x ticks: union of ticks across tasks, log scale
+    all_ticks = sorted(agg["tick"].unique())
+    ax.set_xticks(np.arange(len(all_ticks)))
+    ax.set_xticklabels([str(int(t)) for t in all_ticks])
+    ax.set_xlabel("n_ticks (log scale)")
+    ax.set_ylabel("iterations completed (k)")
+    ax.set_title("(a) Iterations completed vs n_ticks\n"
+                 "(dashed = planned budget; bars below = truncated)",
+                 fontsize=10)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right")
+
+    # --- Panel 2: total compute proxy vs n_ticks ---
+    ax = axes[1]
+    for i, task in enumerate(tasks_here):
+        a = agg[agg["task"] == task].sort_values("tick")
+        x = a["tick"].values
+        xpos = np.arange(len(x)) + (i - 0.5 * (len(tasks_here) - 1)) * width
+        # planned (faint outline)
+        ax.bar(xpos, a["compute_planned"].values / 1e6, width=width,
+               color=TASK_COLORS[task], alpha=0.18, edgecolor=TASK_COLORS[task],
+               linewidth=1.2, hatch="//")
+        # actual (solid)
+        ax.bar(xpos, a["compute_mean"].values / 1e6, width=width,
+               color=TASK_COLORS[task], alpha=0.85,
+               edgecolor="black", linewidth=0.5,
+               label=f"{task} (actual)")
+    # legend with hatch
+    from matplotlib.patches import Patch
+    hatch_handles = [
+        Patch(facecolor="gray", alpha=0.18, hatch="//", edgecolor="gray",
+              label="planned budget"),
+    ]
+    handles, labels = ax.get_legend_handles_labels()
+    ax.legend(handles=handles + hatch_handles, fontsize=8, loc="upper left")
+    ax.set_xticks(np.arange(len(all_ticks)))
+    ax.set_xticklabels([str(int(t)) for t in all_ticks])
+    ax.set_xlabel("n_ticks (log scale)")
+    ax.set_ylabel("total compute proxy  (iter × n_ticks, units of 1M)")
+    ax.set_title("(b) Total compute actually used vs n_ticks\n"
+                 "(hatched = planned; solid = actual)",
+                 fontsize=10)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    # --- Panel 3: best acc vs total compute ---
+    ax = axes[2]
+    for task in tasks_here:
+        a = agg[agg["task"] == task].sort_values("compute_mean")
+        ax.errorbar(a["compute_mean"].values / 1e6, a["acc_mean"].values * 100,
+                    yerr=a["acc_std"].values * 100, marker="o", capsize=4,
+                    linewidth=2, markersize=8, color=TASK_COLORS[task],
+                    label=task, alpha=0.85)
+        # annotate tick value next to each point
+        for x, y, t in zip(a["compute_mean"].values / 1e6,
+                            a["acc_mean"].values * 100, a["tick"].values):
+            ax.annotate(f"t={int(t)}", (x, y), textcoords="offset points",
+                        xytext=(6, 4), fontsize=7, color=TASK_COLORS[task])
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color=TASK_COLORS[task],
+                       linestyle=":", alpha=0.5, linewidth=1)
+    ax.set_xscale("log")
+    ax.set_xlabel("total compute proxy  (iter × n_ticks, log scale)")
+    ax.set_ylabel("best test acc (%)")
+    ax.set_title("(c) Acc vs total compute used\n"
+                 "(dotted = st00 paper baseline; same compute ≠ same acc)",
+                 fontsize=10)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=8, loc="lower right")
+
+    fig.suptitle(
+        "Compute-cost dependency in the st02 tick sweep "
+        "(explains uneven curve lengths in fig4)",
+        fontsize=13, fontweight="bold",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    path = out_dir / "fig7_compute_cost.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig7] -> {path}")
+
+
 # -------------------------- Figure 5: jepa weight sweep -----------------------
 
 def parse_jepa_weight(sweep):
@@ -514,6 +674,7 @@ def main():
     fig_capacity_sweep(df_complete, out_dir, cli.min_iter)
     fig_mc_vs_final(df_complete, out_dir)
     fig_convergence(df_complete, curves, out_dir, cli.min_iter)
+    fig_compute_cost(df_complete, out_dir, cli.min_iter)
     fig_jepa_weight(df_complete, out_dir)
     fig_jepa_variants(df_complete, out_dir)
 
