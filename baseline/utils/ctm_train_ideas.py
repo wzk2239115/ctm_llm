@@ -11,15 +11,46 @@ def compute_multi_tick_loss(
     certainties: torch.Tensor = None,
     weights: str = None,
 ) -> torch.Tensor:
+    """Aggregate per-tick task losses for anytime / multi-tick supervision.
+
+    Args:
+        predictions: (B, ..., T) — model predictions with T internal ticks.
+        targets: task-specific target tensor.
+        task_loss_fn: callable(predictions, targets) -> scalar loss. Receives
+            a SUB-SEQUNCE of predictions ending at tick t (i.e. predictions
+            [..., :t+1]), NOT a single-tick slice. This matters for tasks
+            whose loss depends on the full tick dimension (CTC for sort,
+            most-certain selection for parity/classification): slicing to 1
+            tick would make CTC inf (no valid alignment) or crash parity's
+            certainty indexing.
+            For mode='last' the FULL predictions tensor is passed unchanged.
+        mode: 'last' (only final tick), 'mean' (average all ticks),
+            'min_conf' (weight ticks by inverse certainty), or 'weighted'.
+        certainties: (B, [2], T) certainty tensor for min_conf weighting.
+        weights: per-tick weight list for 'weighted' mode.
+
+    Returns:
+        scalar loss tensor. inf/nan per-tick losses (e.g. CTC when the
+        sub-sequence is shorter than the target) are skipped so they don't
+        poison the gradient.
+    """
     T = predictions.size(-1)
-    total_loss = 0.0
+    total_loss = predictions.new_zeros(())
+    n_valid = 0
 
     if mode == 'last':
         return task_loss_fn(predictions, targets)
 
     for t in range(T):
-        p = predictions[..., t:t+1]
+        # Pass the sub-sequence up to tick t (inclusive) so that CTC and
+        # most-certain selection have enough context. Using t:t+1 (single
+        # tick) causes inf for CTC and IndexError for parity's certainty
+        # argmax. See commit fcc9d49 for the mode='last' half of this fix.
+        p = predictions[..., :t + 1]
         loss_t = task_loss_fn(p, targets)
+        if torch.isinf(loss_t) or torch.isnan(loss_t):
+            continue  # skip ticks with no valid alignment (e.g. CTC early on)
+        n_valid += 1
         if mode == 'mean':
             total_loss = total_loss + loss_t / T
         elif mode == 'min_conf' and certainties is not None:
@@ -33,8 +64,13 @@ def compute_multi_tick_loss(
             w = weights[t]
             total_loss = total_loss + loss_t * w
 
-    if mode == 'min_conf' and certainties is not None:
-        total_loss = total_loss / T
+    if mode == 'min_conf' and n_valid > 0:
+        total_loss = total_loss / n_valid
+
+    # If every tick was inf/nan (e.g. very short CTC target at the start),
+    # fall back to the full-length loss so we always return a usable signal.
+    if n_valid == 0:
+        return task_loss_fn(predictions, targets)
 
     return total_loss
 

@@ -466,8 +466,8 @@ if __name__=='__main__':
                         loss, where_most_certain, upto_where = maze_loss(predictions, certainties, targets, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)
                         # Multi-tick: maze_loss already uses most_certain, but we can weight by compute_multi_tick_loss
                         if args.tick_loss_mode != 'last':
-                            loss = compute_multi_tick_loss(predictions.argmax(2), targets,
-                                                           lambda p, t: maze_loss(predictions, certainties, t, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)[0],
+                            loss = compute_multi_tick_loss(predictions, targets,
+                                                           lambda p, t: maze_loss(p, certainties[..., :p.size(-1)], t, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)[0],
                                                            mode=args.tick_loss_mode, certainties=certainties,
                                                            weights=args.tick_loss_weights)
                         if args.cross_tick_jepa_weight > 0 and hasattr(model, 'cross_tick_predictor') and 'synch_per_tick' in extras:

@@ -324,7 +324,7 @@ if __name__=='__main__':
                         predictions, certainties, synchronisation = out
                         extras = {}
                     loss = compute_multi_tick_loss(predictions, targets,
-                                                   lambda p, t: parity_loss(p.reshape(p.size(0), -1, 2, p.size(-1)), certainties, t, loss_type=args.loss_type)[0],
+                                                   lambda p, t: parity_loss(p.reshape(p.size(0), -1, 2, p.size(-1)), certainties[..., :p.size(-1)], t, loss_type=args.loss_type)[0],
                                                    mode=args.tick_loss_mode,
                                                    certainties=certainties,
                                                    weights=args.tick_loss_weights)

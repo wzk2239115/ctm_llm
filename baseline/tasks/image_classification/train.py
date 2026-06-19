@@ -530,7 +530,7 @@ if __name__=='__main__':
                     # Multi-tick loss
                     if args.tick_loss_mode != 'last' and args.model == 'ctm':
                         loss = compute_multi_tick_loss(predictions, targets,
-                                                       lambda p, t: image_classification_loss(p, certainties, t, loss_type=args.loss_type),
+                                                       lambda p, t: image_classification_loss(p, certainties[..., :p.size(-1)], t, loss_type=args.loss_type),
                                                        mode=args.tick_loss_mode,
                                                        certainties=certainties,
                                                        weights=args.tick_loss_weights)

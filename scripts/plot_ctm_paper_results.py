@@ -641,7 +641,261 @@ def fig_jepa_variants(df_complete, out_dir):
     print(f"[fig6] -> {path}")
 
 
-# ------------------------------ main -----------------------------------------
+# ------------------- New figures: ideas stages (fig8-12) ---------------------
+
+# Stage-specific marker: annotate figures whose underlying data was affected
+# by the log_dir overwrite bug (fixed 2026-06-19). The surviving numbers are
+# real runs but with one or more hyperparameter dimensions collapsed; readers
+# should treat per-axis trends as trustworthy and collapsed dimensions as
+# "one representative variant". See BUGFIX_STAGES in experiment_plan_ctm_paper.py.
+_BUGFIX_NOTE = {
+    "st06": "note: compute_weight dim collapsed (cw=0/0.001 overwrote)",
+    "st09": "note: reflex_weight dim collapsed (w=0.1/0.2 overwrote)",
+    "st10": "note: revise_w/corrupt_p dims collapsed (4 variants overwrote)",
+    "st12": "note: decays/distill_weight dims collapsed",
+    "st13": "note: threshold/compute_weight dims collapsed",
+    "st14": "note: sparsity frac dim collapsed",
+    "st15": "note: sparsity frac dim collapsed",
+}
+
+
+def fig_baselines(df_complete, out_dir):
+    """st00 baseline reproduction: bar chart of all paper / LSTM / FF baselines.
+
+    One bar per (task, baseline_type). Horizontal line per task shows the
+    'paper config' reference so subsequent figures can compare against it.
+    """
+    sub = df_complete[df_complete["stage"] == "st00"].copy()
+    if sub.empty:
+        print("[fig8] no st00 data")
+        return
+    # build per-row label
+    sub["label"] = sub.apply(
+        lambda r: f"{r['task']}\n({r['sweep']})", axis=1)
+    sub = sub.sort_values(["task", "sweep"])
+    labels = sub["label"].tolist()
+    means = sub["best_test_acc"].values * 100
+    # color by task
+    colors = [TASK_COLORS.get(t, "gray") for t in sub["task"]]
+    # hatch the non-paper baselines (lstm/ff) for visual distinction
+    hatches = ["" if s == "paper" else "//" for s in sub["sweep"]]
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    bars = ax.bar(range(len(labels)), means, color=colors, alpha=0.85,
+                  edgecolor="black", linewidth=0.6)
+    for b, h in zip(bars, hatches):
+        b.set_hatch(h)
+    for xi, yi, n in zip(range(len(labels)), means, sub["n_points"].fillna(1).values):
+        ax.annotate(f"{yi:.1f}%", (xi, yi), textcoords="offset points",
+                    xytext=(0, 5), ha="center", fontsize=8)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8.5)
+    ax.set_ylabel("best test acc (%)")
+    ax.set_title("CTM Paper — st00: baseline reproduction\n"
+                 "(solid=paper config, // = LSTM / FF baselines)",
+                 fontsize=12, fontweight="bold")
+    ax.grid(True, axis="y", alpha=0.3)
+    # task-color legend
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=TASK_COLORS[t], label=t)
+               for t in TASK_ORDER if t in sub["task"].unique()]
+    ax.legend(handles=handles, loc="upper right", fontsize=9)
+    fig.tight_layout()
+    path = out_dir / "fig8_baselines.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig8] -> {path}")
+
+
+def fig_simplified_core(df_complete, out_dir, min_iter):
+    """st03 simplified core: sd1_mh2 / sd2_mh2 vs paper baseline (2x2 grid).
+
+    Compares a stripped-down CTM (few synapses / tiny memory) against the
+    paper config. Clean data (not affected by the log_dir bug; tick is the
+    only extra dim and it is determined by task).
+    """
+    sub = df_complete[df_complete["stage"] == "st03"].copy()
+    if sub.empty:
+        print("[fig9] no st03 data")
+        return
+    agg = agg_sweep(sub)
+    tasks = [t for t in TASK_ORDER if t in agg["task"].unique()]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    axes = axes.flatten()
+    for i, task in enumerate(tasks):
+        ax = axes[i]
+        a = agg[agg["task"] == task].sort_values("sweep")
+        labels = a["sweep"].tolist()
+        means = a["best_mean"].values * 100
+        stds = a["best_std"].values * 100
+        x = np.arange(len(labels))
+        colors = [plt.cm.Set2(j / 3) for j in range(len(labels))]
+        ax.bar(x, means, yerr=stds, capsize=4, color=colors, alpha=0.85,
+               edgecolor="black", linewidth=0.5)
+        for xi, yi, n in zip(x, means, a["n_seeds"].values):
+            tag = f"{yi:.1f}%\n(n={int(n)})" + ("!" if n < 2 else "")
+            ax.annotate(tag, (xi, yi), textcoords="offset points",
+                        xytext=(0, 6), ha="center", fontsize=8)
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color="gray", linestyle="--",
+                       alpha=0.7, label="st00 paper baseline")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=9)
+        ax.set_title(f"{task} — st03 simplified core", fontsize=11)
+        ax.set_ylabel("best test acc (%)")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(fontsize=8, loc="lower right")
+    for j in range(len(tasks), 4):
+        axes[j].axis("off")
+    fig.suptitle("CTM Paper — st03: How small can the 'core' get? "
+                 "(synapse_depth + memory_hidden_dims)", fontsize=13,
+                 fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    path = out_dir / "fig9_simplified_core.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig9] -> {path}")
+
+
+def _parse_frac(sweep, prefix):
+    """sparsity0.25 -> 0.25, halt0.6 -> 0.6. Returns None if no match."""
+    m = re.match(re.escape(prefix) + r"([\d.]+)$", sweep)
+    return float(m.group(1)) if m else None
+
+
+def _fig_numeric_sweep(df_complete, out_dir, stage, prefix, fig_id, title,
+                       xlabel, path_name, xscale_log=False,
+                       custom_task_order=None):
+    """Shared helper for st06/st08-style numeric sweeps: errorbar vs x-axis.
+
+    Annotates with the bugfix warning if the stage was affected by the
+    log_dir overwrite bug.
+    """
+    sub = df_complete[df_complete["stage"] == stage].copy()
+    sub["x"] = sub["sweep"].apply(lambda s: _parse_frac(s, prefix))
+    sub = sub.dropna(subset=["x"])
+    if sub.empty:
+        print(f"[{fig_id}] no {stage} data")
+        return
+    order = custom_task_order or TASK_ORDER
+    tasks = [t for t in order if t in sub["task"].unique()]
+    fig, ax = plt.subplots(figsize=(9, 6.5))
+    for task in tasks:
+        grp = sub[sub["task"] == task]
+        agg = grp.groupby("x").agg(
+            mean=("best_test_acc", "mean"),
+            std=("best_test_acc", "std"),
+            n=("best_test_acc", "count"),
+        ).reset_index().sort_values("x")
+        x = agg["x"].values
+        y = agg["mean"].values * 100
+        yerr = agg["std"].fillna(0).values * 100
+        ax.errorbar(x, y, yerr=yerr, marker="o", capsize=5, linewidth=2,
+                    markersize=9, color=TASK_COLORS.get(task, "gray"),
+                    label=task)
+        for xi, yi, n in zip(x, y, agg["n"].values):
+            tag = f"n={int(n)}" + ("!" if n < 2 else "")
+            ax.annotate(tag, (xi, yi), textcoords="offset points",
+                        xytext=(8, -2), fontsize=7,
+                        color=TASK_COLORS.get(task, "gray"))
+    # baseline lines (light, one per task) for context
+    for task in tasks:
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color=TASK_COLORS[task],
+                       linestyle=":", alpha=0.35, linewidth=1)
+    if xscale_log:
+        ax.set_xscale("log")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("best test acc (%)")
+    title_str = title
+    if stage in _BUGFIX_NOTE:
+        title_str += f"\n⚠ {_BUGFIX_NOTE[stage]}"
+    ax.set_title(title_str, fontsize=11, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9)
+    fig.tight_layout()
+    path = out_dir / path_name
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[{fig_id}] -> {path}")
+
+
+def fig_tick_halt(df_complete, out_dir):
+    """st06 tick-halt threshold sweep (0.3 / 0.6 / 0.9).
+
+    WARNING: compute_weight dimension (cw=0 / 0.001) was collapsed by the
+    log_dir bug, so each point is one representative cw variant. Threshold
+    trend is still meaningful.
+    """
+    _fig_numeric_sweep(
+        df_complete, out_dir,
+        stage="st06", prefix="halt", fig_id="fig11",
+        title="st06: tick early-exit / halt threshold sweep",
+        xlabel="halt threshold (confidence cutoff)",
+        path_name="fig11_tick_halt.png",
+    )
+
+
+def fig_cell_sparsity(df_complete, out_dir):
+    """st08 top-k neuron sparsity sweep (0.25 / 0.5 / 0.75). Clean data."""
+    _fig_numeric_sweep(
+        df_complete, out_dir,
+        stage="st08", prefix="sparsity", fig_id="fig10",
+        title="st08: top-k cell sparsity sweep",
+        xlabel="top-k fraction of neurons activated per tick",
+        path_name="fig10_sparsity.png",
+    )
+
+
+def fig_draft_revise(df_complete, out_dir, min_iter):
+    """st10 draft-and-revise: single bar per task vs baseline (2x2 grid).
+
+    WARNING: revise_weight (0.1/0.2) and corrupt_prob (0.15/0.30) were
+    collapsed by the log_dir bug, so each bar is one representative variant.
+    """
+    sub = df_complete[df_complete["stage"] == "st10"].copy()
+    if sub.empty:
+        print("[fig12] no st10 data")
+        return
+    agg = agg_sweep(sub)
+    tasks = [t for t in TASK_ORDER if t in agg["task"].unique()]
+    nrows = (len(tasks) + 1) // 2
+    fig, axes = plt.subplots(nrows, 2, figsize=(12, 4.5 * nrows), squeeze=False)
+    axes = axes.flatten()
+    for i, task in enumerate(tasks):
+        ax = axes[i]
+        a = agg[agg["task"] == task].sort_values("sweep")
+        labels = [s.replace("revise", "draft-revise") for s in a["sweep"]]
+        means = a["best_mean"].values * 100
+        stds = a["best_std"].values * 100
+        x = np.arange(len(labels))
+        ax.bar(x, means, yerr=stds, capsize=4, color=plt.cm.Set2(0.3),
+               alpha=0.85, edgecolor="black", linewidth=0.5)
+        for xi, yi, n in zip(x, means, a["n_seeds"].values):
+            tag = f"{yi:.1f}%\n(n={int(n)})" + ("!" if n < 2 else "")
+            ax.annotate(tag, (xi, yi), textcoords="offset points",
+                        xytext=(0, 6), ha="center", fontsize=8)
+        if task in BASELINE_PAPER:
+            ax.axhline(BASELINE_PAPER[task] * 100, color="gray", linestyle="--",
+                       alpha=0.7, label="st00 paper baseline")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=9)
+        ax.set_title(f"{task} — st10 draft-revise", fontsize=11)
+        ax.set_ylabel("best test acc (%)")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(fontsize=8, loc="lower right")
+    for j in range(len(tasks), len(axes)):
+        axes[j].axis("off")
+    suptitle = "CTM Paper — st10: draft-and-revise (draft pass + noisy revision)"
+    if "st10" in _BUGFIX_NOTE:
+        suptitle += f"\n⚠ {_BUGFIX_NOTE['st10']}"
+    fig.suptitle(suptitle, fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    path = out_dir / "fig12_draft_revise.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig12] -> {path}")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -677,6 +931,12 @@ def main():
     fig_compute_cost(df_complete, out_dir, cli.min_iter)
     fig_jepa_weight(df_complete, out_dir)
     fig_jepa_variants(df_complete, out_dir)
+    # new figures: ideas stages (st00/st03/st06/st08/st10)
+    fig_baselines(df_complete, out_dir)
+    fig_simplified_core(df_complete, out_dir, cli.min_iter)
+    fig_cell_sparsity(df_complete, out_dir)
+    fig_tick_halt(df_complete, out_dir)
+    fig_draft_revise(df_complete, out_dir, cli.min_iter)
 
     print(f"\nAll figures saved to: {out_dir}")
 
