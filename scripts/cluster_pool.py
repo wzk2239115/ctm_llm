@@ -831,19 +831,33 @@ def run_worker(args):
             else:
                 # Task didn't pin specific GPUs — auto-assign ONE free GPU
                 # so multiple tasks run in parallel across the node's GPUs.
-                # (Previously this treated None as "needs ALL GPUs" and only
-                # allowed 1 task per node — a major parallelism bottleneck.)
-                assigned = None
+                # Pick the LEAST-USED GPU that has both a free slot and
+                # enough memory budget. (Previously this treated None as
+                # "needs ALL GPUs" and only allowed 1 task per node.)
+                task_gb = estimate_task_gb(task.get("extra_args", ""))
+                total_gpu_gb = gpus[0]["memory_mb"] / 1024 if gpus else 80.0
+                mem_cap = total_gpu_gb * 0.85
+                best_gpu = None
+                best_used = float("inf")
                 for gpu in range(len(gpus)):
                     used = gpu_slots_used.get(str(gpu), 0)
-                    if used < gpu_slots_config:
-                        assigned = [gpu]
-                        break
-                if assigned is None:
+                    if used >= gpu_slots_config:
+                        continue
+                    est_usage = sum(
+                        item.get("est_gb", 0)
+                        for item in procs.values()
+                        if gpu in (item.get("gpus") or [])
+                    )
+                    if est_usage + task_gb > mem_cap:
+                        continue
+                    if used < best_used:
+                        best_used = used
+                        best_gpu = gpu
+                if best_gpu is None:
                     reject = True
-                    reject_msg = f"all {len(gpus)} gpus full ({gpu_slots_config} slots each)"
+                    reject_msg = f"no free GPU with slot+mem budget (slots={gpu_slots_config}, cap={mem_cap:.0f}GB)"
                 else:
-                    requested_gpus = assigned
+                    requested_gpus = [best_gpu]
             if not reject:
                 task_gb = estimate_task_gb(task.get("extra_args", ""))
                 total_gpu_gb = gpus[0]["memory_mb"] / 1024 if gpus else 80.0
