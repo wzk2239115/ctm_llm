@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -630,6 +631,44 @@ def restart_worker_process():
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+def kill_process_group(pgid, timeout=3.0):
+    """SIGTERM then SIGKILL an entire process group.
+
+    Prevents torchrun's child python workers from surviving as orphans (which
+    leak GPU memory) when a task exits via OOM kill / NCCL hang / segfault.
+    No-op if the group is already gone.
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.3)
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, OSError):
+            return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def cleanup_all_tasks(procs, signum=None):
+    """Kill every running task's process group (used on worker shutdown)."""
+    n = 0
+    for item in list(procs.values()):
+        pgid = item.get("pgid")
+        if pgid is not None:
+            kill_process_group(pgid)
+            n += 1
+    if n:
+        print(f"[worker] cleaned up {n} task(s) on exit", flush=True)
+    if signum is not None:
+        sys.exit(128 + signum)
+
+
 def auto_gpu_slots(gpus, config):
     if not gpus:
         return 1
@@ -685,6 +724,13 @@ def run_worker(args):
     procs = {}
     process_head = git_head()
 
+    def _on_exit_signal(signum, frame):
+        print(f"[worker] signal {signum} received, killing {len(procs)} task(s)", flush=True)
+        cleanup_all_tasks(procs, signum)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, _on_exit_signal)
+
     if args.gpu_slots < 1:
         args.gpu_slots = auto_gpu_slots(gpus, config)
         print(f"[worker] auto-slots: {args.gpu_slots} per GPU (d_model from config)", flush=True)
@@ -701,6 +747,9 @@ def run_worker(args):
                 finished.append(task_id)
         for task_id in finished:
             item = procs.pop(task_id)
+            _pgid = item.get("pgid")
+            if _pgid is not None:
+                kill_process_group(_pgid)
             rc = item["proc"].returncode
             stderr_thread = item.get("stderr_thread")
             if stderr_thread and stderr_thread.is_alive():
@@ -841,10 +890,19 @@ def run_worker(args):
                     env["NPROC_PER_NODE"] = str(len(requested_gpus))
                 for k, v in task.get("env", {}).items():
                     env[k] = v
+                env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
                 print(f"[worker] received task {task['task_id']}: {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
-                proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, env=env)
+                proc = subprocess.Popen(
+                    cmd, stderr=subprocess.PIPE, text=True,
+                    env=env, start_new_session=True,
+                )
+                try:
+                    _pgid = os.getpgid(proc.pid)
+                except OSError:
+                    _pgid = proc.pid
                 item = {
                     "proc": proc,
+                    "pgid": _pgid,
                     "gpus": requested_gpus,
                     "stderr_lines": [],
                     "est_gb": task_gb,
