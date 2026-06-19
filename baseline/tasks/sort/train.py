@@ -441,7 +441,8 @@ if __name__=='__main__':
                             [1.0 if (len(d) == len(t) and torch.equal(d, t.to(d.device))) else 0.0
                              for d, t in zip(decoded, targets)],
                             device=predictions.device)
-                        is_correct = is_correct.unsqueeze(1).expand(-1, predictions.size(-1))
+                        q_T = extras['q_logits'].size(-1)
+                        is_correct = is_correct.unsqueeze(1).expand(-1, q_T)
                         loss = loss + compute_act_q_loss(extras['q_logits'], is_correct, weight=args.halt_q_weight)
                 else:
                     out = model(inputs)

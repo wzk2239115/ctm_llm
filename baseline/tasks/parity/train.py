@@ -347,6 +347,8 @@ if __name__=='__main__':
                     if args.act_halt and 'q_logits' in extras:
                         pred_4d = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
                         pred_correct = (pred_4d.argmax(dim=2) == targets.unsqueeze(-1)).all(dim=1).float()
+                        q_T = extras['q_logits'].size(-1)
+                        pred_correct = pred_correct[:, :q_T]
                         loss = loss + compute_act_q_loss(extras['q_logits'], pred_correct, weight=args.halt_q_weight)
                     # Compute where_most_certain for accuracy tracking
                     predictions = predictions.reshape(predictions.size(0), -1, 2, predictions.size(-1))
