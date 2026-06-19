@@ -317,6 +317,12 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
         self.mlp = FeedForward(config.hidden_size)
         self.resid_drop = nn.Dropout(config.dropout)
 
+        self.liquid_update_mode = config.liquid_update_mode
+        if self.liquid_update_mode != 'none':
+            self.liquid_gate = nn.Linear(config.d_model, config.d_model)
+            nn.init.zeros_(self.liquid_gate.weight)
+            nn.init.constant_(self.liquid_gate.bias, float(config.liquid_update_init))
+
     def _async_expert_layout(self):
         return (
             self.moe_num_experts > 1
@@ -757,6 +763,10 @@ class AsyncCTMBlock(RegionalMoEMixin, nn.Module):
                 for band in self.clock_engine.bands:
                     if band.fires(tick):
                         band.local_tick += 1
+
+            if self.liquid_update_mode != 'none' and prev_sync_o_activated is not None:
+                gate = torch.sigmoid(self.liquid_gate(activated))
+                activated = (1.0 - gate) * prev_sync_o_activated + gate * activated
 
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)

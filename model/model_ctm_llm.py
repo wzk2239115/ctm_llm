@@ -121,6 +121,12 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
         self.mlp = FeedForward(config.hidden_size)
         self.resid_drop = nn.Dropout(config.dropout)
 
+        self.liquid_update_mode = config.liquid_update_mode
+        if self.liquid_update_mode != 'none':
+            self.liquid_gate = nn.Linear(config.d_model, config.d_model)
+            nn.init.zeros_(self.liquid_gate.weight)
+            nn.init.constant_(self.liquid_gate.bias, float(config.liquid_update_init))
+
     def _init_moe_params(self, config):
         self.moe_routing_mode = config.moe_routing_mode
         self.moe_num_experts = max(1, int(config.moe_num_experts))
@@ -671,6 +677,10 @@ class CTMBlock(RegionalMoEMixin, nn.Module):
                 if not self._use_group_sparse_backend():
                     activated = self._apply_cell_sparsity(activated)
 
+            if self.liquid_update_mode != 'none' and prev_sync_o_activated is not None:
+                gate = torch.sigmoid(self.liquid_gate(activated))
+                activated = (1.0 - gate) * prev_sync_o_activated + gate * activated
+
             sync_o, alpha_o, beta_o = self._compute_synch(
                 activated, alpha_o, beta_o, r_o, self.out_left, self.out_right)
             last_sync_o = sync_o
@@ -796,6 +806,7 @@ class CTMModel(nn.Module):
                 result = layer(h, track=track, return_all_ticks=True, **layer_kwargs)
                 h = result.hidden
                 present = result.present_kv
+                extras = result.extras
                 if track:
                     tracking_all[f'layer_{layer.layer_id}'] = result.extras.get('tracking', {})
                 if return_all_ticks:
@@ -1264,6 +1275,14 @@ class CTMForCausalLM(BaseCTMForCausalLM):
             loss = loss + jepa_weight * jepa_total
         else:
             self.last_cross_tick_jepa_loss = 0.0
+
+        traj_weight = float(self.config.trajectory_length_weight)
+        if traj_weight > 0 and num_ticks > 1:
+            traj_loss = self._trajectory_length_loss(tick_outs)
+            self.last_trajectory_length_loss = float(traj_loss.detach().item())
+            loss = loss + traj_weight * traj_loss
+        else:
+            self.last_trajectory_length_loss = 0.0
 
         fast_slow_aux = self._fast_slow_output_loss(
             input_ids, labels, tick_outs, final_logits)

@@ -240,6 +240,23 @@ class BaseCTMForCausalLM(nn.Module):
             return torch.tensor(0.0, device=tick_outs.device)
         return total_div_loss / count
 
+    def _trajectory_length_loss(self, tick_outs):
+        """LTC-inspired trajectory length: total arc length of the tick-state path."""
+        mode = self.config.trajectory_length_mode
+        num_ticks = tick_outs.size(-1)
+        if num_ticks < 2:
+            return tick_outs.new_zeros(())
+        if mode == 'cosine':
+            a = F.normalize(tick_outs[..., :-1], dim=2)
+            b = F.normalize(tick_outs[..., 1:], dim=2)
+            return (1.0 - (a * b).sum(dim=2)).mean()
+        deltas = tick_outs[..., 1:] - tick_outs[..., :-1]
+        if mode == 'l2':
+            return (deltas.float() ** 2).mean()
+        if mode == 'l1':
+            return deltas.float().abs().mean()
+        raise ValueError(f"Unknown trajectory_length_mode: {mode}")
+
     def _halt_train_weighted_loss(self, losses, certainties, num_iters):
         mode = self.config.tick_halt_train_mode
         if mode == 'none':

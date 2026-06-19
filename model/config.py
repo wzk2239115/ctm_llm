@@ -179,6 +179,12 @@ class CTMLLMConfig:
         self.cross_tick_jepa_dropout = float(kwargs.get('cross_tick_jepa_dropout', 0.1))
         self.cross_tick_jepa_target_stop_grad = bool(kwargs.get('cross_tick_jepa_target_stop_grad', True))
 
+        self.liquid_update_mode = kwargs.get('liquid_update_mode', 'none')
+        self.liquid_update_init = kwargs.get('liquid_update_init', 0.0)
+
+        self.trajectory_length_weight = kwargs.get('trajectory_length_weight', 0.0)
+        self.trajectory_length_mode = kwargs.get('trajectory_length_mode', 'l2')
+
         assert self.d_model >= max(self.n_synch_out, self.n_synch_action), \
             f"d_model({self.d_model}) must >= n_synch_out({self.n_synch_out}) and n_synch_action({self.n_synch_action})"
         assert self.d_input % self.heads == 0, \
