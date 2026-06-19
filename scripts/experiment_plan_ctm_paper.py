@@ -11,9 +11,20 @@ Usage:
     
     # Submit one stage to pool
     python scripts/experiment_plan_ctm_paper.py submit --stage st00
+
+    # Re-run ONLY the stages whose log_dir was previously polluted by the
+    # overwrite bug (13 stages, 3 seeds each). Does not touch clean stages.
+    python scripts/experiment_plan_ctm_paper.py submit --stage bugfix --no-wait
     
     # Generate CSV
     python scripts/experiment_plan_ctm_paper.py csv [--stage all]
+
+Stage selectors for --stage:
+    all                 every stage (3 seeds expanded)
+    bugfix              only the 13 polluted stages (3 seeds expanded)
+    clean               only the trustworthy stages
+    st06                a single stage (seed 0 only)
+    st06,st09,st10      comma list (3 seeds expanded)
 """
 
 import json, os, re, shlex, subprocess, sys, time, urllib.request
@@ -34,6 +45,36 @@ STAGES_ORDERED = [
     "st19", "st20", "st21", "st22",     "st23", "st24",
 ]
 ALL_STAGES = STAGES_ORDERED + ["all"]
+
+# ─── log_dir overwrite bugfix ─────────────────────────────────────────────
+# BUG (fixed 2026-06-19): the following stages had `log_dir` patterns that
+# omitted one or more varying hyperparameters, so sibling variants wrote to
+# the SAME directory and overwrote each other. Example: st06 swept both
+# `tick_halt_threshold` and `tick_compute_weight`, but log_dir only encoded
+# the threshold → cw=0.0 and cw=0.001 clobbered each other, and the only
+# surviving checkpoint could be either variant (race depends on submit order).
+#
+# FIX: every varying knob is now encoded in log_dir, so each variant has its
+# own directory. The old (polluted) directories still exist on the compute
+# machine and will still be picked up by extract_ctm_paper_results.py under
+# the legacy short names (e.g. `st06/sort_halt0.6`); ignore them when reading
+# post-fix runs and prefer the new disambiguated names
+# (e.g. `st06/sort_halt0p6_cw0p0`, `st06/sort_halt0p6_cw0p001`).
+#
+# To re-run ONLY the previously-polluted stages without touching the clean
+# ones (st00/01/02/04/05/07/08/17/19/20/21/24), submit with:
+#     python scripts/experiment_plan_ctm_paper.py submit --stage bugfix --no-wait
+# st03 is included for name/log_dir consistency (tick now in log_dir) even
+# though no actual overwrite happened there (tick is determined by task).
+BUGFIX_STAGES = [
+    "st03", "st06", "st09", "st10", "st11", "st12", "st13",
+    "st14", "st15", "st16", "st18", "st22", "st23",
+]
+# Stages whose pre-fix data is trustworthy (log_dir was already unique).
+# Listed so users can deliberately avoid re-running them.
+CLEAN_STAGES = [
+    s for s in STAGES_ORDERED if s not in BUGFIX_STAGES
+]
 
 def _next_slot():
     i = _slot_idx[0]
@@ -346,21 +387,46 @@ def build_st03_simplified_core(plan):
             plan.append(exp(
                 f"st03_{task_name}_sd{sd}_mh{mh}_tick{cfg['iterations']}",
                 f"{task_name}: simplified sd={sd} mh={mh} tick={cfg['iterations']}",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st03/{task_name}_sd{sd}_mh{mh}"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st03/{task_name}_sd{sd}_mh{mh}_tick{cfg['iterations']}"}),
                 tags=[task_name, "simplified-core"],
             ))
     return plan
 
 
 def build_st04_jepa_sweep(plan):
-    """Cross-tick JEPA: weight, loss, stop_grad sweeps on paper config."""
+    """Cross-tick JEPA: weight, loss, stop_grad sweeps on paper config.
+
+    BUG (2026-06-17): CONFOUNDED ABLATION — the loss / stop-grad / predictor-
+    depth variants all hardcode cross_tick_jepa_weight = 1.0 (10x the
+    jepa_w0.1 'default' bar that fig6 compares them against). JEPA weight is
+    NOT a neutral knob: the weight sweep itself shows weight has a large,
+    task-dependent effect — sort drops 43% (w0.1) -> 20% (w1.0), and every
+    weight=1.0 variant on sort collapses to ~0.25%. So each variant changes
+    TWO independent variables at once (its target knob AND 0.1 -> 1.0 weight),
+    and the accuracy delta cannot be attributed to loss-type / stop-grad /
+    depth alone. This is the same class of bug as st02's memory_length coupling.
+
+    Secondary data problem: parity produces final_iter=0 (acc stuck at 0.499
+    = chance) in st04 AND every other stage where ideas_active=True
+    (st05/06/09/12/13/14/15/19). This is a RUNTIME bug in the ideas_active
+    branch of baseline/tasks/parity/train.py:314, NOT a plan bug — re-running
+    parity will keep failing until that is fixed. Do not draw JEPA
+    conclusions for parity from st04.
+
+    FIX: see scripts/fix_bug_st04_jepa_weight_confound.py — re-runs the four
+    variants (mse / nostopgrad / pd1 / pd4) at weight=0.1 (the empirically
+    stable default) as stage 'st04b', so each knob is tested at an operating
+    point where the base config actually trains. Original st04 results are
+    kept for side-by-side comparison; when reading fig6, compare variants
+    against jepa_w1.0 (the correct single-variable reference), NOT jepa_w0.1.
+    """
     jepa_defaults = dict(
         cross_tick_jepa_hidden_dim=128,
         cross_tick_jepa_predictor_depth=2,
         cross_tick_jepa_dropout=0.0,
     )
     for task_name, (module, base, _) in TASKS.items():
-        # weight sweep
+        # weight sweep (clean: only weight varies — this part is NOT buggy)
         for w in [0.1, 0.5, 1.0]:
             cfg = dict(with_seed(base, 0))
             cfg["log_dir"] = f"logs/ctm_paper/st04/{task_name}_jepa_w{w}"
@@ -377,6 +443,8 @@ def build_st04_jepa_sweep(plan):
             cfg = dict(with_seed(base, 0))
             cfg["log_dir"] = f"logs/ctm_paper/st04/{task_name}_jepa_{loss_type}"
             cfg.update(jepa_defaults)
+            # NOTE: BUG — weight=1.0 confounds this with the weight sweep.
+            # Should be 0.1 to isolate the loss-type effect. See fix ...st04b.
             cfg["cross_tick_jepa_weight"] = 1.0
             cfg["cross_tick_jepa_loss"] = loss_type
             plan.append(exp(
@@ -389,6 +457,8 @@ def build_st04_jepa_sweep(plan):
         cfg = dict(with_seed(base, 0))
         cfg["log_dir"] = f"logs/ctm_paper/st04/{task_name}_jepa_nostopgrad"
         cfg.update(jepa_defaults)
+        # NOTE: BUG — weight=1.0 confounds this with the weight sweep.
+        # Should be 0.1 to isolate the stop-grad effect. See fix ...st04b.
         cfg["cross_tick_jepa_weight"] = 1.0
         cfg["cross_tick_jepa_target_stop_grad"] = False
         plan.append(exp(
@@ -402,6 +472,8 @@ def build_st04_jepa_sweep(plan):
             cfg = dict(with_seed(base, 0))
             cfg["log_dir"] = f"logs/ctm_paper/st04/{task_name}_jepa_pd{pd}"
             cfg.update(jepa_defaults)
+            # NOTE: BUG — weight=1.0 confounds this with the weight sweep.
+            # Should be 0.1 to isolate the predictor-depth effect. See fix ...st04b.
             cfg["cross_tick_jepa_weight"] = 1.0
             cfg["cross_tick_jepa_predictor_depth"] = pd
             plan.append(exp(
@@ -478,7 +550,7 @@ def build_st06_tick_halt(plan):
                 plan.append(exp(
                     f"st06_{task_name}_halt{str(thresh).replace('.','p')}_cw{str(compute_w).replace('.','p')}",
                     f"{task_name}: halt@{thresh} compute_w={compute_w}",
-                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st06/{task_name}_halt{thresh}"}),
+                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st06/{task_name}_halt{str(thresh).replace('.','p')}_cw{str(compute_w).replace('.','p')}"}),
                     tags=[task_name, "tick-halt"],
                     impl_status="ready",
                 ))
@@ -529,7 +601,7 @@ def build_st09_reflex_head(plan):
             plan.append(exp(
                 f"st09_{task_name}_reflex_w{str(reflex_weight).replace('.','p')}",
                 f"{task_name}: reflex head w={reflex_weight}",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st09/{task_name}_reflex"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st09/{task_name}_reflex_w{str(reflex_weight).replace('.','p')}"}),
                 tags=[task_name, "reflex"],
                 impl_status="ready",
             ))
@@ -551,7 +623,7 @@ def build_st10_draft_revise(plan):
                 plan.append(exp(
                     f"st10_{task_name}_revise_w{str(revise_w).replace('.','p')}_cp{str(corrupt_p).replace('.','p')}",
                     f"{task_name}: revise w={revise_w} corrupt={corrupt_p}",
-                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st10/{task_name}_revise"}),
+                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st10/{task_name}_revise_w{str(revise_w).replace('.','p')}_cp{str(corrupt_p).replace('.','p')}"}),
                     tags=[task_name, "draft-revise"],
                     impl_status="ready",
                 ))
@@ -571,7 +643,7 @@ def build_st11_async_ticks(plan):
             plan.append(exp(
                 f"st11_{task_name}_async_{periods.replace(',','_')}",
                 f"{task_name}: async ticks periods={periods}",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st11/{task_name}_async"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st11/{task_name}_async_{periods.replace(',','_')}"}),
                 tags=[task_name, "async-ticks"],
                 impl_status="ready",
             ))
@@ -592,7 +664,7 @@ def build_st12_ema_speed_spectrum(plan):
                 plan.append(exp(
                     f"st12_{task_name}_ema_{decays.replace(',','_').replace('.','p')}_w{str(weight).replace('.','p')}",
                     f"{task_name}: EMA spectrum decays={decays} w={weight}",
-                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st12/{task_name}_ema"}),
+                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st12/{task_name}_ema_{decays.replace(',','_').replace('.','p')}_w{str(weight).replace('.','p')}"}),
                     tags=[task_name, "ema-spectrum"],
                     impl_status="ready",
                 ))
@@ -628,7 +700,7 @@ def build_st13_jepa_halt(plan):
                 plan.append(exp(
                     f"st13_{task_name}_jepa_halt{str(thresh).replace('.','p')}_cw{str(cw).replace('.','p')}",
                     f"{task_name}: JEPA+halt@{thresh} cw={cw}",
-                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st13/{task_name}_jepa_halt"}),
+                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st13/{task_name}_jepa_halt{str(thresh).replace('.','p')}_cw{str(cw).replace('.','p')}"}),
                     tags=[task_name, "jepa", "tick-halt"],
                 ))
     return plan
@@ -645,7 +717,7 @@ def build_st14_jepa_sparsity(plan):
             plan.append(exp(
                 f"st14_{task_name}_jepa_sparsity{str(frac).replace('.','p')}",
                 f"{task_name}: JEPA+sparsity topk={frac}",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st14/{task_name}_jepa_sparsity"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st14/{task_name}_jepa_sparsity{str(frac).replace('.','p')}"}),
                 tags=[task_name, "jepa", "sparsity"],
             ))
     return plan
@@ -662,7 +734,7 @@ def build_st15_halt_sparsity(plan):
             plan.append(exp(
                 f"st15_{task_name}_halt_sparsity{str(frac).replace('.','p')}",
                 f"{task_name}: halt@0.6+sparsity topk={frac}",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st15/{task_name}_halt_sparsity"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st15/{task_name}_halt_sparsity{str(frac).replace('.','p')}"}),
                 tags=[task_name, "tick-halt", "sparsity"],
             ))
     return plan
@@ -682,7 +754,7 @@ def build_st16_jepa_async(plan):
             plan.append(exp(
                 f"st16_{task_name}_jepa_async_{periods.replace(',','_')}",
                 f"{task_name}: JEPA+async periods={periods}",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st16/{task_name}_jepa_async"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st16/{task_name}_jepa_async_{periods.replace(',','_')}"}),
                 tags=[task_name, "jepa", "async-ticks"],
             ))
     return plan
@@ -718,7 +790,7 @@ def build_st18_sparsity_async(plan):
                 plan.append(exp(
                     f"st18_{task_name}_sparsity{str(frac).replace('.','p')}_async_{periods.replace(',','_')}",
                     f"{task_name}: sparsity topk={frac}+async periods={periods}",
-                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st18/{task_name}_sparsity_async"}),
+                    _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st18/{task_name}_sparsity{str(frac).replace('.','p')}_async_{periods.replace(',','_')}"}),
                     tags=[task_name, "sparsity", "async-ticks"],
                 ))
     return plan
@@ -788,7 +860,7 @@ def build_st22_sparsity_multitick(plan):
             plan.append(exp(
                 f"st22_{task_name}_sparsity{str(frac).replace('.','p')}_multitick",
                 f"{task_name}: sparsity topk={frac}+multi-tick",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st22/{task_name}_sparsity_multitick"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st22/{task_name}_sparsity{str(frac).replace('.','p')}_multitick"}),
                 tags=[task_name, "sparsity", "multi-tick-loss"],
             ))
     return plan
@@ -807,7 +879,7 @@ def build_st23_async_multitick(plan):
             plan.append(exp(
                 f"st23_{task_name}_async_{periods.replace(',','_')}_multitick",
                 f"{task_name}: async periods={periods}+multi-tick",
-                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st23/{task_name}_async_multitick"}),
+                _p(module, {**cfg, "log_dir": f"logs/ctm_paper/st23/{task_name}_async_{periods.replace(',','_')}_multitick"}),
                 tags=[task_name, "async-ticks", "multi-tick-loss"],
             ))
     return plan
@@ -927,18 +999,52 @@ def _expand_seeds(plan, seeds=[0, 1, 2]):
     return new_plan
 
 
+def _resolve_stages(stage):
+    """Resolve a --stage argument to a list of concrete stage ids.
+
+    Accepted forms:
+        "all"               -> every stage in STAGES_ORDERED
+        "bugfix"            -> only the stages whose log_dir was previously
+                               polluted (BUGFIX_STAGES). Use to re-run only
+                               the affected variants without touching the
+                               clean ones.
+        "clean"             -> only the stages whose pre-fix data is
+                               trustworthy (CLEAN_STAGES).
+        "st06"              -> a single stage id
+        "st06,st09,st10"    -> comma-separated list of stage ids
+    """
+    if stage == "all":
+        return list(STAGES_ORDERED)
+    if stage == "bugfix":
+        return list(BUGFIX_STAGES)
+    if stage == "clean":
+        return list(CLEAN_STAGES)
+    if "," in stage:
+        parts = [p.strip() for p in stage.split(",") if p.strip()]
+        bad = [p for p in parts if p not in STAGE_BUILDERS]
+        if bad:
+            print(f"Unknown stage(s): {bad}. Available: {STAGES_ORDERED}")
+            return []
+        return parts
+    if stage in STAGE_BUILDERS:
+        return [stage]
+    print(f"Unknown stage: {stage}. Available: {STAGES_ORDERED + ['all', 'bugfix', 'clean']}")
+    return []
+
+
 def build_plan(stage="all", seed_expand=True):
     plan = []
-    if stage == "all":
-        for s in STAGES_ORDERED:
-            if s in STAGE_BUILDERS:
-                STAGE_BUILDERS[s](plan)
-    elif stage in STAGE_BUILDERS:
-        STAGE_BUILDERS[stage](plan)
-    else:
-        print(f"Unknown stage: {stage}. Available: {STAGES_ORDERED}")
+    stages = _resolve_stages(stage)
+    if not stages:
         return []
-    if seed_expand and stage == "all":
+    for s in stages:
+        if s in STAGE_BUILDERS:
+            STAGE_BUILDERS[s](plan)
+    # Seed-expand multi-stage runs (all/bugfix/clean/comma-list) so they get
+    # the same 3-seed coverage as the full plan. A single bare stage (e.g.
+    # `--stage st06`) stays seed-0 only, matching the historical debug usage.
+    multi_stage = len(stages) > 1
+    if seed_expand and multi_stage:
         plan = _expand_seeds(plan)
     return plan
 
@@ -1089,14 +1195,33 @@ def cmd_csv(args):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="CTM Paper: All Ideas × All Tasks")
+    parser = argparse.ArgumentParser(
+        description="CTM Paper: All Ideas × All Tasks",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Stage selectors for --stage:\n"
+            "  all                     every stage (3 seeds expanded)\n"
+            "  bugfix                  only the 13 stages whose log_dir was\n"
+            "                          previously polluted (3 seeds expanded).\n"
+            "                          Use to re-run ONLY affected variants.\n"
+            "  clean                   only the trustworthy stages\n"
+            "  st06                    a single stage (seed 0 only)\n"
+            "  st06,st09,st10          comma list (3 seeds expanded)\n"
+            "\n"
+            "Typical rerun after the log_dir bugfix:\n"
+            "  python scripts/experiment_plan_ctm_paper.py plan --stage bugfix\n"
+            "  python scripts/experiment_plan_ctm_paper.py submit --stage bugfix --no-wait\n"
+        ),
+    )
     sub = parser.add_subparsers(dest="command")
 
     p_plan = sub.add_parser("plan")
-    p_plan.add_argument("--stage", default="all")
+    p_plan.add_argument("--stage", default="all",
+                        help="all|bugfix|clean|st06|st06,st09,... (see epilog)")
 
     p_submit = sub.add_parser("submit")
-    p_submit.add_argument("--stage", default="all")
+    p_submit.add_argument("--stage", default="all",
+                          help="all|bugfix|clean|st06|st06,st09,... (see epilog)")
     p_submit.add_argument("--dry-run", action="store_true")
     p_submit.add_argument("--wait", action="store_true", default=True)
     p_submit.add_argument("--no-wait", action="store_false", dest="wait")
@@ -1107,7 +1232,8 @@ if __name__ == "__main__":
     p_submit.add_argument("--port", type=int, default=PORT)
 
     p_csv = sub.add_parser("csv")
-    p_csv.add_argument("--stage", default="all")
+    p_csv.add_argument("--stage", default="all",
+                       help="all|bugfix|clean|st06|st06,st09,... (see epilog)")
     p_csv.add_argument("--output", default=None)
 
     args = parser.parse_args()
