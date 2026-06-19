@@ -68,6 +68,10 @@ def parse_args():
     parser.add_argument('--n_synch_action', type=int, default=32, help='Number of neurons to use for observation/action synch.')
     parser.add_argument('--neuron_select_type', type=str, default='random-pairing', help='Protocol for selecting neuron subset.')
     parser.add_argument('--n_random_pairing_self', type=int, default=0, help='Number of neurons paired self-to-self for synch.')
+    parser.add_argument('--synch_gate_mode', type=str, default='fixed', choices=['fixed', 'soft'],
+                        help='Synch subspace selection: fixed=legacy random-pairing indices (su00); soft=learnable softmax gates (su01).')
+    parser.add_argument('--synch_gate_temp', type=float, default=1.0,
+                        help='Softmax temperature for synch_gate_mode=soft. Lower=peakier (closer to hard indexing).')
     
     parser.add_argument('--iterations', type=int, default=50, help='Number of internal ticks.')
     parser.add_argument('--memory_length', type=int, default=25, help='Length of the pre-activation history for NLMS.')
@@ -192,6 +196,8 @@ if __name__=='__main__':
         dropout_nlm=args.dropout_nlm,    
         neuron_select_type=args.neuron_select_type,
         n_random_pairing_self=args.n_random_pairing_self,
+        synch_gate_mode=getattr(args, 'synch_gate_mode', 'fixed'),
+        synch_gate_temp=getattr(args, 'synch_gate_temp', 1.0),
     ).to(device)
 
     # --- Setup CTM ideas ---

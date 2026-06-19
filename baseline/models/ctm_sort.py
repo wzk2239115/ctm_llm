@@ -28,6 +28,8 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 synch_gate_mode='fixed',
+                 synch_gate_temp=1.0,
                  ):
         super().__init__(
             iterations=iterations,
@@ -49,6 +51,8 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
             dropout_nlm=dropout_nlm,
             neuron_select_type=neuron_select_type,
             n_random_pairing_self=n_random_pairing_self,
+            synch_gate_mode=synch_gate_mode,
+            synch_gate_temp=synch_gate_temp,
         )
 
         # --- Use a minimal CTM w/out input (action) synch ---

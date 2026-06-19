@@ -99,6 +99,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 synch_gate_mode='fixed',
+                 synch_gate_temp=1.0,
                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -116,6 +118,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.neuron_select_type = neuron_select_type
         self.memory_length = memory_length
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
+        # --- Synch-Gate Mode (su00 = 'fixed' = legacy; 'soft' = su01 learnable softmax gates) ---
+        self.synch_gate_mode = synch_gate_mode
+        self.synch_gate_temp = synch_gate_temp
 
         # --- Assertions ---
         self.verify_args()
@@ -225,47 +230,64 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         
         Therefore, in practice, we update the synchronisation based on the current post-activations,
         which we call the 'activated state' here. This is possible because the inputs to synchronisation 
-        are only updated recurrently at each step, meaning that there is a linear recurrence we can
+        are only updated recurrently at each step, meaning that there is a linear recurrence we can 
         leverage. 
         
         See Appendix TODO of the Technical Report (TODO:LINK) for the maths that enables this method.
+
+        Branches on self.synch_gate_mode:
+          - 'fixed': legacy hard indexing via {type}_neuron_indices_{left,right} buffers.
+          - 'soft' : learnable softmax gates {type}_gate_{left,right} of shape [K, D].
+                     Replaces indexing with `s @ softmax(gate/temp).T`, giving differentiable
+                     "soft indices" that gradient descent can move. See su01 in
+                     scripts/experiment_plan_synch_upgrades.py.
         """
 
-        if synch_type == 'action': # Get action parameters
-            n_synch = self.n_synch_action
-            neuron_indices_left = self.action_neuron_indices_left
-            neuron_indices_right = self.action_neuron_indices_right
-        elif synch_type == 'out': # Get input parameters
-            n_synch = self.n_synch_out
-            neuron_indices_left = self.out_neuron_indices_left
-            neuron_indices_right = self.out_neuron_indices_right
-        
-        if self.neuron_select_type in ('first-last', 'random'):
-            # For first-last and random, we compute the pairwise sync between all selected neurons
-            if self.neuron_select_type == 'first-last':
-                if synch_type == 'action': # Use last n_synch neurons for action
-                    selected_left = selected_right = activated_state[:, -n_synch:]
-                elif synch_type == 'out': # Use first n_synch neurons for out
-                    selected_left = selected_right = activated_state[:, :n_synch]
-            else: # Use the randomly selected neurons
-                selected_left = activated_state[:, neuron_indices_left]
-                selected_right = activated_state[:, neuron_indices_right]
-            
-            # Compute outer product of selected neurons
-            outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
-            # Resulting matrix is symmetric, so we only need the upper triangle
-            i, j = torch.triu_indices(n_synch, n_synch)
-            pairwise_product = outer[:, i, j]
-            
-        elif self.neuron_select_type == 'random-pairing':
-            # For random-pairing, we compute the sync between specific pairs of neurons
-            left = activated_state[:, neuron_indices_left]
-            right = activated_state[:, neuron_indices_right]
-            pairwise_product = left * right
+        if self.synch_gate_mode == 'soft':
+            # --- Learnable Soft Gating (su01) ---
+            gate_left  = getattr(self, f'{synch_type}_gate_left')   # [K, D]
+            gate_right = getattr(self, f'{synch_type}_gate_right')  # [K, D]
+            w_left  = torch.softmax(gate_left  / self.synch_gate_temp, dim=-1)   # [K, D]
+            w_right = torch.softmax(gate_right / self.synch_gate_temp, dim=-1)   # [K, D]
+            # Differentiable "soft indexing": expected activation under the softmax mask
+            s_left  = activated_state @ w_left.T    # [B, K]
+            s_right = activated_state @ w_right.T   # [B, K]
+            pairwise_product = s_left * s_right     # [B, K]
         else:
-            raise ValueError("Invalid neuron selection type")
-        
-        
+            # --- Legacy Fixed Indexing (su00 / default) ---
+            if synch_type == 'action': # Get action parameters
+                n_synch = self.n_synch_action
+                neuron_indices_left = self.action_neuron_indices_left
+                neuron_indices_right = self.action_neuron_indices_right
+            elif synch_type == 'out': # Get input parameters
+                n_synch = self.n_synch_out
+                neuron_indices_left = self.out_neuron_indices_left
+                neuron_indices_right = self.out_neuron_indices_right
+            
+            if self.neuron_select_type in ('first-last', 'random'):
+                # For first-last and random, we compute the pairwise sync between all selected neurons
+                if self.neuron_select_type == 'first-last':
+                    if synch_type == 'action': # Use last n_synch neurons for action
+                        selected_left = selected_right = activated_state[:, -n_synch:]
+                    elif synch_type == 'out': # Use first n_synch neurons for out
+                        selected_left = selected_right = activated_state[:, :n_synch]
+                else: # Use the randomly selected neurons
+                    selected_left = activated_state[:, neuron_indices_left]
+                    selected_right = activated_state[:, neuron_indices_right]
+                
+                # Compute outer product of selected neurons
+                outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
+                # Resulting matrix is symmetric, so we only need the upper triangle
+                i, j = torch.triu_indices(n_synch, n_synch)
+                pairwise_product = outer[:, i, j]
+                
+            elif self.neuron_select_type == 'random-pairing':
+                # For random-pairing, we compute the sync between specific pairs of neurons
+                left = activated_state[:, neuron_indices_left]
+                right = activated_state[:, neuron_indices_right]
+                pairwise_product = left * right
+            else:
+                raise ValueError(f"Invalid neuron selection type: {self.neuron_select_type}")
         
         # Compute synchronisation recurrently
         if decay_alpha is None or decay_beta is None:
@@ -451,12 +473,40 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             1. Set the buffers for selecting neurons so that these indices are saved into the model state_dict.
             2. Set the parameters for learnable exponential decay when computing synchronisation between all 
                 neurons.
+
+            Branches on self.synch_gate_mode:
+              - 'fixed': legacy path, register_{type}_neuron_indices_{left,right} as buffers
+                         (sampled once, frozen for life — see baseline/models/ctm.py:initialize_left_right_neurons).
+              - 'soft' : register_{type}_gate_{left,right} as learnable nn.Parameter of shape [n_synch, d_model].
+                         Initialized to a SOFT one-hot at the same sampled indices (scale=5.0), so at temp=1.0
+                         the model starts as a slightly-smoothed random-pairing and can drift to better pairs
+                         via gradient descent. See scripts/experiment_plan_synch_upgrades.py:su01.
             """
             assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
             left, right = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
             synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
-            self.register_buffer(f'{synch_type}_neuron_indices_left', left)
-            self.register_buffer(f'{synch_type}_neuron_indices_right', right)
+
+            if self.synch_gate_mode == 'fixed':
+                self.register_buffer(f'{synch_type}_neuron_indices_left', left)
+                self.register_buffer(f'{synch_type}_neuron_indices_right', right)
+            elif self.synch_gate_mode == 'soft':
+                # Learnable softmax gates: gate[k, d] is the logit for pair-slot k reading from neuron d.
+                # Initialized to SOFT one-hot at the sampled indices (matches random-pairing init in expectation).
+                SOFT_INIT_SCALE = 5.0
+                gate_left  = torch.zeros(n_synch, self.d_model, device=left.device)
+                gate_right = torch.zeros(n_synch, self.d_model, device=right.device)
+                gate_left[ torch.arange(n_synch), left]  = SOFT_INIT_SCALE
+                gate_right[torch.arange(n_synch), right] = SOFT_INIT_SCALE
+                self.register_parameter(f'{synch_type}_gate_left',  nn.Parameter(gate_left))
+                self.register_parameter(f'{synch_type}_gate_right', nn.Parameter(gate_right))
+            else:
+                raise ValueError(
+                    f"synch_gate_mode='{self.synch_gate_mode}' not yet implemented. "
+                    f"This revision of set_synchronisation_parameters only supports 'fixed' and 'soft'. "
+                    f"Other modes (gumbel / sparsemax / topk / attn / hypernet) are stubs in "
+                    f"scripts/experiment_plan_synch_upgrades.py and need their own implementation."
+                )
+
             self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
 
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
@@ -505,9 +555,20 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         Specifically when selecting neurons for sychronisation using 'first-last' or 'random',
         one needs the right number of neurons
         """
-        assert self.neuron_select_type in VALID_NEURON_SELECT_TYPES, \
-            f"Invalid neuron selection type: {self.neuron_select_type}"
-        
+        if self.synch_gate_mode == 'fixed':
+            # neuron_select_type is only consulted when synch_gate_mode == 'fixed'.
+            # All learnable / dynamic gate modes bypass neuron_select_type entirely.
+            assert self.neuron_select_type in VALID_NEURON_SELECT_TYPES, \
+                f"Invalid neuron selection type: {self.neuron_select_type}"
+            if self.neuron_select_type == 'first-last':
+                assert self.d_model >= (self.n_synch_out + self.n_synch_action), \
+                    "d_model must be >= n_synch_out + n_synch_action for neuron subsets"
+        else:
+            assert self.synch_gate_mode in ('soft',), \
+                f"synch_gate_mode='{self.synch_gate_mode}' not supported in this revision. " \
+                f"Only 'fixed' and 'soft' are wired (gumbel/sparsemax/topk/etc are placeholders)."
+            assert self.synch_gate_temp > 0, f"synch_gate_temp must be > 0, got {self.synch_gate_temp}"
+
         assert self.backbone_type in VALID_BACKBONE_TYPES + ['none'], \
             f"Invalid backbone_type: {self.backbone_type}"
         
@@ -524,7 +585,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
     def calculate_synch_representation_size(self, n_synch):
         """
         Calculate the size of the synchronisation representation based on neuron selection type.
+
+        For any non-'fixed' synch_gate_mode (e.g. 'soft'), K = n_synch pairs are produced
+        directly (random-pairing semantics), so the representation size equals n_synch.
         """
+        if self.synch_gate_mode != 'fixed':
+            return n_synch
         if self.neuron_select_type == 'random-pairing':
             synch_representation_size = n_synch
         elif self.neuron_select_type in ('first-last', 'random'):

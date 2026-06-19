@@ -24,7 +24,9 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
                  prediction_reshaper=[-1],
                  dropout=0,
                  neuron_select_type='first-last',
-                 n_random_pairing_self=256
+                 n_random_pairing_self=256,
+                 synch_gate_mode='fixed',
+                 synch_gate_temp=1.0,
                  ):
         super().__init__(
             iterations=iterations,
@@ -45,6 +47,8 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
             n_random_pairing_self=n_random_pairing_self,
             backbone_type='none',
             positional_embedding_type='none',
+            synch_gate_mode=synch_gate_mode,
+            synch_gate_temp=synch_gate_temp,
         )
 
         # --- Core Parameters ---

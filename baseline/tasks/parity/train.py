@@ -49,6 +49,10 @@ def parse_args():
     parser.add_argument('--n_synch_action', type=int, default=32, help='Number of neurons for action sync.')
     parser.add_argument('--neuron_select_type', type=str, default='random', choices=['first-last', 'random', 'random-pairing'], help='Protocol for selecting neuron subset.')
     parser.add_argument('--n_random_pairing_self', type=int, default=256, help='Number of neurons paired self-to-self for synch.')
+    parser.add_argument('--synch_gate_mode', type=str, default='fixed', choices=['fixed', 'soft'],
+                        help='Synch subspace selection: fixed=legacy random-pairing indices (su00); soft=learnable softmax gates (su01).')
+    parser.add_argument('--synch_gate_temp', type=float, default=1.0,
+                        help='Softmax temperature for synch_gate_mode=soft. Lower=peakier (closer to hard indexing).')
     parser.add_argument('--iterations', type=int, default=75, help='Number of internal ticks.')
     parser.add_argument('--memory_length', type=int, default=25, help='Length of pre-activation history for NLMs.')
     parser.add_argument('--deep_memory', action=argparse.BooleanOptionalAction, default=True, help='Use deep NLMs.')

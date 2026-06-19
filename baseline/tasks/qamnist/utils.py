@@ -37,6 +37,8 @@ def prepare_model(args, device):
         dropout=args.dropout,          
         neuron_select_type=args.neuron_select_type,
         n_random_pairing_self=args.n_random_pairing_self,
+        synch_gate_mode=getattr(args, 'synch_gate_mode', 'fixed'),
+        synch_gate_temp=getattr(args, 'synch_gate_temp', 1.0),
         iterations_per_digit=args.q_num_repeats_per_input,
         iterations_per_question_part=args.q_num_repeats_per_input,
         iterations_for_answering=args.q_num_answer_steps,

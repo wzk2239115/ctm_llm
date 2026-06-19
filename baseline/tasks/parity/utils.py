@@ -25,6 +25,8 @@ def prepare_model(prediction_reshaper, args, device):
             dropout=args.dropout,          
             neuron_select_type=args.neuron_select_type,
             n_random_pairing_self=args.n_random_pairing_self,
+            synch_gate_mode=getattr(args, 'synch_gate_mode', 'fixed'),
+            synch_gate_temp=getattr(args, 'synch_gate_temp', 1.0),
         ).to(device)
     elif args.model_type == 'lstm':
         model = LSTMBaseline(
