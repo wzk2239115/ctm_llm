@@ -344,9 +344,10 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
     pending = list(experiments)
     done, failed = [], []
     t0 = time.time()
+    rr = 0
 
     print(f"GPUs: {gpus} x {total_gb:.0f}GB (cap {cap_gb:.0f}GB/GPU, "
-          f"live nvidia-smi check, OOM retry x{max_retries})")
+          f"round-robin + live nvidia-smi, OOM retry x{max_retries})")
 
     while pending or running:
         free_map = _gpu_free_map()
@@ -354,12 +355,12 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
             exp = pending[0]
             est = _est_gb(exp)
             placed = False
-            for gpu in range(gpus):
+            for offset in range(gpus):
+                gpu = (rr + offset) % gpus
                 if gpu_n[gpu] >= gpu_max_slots[gpu]:
                     continue
                 free_gb = free_map.get(gpu, cap_gb)
-                need_gb = est * 1.3
-                if free_gb < need_gb:
+                if free_gb < est * 1.3:
                     continue
                 pending.pop(0)
                 edir = log_root / exp.name
@@ -370,8 +371,10 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
                                          stderr=subprocess.STDOUT, cwd=str(ROOT))
                 running[proc.pid] = (exp, proc, logfile, gpu, est, edir)
                 gpu_n[gpu] += 1
+                free_map[gpu] = max(0, free_gb - est)
+                rr = (gpu + 1) % gpus
                 print(f"[GPU {gpu}] START {exp.name}  ({len(running)} running, "
-                      f"free={free_gb:.0f}GB est={est:.1f}GB, "
+                      f"free={free_gb:.0f}GB est={est:.1f}GB n={gpu_n[gpu]}, "
                       f"elapsed {time.time()-t0:.0f}s)")
                 placed = True
                 break
