@@ -24,6 +24,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve(path):
+    p = Path(path)
+    return p if p.is_absolute() else ROOT / p
+
 # ═══════════════════════════════════════════════════
 # Per-task base configs (CTM paper defaults)
 # ═══════════════════════════════════════════════════
@@ -261,7 +268,7 @@ def build_cmd(exp: Experiment, gpu: int, log_dir: str) -> str:
 
 def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False):
     """Run experiments in parallel on N GPUs. Blocks until all done."""
-    log_root = Path(log_root)
+    log_root = _resolve(log_root)
     log_root.mkdir(parents=True, exist_ok=True)
 
     if dry_run:
@@ -289,7 +296,8 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False):
             edir.mkdir(parents=True, exist_ok=True)
             logfile = open(edir / "train.log", "w")
             cmd = build_cmd(exp, gpu, str(edir))
-            proc = subprocess.Popen(cmd, shell=True, stdout=logfile, stderr=subprocess.STDOUT)
+            proc = subprocess.Popen(cmd, shell=True, stdout=logfile, stderr=subprocess.STDOUT,
+                                     cwd=str(ROOT))
             running[gpu] = (exp, proc, logfile)
             print(f"[GPU {gpu}] START {exp.name}  (elapsed {time.time()-t0:.0f}s)")
 
@@ -322,7 +330,7 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False):
 def status(log_root="logs/deep"):
     """Quick progress snapshot of all experiments under log_root."""
     import glob
-    log_root = Path(log_root)
+    log_root = _resolve(log_root)
     if not log_root.exists():
         print(f"{log_root} does not exist yet")
         return
@@ -369,7 +377,7 @@ def collect(log_root="logs/deep"):
     """Load best_test_acc from each experiment's latest checkpoint."""
     import torch
     import pandas as pd
-    log_root = Path(log_root)
+    log_root = _resolve(log_root)
     rows = []
     for edir in sorted(log_root.iterdir()):
         if not edir.is_dir():
