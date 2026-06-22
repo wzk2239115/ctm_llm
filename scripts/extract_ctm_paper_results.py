@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-LOGS = ROOT / "logs" / "ctm_paper"
+DEFAULT_LOGS = "logs/ctm_paper"
 OUT_DIR = ROOT / "runs" / "metrics"
 
 # args dumped for each row (sweep-related knobs + key training hyperparams)
@@ -166,12 +166,20 @@ def collect(cli):
     stages = None if cli.stages == "all" else set(cli.stages.split(","))
     tasks = None if cli.tasks == "all" else set(cli.tasks.split(","))
 
+    logs_path = Path(cli.logs)
+    if not logs_path.is_absolute():
+        logs_path = ROOT / logs_path
+
     rows = []
     curves = {}
     t0 = time.time()
     n_ok = n_err = 0
 
-    for stage_dir in sorted(LOGS.iterdir()):
+    if not logs_path.exists():
+        print(f"ERROR: {logs_path} does not exist")
+        return rows, curves, 0, 0, time.time() - t0
+
+    for stage_dir in sorted(logs_path.iterdir()):
         if not stage_dir.is_dir():
             continue
         stage = stage_dir.name
@@ -298,21 +306,28 @@ def write_markdown(cli, rows):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--csv", default=str(OUT_DIR / "ctm_paper_summary.csv"))
-    ap.add_argument("--md", default=str(OUT_DIR / "ctm_paper_summary.md"))
+    ap.add_argument("--logs", default=DEFAULT_LOGS,
+                    help=f"root dir of experiment checkpoints (default: {DEFAULT_LOGS})")
+    ap.add_argument("--csv", default=None,
+                    help="output CSV path (default: runs/metrics/<logs_name>_summary.csv)")
+    ap.add_argument("--md", default=None,
+                    help="output Markdown path (default: runs/metrics/<logs_name>_summary.md)")
     ap.add_argument("--stages", default="all", help="comma-separated stage ids")
     ap.add_argument("--tasks", default="all", help="comma-separated task names")
     ap.add_argument("--limit", type=int, default=0, help="0 = no limit (smoke test: --limit 5)")
     ap.add_argument("--no-args", action="store_true", help="skip args dump (faster)")
     ap.add_argument("--curves", action="store_true",
-                    help="also dump full test_acc curves to runs/metrics/ctm_paper_curves.json")
+                    help="also dump full test_acc curves to runs/metrics/<logs_name>_curves.json")
     cli = ap.parse_args()
 
-    if not LOGS.exists():
-        print(f"ERROR: {LOGS} does not exist")
-        return
-
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    logs_name = Path(cli.logs.rstrip("/")).name or "results"
+    if cli.csv is None:
+        cli.csv = str(OUT_DIR / f"{logs_name}_summary.csv")
+    if cli.md is None:
+        cli.md = str(OUT_DIR / f"{logs_name}_summary.md")
+
     rows, curves, n_ok, n_err, elapsed = collect(cli)
 
     if not rows:
@@ -326,9 +341,10 @@ def main():
     print(f"=== MD   -> {cli.md}")
 
     if cli.curves and curves:
-        with open(OUT_DIR / "ctm_paper_curves.json", "w") as f:
+        curves_path = OUT_DIR / f"{logs_name}_curves.json"
+        with open(curves_path, "w") as f:
             json.dump(curves, f)
-        print(f"=== curves -> {OUT_DIR / 'ctm_paper_curves.json'} ({len(curves)} runs)")
+        print(f"=== curves -> {curves_path} ({len(curves)} runs)")
 
     print(f"=== ok={n_ok} err={n_err} elapsed={elapsed:.1f}s")
 
