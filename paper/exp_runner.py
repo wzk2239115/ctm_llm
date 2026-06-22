@@ -287,7 +287,18 @@ def build_cmd(exp: Experiment, gpu: int, log_dir: str) -> str:
     return " ".join(parts)
 
 
-def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0.80):
+def _check_oom(log_path):
+    try:
+        content = log_path.read_text(errors="replace")
+        return any(kw in content for kw in [
+            "OutOfMemoryError", "out of memory", "CUBLAS_STATUS_ALLOC_FAILED",
+        ])
+    except Exception:
+        return False
+
+
+def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0.80,
+            max_retries=2):
     """Run experiments in parallel on N GPUs, multiple per GPU based on VRAM.
 
     Automatically packs experiments onto GPUs by estimated memory usage.
@@ -296,14 +307,14 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
     log_root = _resolve(log_root)
     log_root.mkdir(parents=True, exist_ok=True)
     total_gb = _total_gpu_gb()
-    budget = total_gb * mem_util
+    init_budget = total_gb * mem_util
 
     if dry_run:
         max_gb = max(_est_gb(e) for e in experiments)
         min_gb = min(_est_gb(e) for e in experiments)
-        per_gpu_max = max(1, int(budget / max_gb))
+        per_gpu_max = max(1, int(init_budget / max_gb))
         total_parallel = gpus * per_gpu_max
-        print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {budget:.0f}GB/GPU)")
+        print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {init_budget:.0f}GB/GPU)")
         print(f"Task est: {min_gb:.1f}~{max_gb:.1f} GB  =>  ~{per_gpu_max} per GPU = {total_parallel} parallel")
         print(f"Total experiments: {len(experiments)}  =>  ~{len(experiments)/total_parallel:.1f} rounds")
         print()
@@ -317,12 +328,14 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
 
     running = {}
     gpu_used = {g: 0.0 for g in range(gpus)}
+    gpu_budget = {g: init_budget for g in range(gpus)}
+    retry_count = {}
     pending = list(experiments)
     done, failed = [], []
     t0 = time.time()
-    launched = 0
 
-    print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {budget:.0f}GB/GPU)")
+    print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {init_budget:.0f}GB/GPU, "
+          f"OOM auto-retry x{max_retries})")
 
     while pending or running:
         while pending:
@@ -330,7 +343,7 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
             est = _est_gb(exp)
             placed = False
             for gpu in range(gpus):
-                if gpu_used[gpu] + est <= budget:
+                if gpu_used[gpu] + est <= gpu_budget[gpu]:
                     pending.pop(0)
                     edir = log_root / exp.name
                     edir.mkdir(parents=True, exist_ok=True)
@@ -340,10 +353,9 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
                                              stderr=subprocess.STDOUT, cwd=str(ROOT))
                     running[proc.pid] = (exp, proc, logfile, gpu, est, edir)
                     gpu_used[gpu] += est
-                    launched += 1
-                    n_running = len(running)
-                    print(f"[GPU {gpu}] START {exp.name}  ({n_running} running, "
-                          f"GPU{gpu}={gpu_used[gpu]:.0f}GB, elapsed {time.time()-t0:.0f}s)")
+                    print(f"[GPU {gpu}] START {exp.name}  ({len(running)} running, "
+                          f"GPU{gpu}={gpu_used[gpu]:.0f}/{gpu_budget[gpu]:.0f}GB, "
+                          f"elapsed {time.time()-t0:.0f}s)")
                     placed = True
                     break
             if not placed:
@@ -356,25 +368,37 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
                 logfile.close()
                 rc = proc.returncode
                 gpu_used[gpu] -= est
+                log_path = edir / "train.log"
                 if rc == 0:
                     done.append(exp)
                     print(f"[GPU {gpu}] DONE  {exp.name}  (elapsed {time.time()-t0:.0f}s)")
                 else:
-                    failed.append(exp)
-                    log_path = edir / "train.log"
-                    err_tail = ""
-                    try:
-                        lines = log_path.read_text(errors="replace").strip().split("\n")
-                        err_tail = "\n".join(lines[-8:])
-                    except Exception:
-                        pass
-                    print(f"[GPU {gpu}] FAIL  {exp.name}  (rc={rc})")
-                    if err_tail:
-                        print(f"  {'─'*50}")
-                        for line in err_tail.split("\n"):
-                            print(f"  {line}")
-                        print(f"  {'─'*50}")
-                    print(f"  log: {log_path}")
+                    is_oom = _check_oom(log_path)
+                    retries = retry_count.get(exp.name, 0)
+                    if is_oom and retries < max_retries:
+                        retry_count[exp.name] = retries + 1
+                        old = gpu_budget[gpu]
+                        gpu_budget[gpu] = max(old * 0.75, total_gb * 0.35)
+                        pending.append(exp)
+                        print(f"[GPU {gpu}] OOM  {exp.name}  "
+                              f"(retry {retries+1}/{max_retries}, "
+                              f"GPU{gpu} budget {old:.0f}->{gpu_budget[gpu]:.0f}GB)")
+                    else:
+                        failed.append(exp)
+                        err_tail = ""
+                        try:
+                            lines = log_path.read_text(errors="replace").strip().split("\n")
+                            err_tail = "\n".join(lines[-8:])
+                        except Exception:
+                            pass
+                        kind = "OOM" if is_oom else "FAIL"
+                        print(f"[GPU {gpu}] {kind}  {exp.name}  (rc={rc})")
+                        if err_tail:
+                            print(f"  {'─'*50}")
+                            for line in err_tail.split("\n"):
+                                print(f"  {line}")
+                            print(f"  {'─'*50}")
+                        print(f"  log: {log_path}")
                 del running[pid]
                 finished = True
 
