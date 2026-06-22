@@ -269,7 +269,7 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False):
             gpu = i % gpus
             edir = log_root / exp.name
             cmd = build_cmd(exp, gpu, str(edir))
-            print(f"[GPU {gpu}] {exp.name}\n  {cmd[:120]}...")
+            print(f"[GPU {gpu}] {exp.name}\n  {cmd}")
         print(f"\n({len(experiments)} experiments, dry-run only)")
         return
 
