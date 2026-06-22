@@ -426,6 +426,7 @@ def plot_delta_bars(df, title="Experiments vs baseline", savepath=None):
     ax.grid(True, axis="x", alpha=0.2)
     fig.tight_layout()
     if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
 
@@ -508,6 +509,7 @@ def plot_prior_bar(df_prior, tasks, stage, sweep, title="Prior results", savepat
     ax.grid(True, axis="y", alpha=0.2)
     fig.tight_layout()
     if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
 
@@ -540,6 +542,7 @@ def plot_prior_curves(curves, task, specs, title=None, savepath=None):
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
 
@@ -566,6 +569,7 @@ def plot_box_seeds(df, group_col="task", value_col="best_acc", title="Seed varia
     ax.grid(True, axis="y", alpha=0.2)
     fig.tight_layout()
     if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
 
@@ -617,6 +621,7 @@ def plot_sweep_curve(df, x_col, task_col="task", value_col="best_acc", title="Sw
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
 
@@ -656,5 +661,6 @@ def plot_combo_synergy(df, singles_stages, combo_stage, task, title=None, savepa
     ax.grid(True, axis="y", alpha=0.2)
     fig.tight_layout()
     if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
