@@ -297,8 +297,19 @@ def _check_oom(log_path):
         return False
 
 
+def _gpu_free_map():
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            text=True, stderr=subprocess.DEVNULL)
+        return {int(l.split(",")[0].strip()): int(l.split(",")[1].strip()) / 1024
+                for l in out.strip().splitlines() if "," in l}
+    except Exception:
+        return {}
+
+
 def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0.80,
-            max_retries=2):
+            max_retries=2, poll_interval=3):
     """Run experiments in parallel on N GPUs, multiple per GPU based on VRAM.
 
     Automatically packs experiments onto GPUs by estimated memory usage.
@@ -307,14 +318,14 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
     log_root = _resolve(log_root)
     log_root.mkdir(parents=True, exist_ok=True)
     total_gb = _total_gpu_gb()
-    init_budget = total_gb * mem_util
+    cap_gb = total_gb * mem_util
 
     if dry_run:
         max_gb = max(_est_gb(e) for e in experiments)
         min_gb = min(_est_gb(e) for e in experiments)
-        per_gpu_max = max(1, int(init_budget / max_gb))
+        per_gpu_max = max(1, int(cap_gb / max_gb))
         total_parallel = gpus * per_gpu_max
-        print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {init_budget:.0f}GB/GPU)")
+        print(f"GPUs: {gpus} x {total_gb:.0f}GB (cap {cap_gb:.0f}GB/GPU)")
         print(f"Task est: {min_gb:.1f}~{max_gb:.1f} GB  =>  ~{per_gpu_max} per GPU = {total_parallel} parallel")
         print(f"Total experiments: {len(experiments)}  =>  ~{len(experiments)/total_parallel:.1f} rounds")
         print()
@@ -327,37 +338,43 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
         return
 
     running = {}
-    gpu_used = {g: 0.0 for g in range(gpus)}
-    gpu_budget = {g: init_budget for g in range(gpus)}
+    gpu_n = {g: 0 for g in range(gpus)}
+    gpu_max_slots = {g: 999 for g in range(gpus)}
     retry_count = {}
     pending = list(experiments)
     done, failed = [], []
     t0 = time.time()
 
-    print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {init_budget:.0f}GB/GPU, "
-          f"OOM auto-retry x{max_retries})")
+    print(f"GPUs: {gpus} x {total_gb:.0f}GB (cap {cap_gb:.0f}GB/GPU, "
+          f"live nvidia-smi check, OOM retry x{max_retries})")
 
     while pending or running:
+        free_map = _gpu_free_map()
         while pending:
             exp = pending[0]
             est = _est_gb(exp)
             placed = False
             for gpu in range(gpus):
-                if gpu_used[gpu] + est <= gpu_budget[gpu]:
-                    pending.pop(0)
-                    edir = log_root / exp.name
-                    edir.mkdir(parents=True, exist_ok=True)
-                    logfile = open(edir / "train.log", "w")
-                    cmd = build_cmd(exp, gpu, str(edir))
-                    proc = subprocess.Popen(cmd, shell=True, stdout=logfile,
-                                             stderr=subprocess.STDOUT, cwd=str(ROOT))
-                    running[proc.pid] = (exp, proc, logfile, gpu, est, edir)
-                    gpu_used[gpu] += est
-                    print(f"[GPU {gpu}] START {exp.name}  ({len(running)} running, "
-                          f"GPU{gpu}={gpu_used[gpu]:.0f}/{gpu_budget[gpu]:.0f}GB, "
-                          f"elapsed {time.time()-t0:.0f}s)")
-                    placed = True
-                    break
+                if gpu_n[gpu] >= gpu_max_slots[gpu]:
+                    continue
+                free_gb = free_map.get(gpu, cap_gb)
+                need_gb = est * 1.3
+                if free_gb < need_gb:
+                    continue
+                pending.pop(0)
+                edir = log_root / exp.name
+                edir.mkdir(parents=True, exist_ok=True)
+                logfile = open(edir / "train.log", "w")
+                cmd = build_cmd(exp, gpu, str(edir))
+                proc = subprocess.Popen(cmd, shell=True, stdout=logfile,
+                                         stderr=subprocess.STDOUT, cwd=str(ROOT))
+                running[proc.pid] = (exp, proc, logfile, gpu, est, edir)
+                gpu_n[gpu] += 1
+                print(f"[GPU {gpu}] START {exp.name}  ({len(running)} running, "
+                      f"free={free_gb:.0f}GB est={est:.1f}GB, "
+                      f"elapsed {time.time()-t0:.0f}s)")
+                placed = True
+                break
             if not placed:
                 break
 
@@ -367,7 +384,7 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
             if proc.poll() is not None:
                 logfile.close()
                 rc = proc.returncode
-                gpu_used[gpu] -= est
+                gpu_n[gpu] -= 1
                 log_path = edir / "train.log"
                 if rc == 0:
                     done.append(exp)
@@ -377,12 +394,12 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
                     retries = retry_count.get(exp.name, 0)
                     if is_oom and retries < max_retries:
                         retry_count[exp.name] = retries + 1
-                        old = gpu_budget[gpu]
-                        gpu_budget[gpu] = max(old * 0.75, total_gb * 0.35)
-                        pending.append(exp)
+                        if gpu_n[gpu] + 1 > 1:
+                            gpu_max_slots[gpu] = max(1, gpu_n[gpu])
+                        pending.insert(0, exp)
                         print(f"[GPU {gpu}] OOM  {exp.name}  "
                               f"(retry {retries+1}/{max_retries}, "
-                              f"GPU{gpu} budget {old:.0f}->{gpu_budget[gpu]:.0f}GB)")
+                              f"GPU{gpu} max_slots -> {gpu_max_slots[gpu]})")
                     else:
                         failed.append(exp)
                         err_tail = ""
@@ -391,7 +408,7 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
                             err_tail = "\n".join(lines[-8:])
                         except Exception:
                             pass
-                        kind = "OOM" if is_oom else "FAIL"
+                        kind = "OOM-final" if is_oom else "FAIL"
                         print(f"[GPU {gpu}] {kind}  {exp.name}  (rc={rc})")
                         if err_tail:
                             print(f"  {'─'*50}")
@@ -403,7 +420,7 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
                 finished = True
 
         if not finished:
-            time.sleep(2)
+            time.sleep(poll_interval)
 
     print(f"\n{'='*60}")
     print(f"Finished: {len(done)} ok, {len(failed)} failed, {time.time()-t0:.0f}s total")
