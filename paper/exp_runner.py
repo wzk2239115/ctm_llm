@@ -664,3 +664,175 @@ def plot_combo_synergy(df, singles_stages, combo_stage, task, title=None, savepa
         Path(savepath).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
+
+
+# ═════════════════════════════════════════════════════════════════
+# Paper-grade: heatmaps, ablations, significance tests, sweep builders
+# ═════════════════════════════════════════════════════════════════
+
+def plot_sweep_heatmap(df, x_col, y_col="task", value_col="best_acc",
+                        title="Hyperparameter sweep", savepath=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if df.empty or value_col not in df:
+        print("no data"); return
+    dv = df.dropna(subset=[value_col, x_col]).copy()
+    x_vals = sorted(dv[x_col].unique())
+    y_vals = sorted(dv[y_col].unique())
+    mat = np.full((len(y_vals), len(x_vals)), np.nan)
+    for i, yv in enumerate(y_vals):
+        bl = BASELINE_ACC.get(yv)
+        for j, xv in enumerate(x_vals):
+            sub = dv[(dv[y_col] == yv) & (dv[x_col] == xv)]
+            if not sub.empty:
+                v = sub[value_col].mean()
+                mat[i, j] = (v - bl) * 100 if bl else v * 100
+    fig, ax = plt.subplots(figsize=(max(7, len(x_vals) * 1.2), max(3, len(y_vals) * 0.8)))
+    finite = mat[~np.isnan(mat)]
+    vmax = max(abs(finite.min()), abs(finite.max()), 5) if len(finite) else 5
+    im = ax.imshow(mat, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
+    ax.set_xticks(range(len(x_vals))); ax.set_xticklabels([str(v) for v in x_vals], fontsize=10)
+    ax.set_yticks(range(len(y_vals))); ax.set_yticklabels(y_vals, fontsize=11)
+    for i in range(len(y_vals)):
+        for j in range(len(x_vals)):
+            if not np.isnan(mat[i, j]):
+                c = "white" if abs(mat[i, j]) > vmax * 0.6 else "black"
+                ax.text(j, i, f"{mat[i, j]:+.1f}", ha="center", va="center", fontsize=9, fontweight="bold", color=c)
+            else:
+                ax.text(j, i, "-", ha="center", fontsize=10, color="gray")
+    ax.set_xlabel(x_col, fontsize=11)
+    plt.colorbar(im, ax=ax, shrink=0.8, label="delta vs baseline (pp)")
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def significance_test(df_treat, df_control=None, value_col="best_acc", group_col="task"):
+    import pandas as pd
+    from scipy import stats as sp_stats
+    rows = []
+    use_const = df_control is None
+    tasks = sorted(df_treat[group_col].unique()) if group_col in df_treat else []
+    for task in tasks:
+        treat = df_treat[df_treat[group_col] == task][value_col].dropna()
+        if use_const:
+            ctrl_mean = BASELINE_ACC.get(task)
+            if ctrl_mean is None or len(treat) < 2:
+                continue
+            t_stat, p_val = sp_stats.ttest_1samp(treat, ctrl_mean)
+        else:
+            ctrl = df_control[df_control[group_col] == task][value_col].dropna()
+            if len(treat) < 2 or len(ctrl) < 2:
+                continue
+            ctrl_mean = ctrl.mean()
+            t_stat, p_val = sp_stats.ttest_ind(treat, ctrl)
+        delta = treat.mean() - ctrl_mean
+        sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+        rows.append(dict(task=task, mean=f"{treat.mean()*100:.2f}%", std=f"{treat.std(ddof=1)*100:.2f}",
+                         delta=f"{delta*100:+.2f}pp", p=f"{p_val:.4f}", sig=sig, n=len(treat)))
+    return pd.DataFrame(rows)
+
+
+def plot_ablation_bars(df, ablation_col="variant", value_col="best_acc",
+                        task_col="task", title="Ablation study", savepath=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if df.empty or value_col not in df:
+        print("no data"); return
+    variants = sorted(df[ablation_col].unique())
+    tasks = sorted(df[task_col].unique())
+    x = np.arange(len(tasks)); n = len(variants); w = 0.75 / max(n, 1)
+    fig, ax = plt.subplots(figsize=(max(9, len(tasks) * 2), 5.5))
+    cmap = plt.cm.Set2(np.linspace(0, 1, max(n, 1)))
+    for i, var in enumerate(variants):
+        means, stds = [], []
+        for task in tasks:
+            sub = df[(df[ablation_col] == var) & (df[task_col] == task)]
+            means.append(sub[value_col].mean() * 100 if not sub.empty else 0)
+            stds.append(sub[value_col].std(ddof=1) * 100 if len(sub) > 1 else 0)
+        ax.bar(x + i*w - 0.375 + w/2, means, w, yerr=stds, capsize=3,
+               label=var, color=cmap[i], edgecolor="black", lw=0.4, alpha=0.85)
+    ax.set_xticks(x); ax.set_xticklabels(tasks, fontsize=11)
+    ax.set_ylabel("best test acc (%)", fontsize=11)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(fontsize=9); ax.grid(True, axis="y", alpha=0.2)
+    fig.tight_layout()
+    if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def make_revise_sweep(tasks, seeds):
+    """2D sweep: revise_weight x corrupt_prob."""
+    exps = []
+    for task in tasks:
+        for w in [0.05, 0.1, 0.2, 0.3]:
+            for cp in [0.05, 0.15, 0.30]:
+                for s in seeds:
+                    e = dict(seed=s, draft_mode="revise", draft_block_size=2,
+                             draft_revise_weight=w, draft_corrupt_prob=cp)
+                    ws, cs = str(w).replace(".", "p"), str(cp).replace(".", "p")
+                    exps.append(_exp(task, f"swp_w{ws}_cp{cs}_s{s}", e, ["sweep"]))
+    return exps
+
+
+def make_jepa_sweep(tasks, seeds):
+    exps = []
+    for task in tasks:
+        for w in [0.02, 0.05, 0.1, 0.2, 0.3, 0.5]:
+            for s in seeds:
+                e = dict(seed=s, cross_tick_jepa_weight=w,
+                         cross_tick_jepa_hidden_dim=128, cross_tick_jepa_predictor_depth=2,
+                         cross_tick_jepa_dropout=0.0)
+                exps.append(_exp(task, f"swp_w{str(w).replace('.','p')}_s{s}", e, ["sweep"]))
+    return exps
+
+
+def make_sparsity_sweep(tasks, seeds):
+    exps = []
+    for task in tasks:
+        for r in [0.1, 0.25, 0.5, 0.75, 0.9]:
+            for s in seeds:
+                exps.append(_exp(task, f"swp_r{str(r).replace('.','p')}_s{s}",
+                                 dict(seed=s, topk_neurons=r), ["sweep"]))
+    return exps
+
+
+def make_revise_ablation(tasks, seeds):
+    configs = [
+        ("full",           dict(draft_mode="revise", draft_block_size=2, draft_revise_weight=0.1, draft_corrupt_prob=0.15)),
+        ("no_noise",       dict(draft_mode="revise", draft_block_size=2, draft_revise_weight=0.1, draft_corrupt_prob=0.0)),
+        ("no_revise_loss", dict(draft_mode="revise", draft_block_size=2, draft_revise_weight=0.0, draft_corrupt_prob=0.15)),
+        ("block1",         dict(draft_mode="revise", draft_block_size=1, draft_revise_weight=0.1, draft_corrupt_prob=0.15)),
+        ("block3",         dict(draft_mode="revise", draft_block_size=3, draft_revise_weight=0.1, draft_corrupt_prob=0.15)),
+    ]
+    exps = []
+    for task in tasks:
+        for variant, extra in configs:
+            for s in seeds:
+                exps.append(_exp(task, f"abl_{variant}_s{s}", dict(extra, seed=s), ["ablation", variant]))
+    return exps
+
+
+def make_jepa_ablation(tasks, seeds):
+    jb = dict(cross_tick_jepa_hidden_dim=128, cross_tick_jepa_predictor_depth=2,
+              cross_tick_jepa_dropout=0.0, cross_tick_jepa_weight=0.1)
+    configs = [
+        ("full",        dict(jb)),
+        ("loss_mse",    dict(jb, cross_tick_jepa_loss="mse")),
+        ("no_stopgrad", dict(jb, cross_tick_jepa_target_stop_grad=False)),
+        ("depth1",      dict(jb, cross_tick_jepa_predictor_depth=1)),
+        ("depth4",      dict(jb, cross_tick_jepa_predictor_depth=4)),
+        ("hid64",       dict(jb, cross_tick_jepa_hidden_dim=64)),
+        ("hid256",      dict(jb, cross_tick_jepa_hidden_dim=256)),
+    ]
+    exps = []
+    for task in tasks:
+        for variant, extra in configs:
+            for s in seeds:
+                exps.append(_exp(task, f"abl_{variant}_s{s}", dict(extra, seed=s), ["ablation", variant]))
+    return exps
