@@ -428,3 +428,233 @@ def plot_delta_bars(df, title="Experiments vs baseline", savepath=None):
     if savepath:
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.show()
+
+
+# ═══════════════════════════════════════════════════
+# Prior-art loading + advanced multi-figure visualization
+# ═══════════════════════════════════════════════════
+
+def load_prior(csv_path=None):
+    """Load existing ctm_paper_summary.csv for prior-art comparison."""
+    import pandas as pd
+    if csv_path is None:
+        for p in [Path("csv_data"), Path("../csv_data"), Path.cwd().parent / "csv_data"]:
+            if (p / "ctm_paper_summary.csv").exists():
+                csv_path = p / "ctm_paper_summary.csv"
+                break
+    if csv_path is None or not Path(csv_path).exists():
+        return None
+    df = pd.read_csv(csv_path)
+    for c in ["final_iter", "best_test_acc", "final_test_acc", "best_test_acc_mc", "n_points"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    RANDOM = {"cifar10": 0.10, "mazes": 0.10, "parity": 0.55, "qamnist": 0.10, "sort": 0.05}
+    def _ok(r):
+        if pd.isna(r.get("final_iter")) or r.get("final_iter", 0) < 100:
+            return False
+        return r.get("best_test_acc", 0) >= RANDOM.get(r.get("task"), 0.10)
+    df = df[df.apply(_ok, axis=1)].copy()
+    return df
+
+
+def load_prior_curves(curves_path=None):
+    """Load existing ctm_paper_curves.json."""
+    import json
+    if curves_path is None:
+        for p in [Path("csv_data"), Path("../csv_data"), Path.cwd().parent / "csv_data"]:
+            if (p / "ctm_paper_curves.json").exists():
+                curves_path = p / "ctm_paper_curves.json"
+                break
+    if curves_path is None or not Path(curves_path).exists():
+        return None
+    with open(curves_path) as f:
+        return json.load(f)
+
+
+def plot_prior_bar(df_prior, tasks, stage, sweep, title="Prior results", savepath=None):
+    """Baseline vs idea bar chart from prior ctm_paper data (with seed errorbars)."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if df_prior is None:
+        print("no prior data")
+        return
+    bl_vals, idea_vals, idea_errs = [], [], []
+    for t in tasks:
+        bl_vals.append(BASELINE_ACC.get(t, 0) * 100)
+        sub = df_prior[(df_prior.task == t) & (df_prior.stage == stage) & (df_prior.sweep == sweep)]
+        if not sub.empty:
+            idea_vals.append(sub["best_test_acc"].mean() * 100)
+            idea_errs.append(sub["best_test_acc"].std(ddof=1) * 100 if len(sub) > 1 else 0)
+        else:
+            idea_vals.append(0)
+            idea_errs.append(0)
+    x = np.arange(len(tasks))
+    w = 0.35
+    fig, ax = plt.subplots(figsize=(max(8, len(tasks) * 2), 5.5))
+    ax.bar(x - w/2, bl_vals, w, label="paper baseline", color="#bbb", edgecolor="black", lw=0.5)
+    ax.bar(x + w/2, idea_vals, w, yerr=idea_errs, capsize=4,
+           label=stage, color="#2ca02c", edgecolor="black", lw=0.5, alpha=0.85)
+    for i, (b, v) in enumerate(zip(bl_vals, idea_vals)):
+        ax.text(i - w/2, b + 1, f"{b:.1f}", ha="center", fontsize=9)
+        if v > 0:
+            d = v - b
+            ax.text(i + w/2, v + 1, f"{v:.1f}\\n({d:+.1f})", ha="center", fontsize=9,
+                    fontweight="bold", color="#2ca02c" if d >= 0 else "#d62728")
+    ax.set_xticks(x)
+    ax.set_xticklabels(tasks, fontsize=11)
+    ax.set_ylabel("best test acc (%)", fontsize=11)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(True, axis="y", alpha=0.2)
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_prior_curves(curves, task, specs, title=None, savepath=None):
+    """Convergence curves. specs = [(stage, sweep, label, color), ...]"""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if curves is None:
+        print("no curves data")
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for stage, sweep, label, color in specs:
+        keys = [k for k in curves if k.startswith(f"{stage}/{task}_{sweep}")]
+        if not keys:
+            continue
+        all_iters, all_accs = [], []
+        for k in keys:
+            c = curves[k]
+            all_iters.append(c["iters"])
+            all_accs.append([a * 100 for a in c["test_acc"]])
+        min_len = min(len(x) for x in all_iters)
+        iters = all_iters[0][:min_len]
+        accs = np.array([a[:min_len] for a in all_accs]).mean(axis=0)
+        ax.plot(iters, accs, linewidth=2, label=label, color=color)
+    ax.set_xlabel("training iteration", fontsize=11)
+    ax.set_ylabel("test acc (%)", fontsize=11)
+    ax.set_title(title or f"{task} convergence", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_box_seeds(df, group_col="task", value_col="best_acc", title="Seed variance", savepath=None):
+    """Box plot showing seed-to-seed variance per group."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if df.empty or value_col not in df:
+        print("no data")
+        return
+    dv = df.dropna(subset=[value_col]).copy()
+    dv[value_col] = dv[value_col] * 100
+    groups = sorted(dv[group_col].unique())
+    data = [dv[dv[group_col] == g][value_col].values for g in groups]
+    fig, ax = plt.subplots(figsize=(max(8, len(groups) * 1.8), 5.5))
+    bp = ax.boxplot(data, labels=groups, patch_artist=True, showmeans=True,
+                    meanprops=dict(marker="D", markerfacecolor="red", markersize=6))
+    for patch, g in zip(bp["boxes"], groups):
+        patch.set_facecolor(TASK_COLORS.get(g, "#888"))
+        patch.set_alpha(0.6)
+    ax.set_ylabel("best test acc (%)", fontsize=11)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.grid(True, axis="y", alpha=0.2)
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def summary_stats(df, groupby=("task",), value_col="best_acc"):
+    """Mean +/- std summary table with delta vs baseline."""
+    import pandas as pd
+    if df.empty or value_col not in df:
+        return None
+    dv = df.dropna(subset=[value_col]).copy()
+    dv[value_col] = dv[value_col] * 100
+    g = dv.groupby(list(groupby))[value_col]
+    result = g.agg(["count", "mean", "std", "min", "max"]).round(2)
+    deltas = []
+    for idx in result.index:
+        task = idx[0] if isinstance(idx, tuple) else idx
+        bl = BASELINE_ACC.get(task)
+        deltas.append(f"{result.loc[idx, 'mean'] - bl*100:+.2f}pp" if bl else "-")
+    result["delta_vs_bl"] = deltas
+    result.columns = ["seeds", "mean_acc", "std_acc", "min_acc", "max_acc", "delta_vs_bl"]
+    return result
+
+
+def plot_sweep_curve(df, x_col, task_col="task", value_col="best_acc", title="Sweep", savepath=None):
+    """Sweep curve with errorbar per task."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if df.empty or value_col not in df:
+        print("no data")
+        return
+    dv = df.dropna(subset=[value_col, x_col]).copy()
+    dv[value_col] = dv[value_col] * 100
+    tasks = sorted(dv[task_col].unique())
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for task in tasks:
+        sub = dv[dv[task_col] == task]
+        xs = sorted(sub[x_col].unique())
+        means = [sub[sub[x_col] == x][value_col].mean() for x in xs]
+        stds = [sub[sub[x_col] == x][value_col].std(ddof=1) if len(sub[sub[x_col] == x]) > 1 else 0 for x in xs]
+        ax.errorbar(xs, means, yerr=stds, fmt="-o", color=TASK_COLORS.get(task, "#888"),
+                    linewidth=2, markersize=8, capsize=5, label=task)
+        bl = BASELINE_ACC.get(task)
+        if bl:
+            ax.axhline(bl * 100, color=TASK_COLORS.get(task, "#888"), ls=":", alpha=0.3, lw=1)
+    ax.set_xlabel(x_col, fontsize=11)
+    ax.set_ylabel("best test acc (%)", fontsize=11)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+def plot_combo_synergy(df, singles_stages, combo_stage, task, title=None, savepath=None):
+    """Compare combo vs best single vs baseline for a task."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    bl = BASELINE_ACC.get(task, 0) * 100
+    labels, vals, colors = ["baseline"], [bl], ["#bbb"]
+    best_single = 0
+    for stage in singles_stages:
+        sub = df[(df.task == task) & (df.stage == stage)]
+        if not sub.empty:
+            v = sub["best_acc"].mean() * 100
+            labels.append(stage)
+            vals.append(v)
+            colors.append("#2ca02c")
+            best_single = max(best_single, v)
+    sub_c = df[(df.task == task) & (df.stage == combo_stage)]
+    if not sub_c.empty:
+        labels.append(combo_stage)
+        vals.append(sub_c["best_acc"].mean() * 100)
+        colors.append("#d62728")
+    x = range(len(labels))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x, vals, color=colors, edgecolor="black", lw=0.5, alpha=0.85)
+    for i, v in enumerate(vals):
+        ax.text(i, v + 1, f"{v:.1f}", ha="center", fontsize=10, fontweight="bold")
+    ax.axhline(best_single, color="#2ca02c", ls="--", alpha=0.5, label=f"best single ({best_single:.1f}%)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, fontsize=9)
+    ax.set_ylabel("best test acc (%)", fontsize=11)
+    ax.set_title(title or f"{task}: combo vs singles", fontsize=13, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y", alpha=0.2)
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
