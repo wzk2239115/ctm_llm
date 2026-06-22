@@ -31,6 +31,27 @@ def _resolve(path):
     p = Path(path)
     return p if p.is_absolute() else ROOT / p
 
+
+def _total_gpu_gb():
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            text=True, stderr=subprocess.DEVNULL)
+        return int(out.splitlines()[0].strip()) / 1024
+    except Exception:
+        return 80.0
+
+
+def _est_gb(exp):
+    d_model = exp.config.get("d_model", 512) or 512
+    gb = max(2.0, d_model * 0.01)
+    jw = exp.config.get("cross_tick_jepa_weight", 0)
+    if jw and float(jw) > 0:
+        gb *= 1.3
+    if exp.config.get("draft_mode") == "revise":
+        gb *= 1.15
+    return gb
+
 # ═══════════════════════════════════════════════════
 # Per-task base configs (CTM paper defaults)
 # ═══════════════════════════════════════════════════
@@ -266,46 +287,75 @@ def build_cmd(exp: Experiment, gpu: int, log_dir: str) -> str:
     return " ".join(parts)
 
 
-def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False):
-    """Run experiments in parallel on N GPUs. Blocks until all done."""
+def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0.80):
+    """Run experiments in parallel on N GPUs, multiple per GPU based on VRAM.
+
+    Automatically packs experiments onto GPUs by estimated memory usage.
+    e.g. 80GB H100 + d_model=512 (~6GB/task) => ~10 parallel per GPU.
+    """
     log_root = _resolve(log_root)
     log_root.mkdir(parents=True, exist_ok=True)
+    total_gb = _total_gpu_gb()
+    budget = total_gb * mem_util
 
     if dry_run:
-        for i, exp in enumerate(experiments):
-            gpu = i % gpus
-            edir = log_root / exp.name
-            cmd = build_cmd(exp, gpu, str(edir))
-            print(f"[GPU {gpu}] {exp.name}\n  {cmd}")
+        max_gb = max(_est_gb(e) for e in experiments)
+        min_gb = min(_est_gb(e) for e in experiments)
+        per_gpu_max = max(1, int(budget / max_gb))
+        total_parallel = gpus * per_gpu_max
+        print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {budget:.0f}GB/GPU)")
+        print(f"Task est: {min_gb:.1f}~{max_gb:.1f} GB  =>  ~{per_gpu_max} per GPU = {total_parallel} parallel")
+        print(f"Total experiments: {len(experiments)}  =>  ~{len(experiments)/total_parallel:.1f} rounds")
+        print()
+        for i, exp in enumerate(experiments[:5]):
+            est = _est_gb(exp)
+            print(f"  [{exp.name}] est={est:.1f}GB")
+        if len(experiments) > 5:
+            print(f"  ... ({len(experiments)-5} more)")
         print(f"\n({len(experiments)} experiments, dry-run only)")
         return
 
     running = {}
+    gpu_used = {g: 0.0 for g in range(gpus)}
     pending = list(experiments)
     done, failed = [], []
     t0 = time.time()
+    launched = 0
+
+    print(f"GPUs: {gpus} x {total_gb:.0f}GB (budget {budget:.0f}GB/GPU)")
 
     while pending or running:
-        while pending and len(running) < gpus:
-            free = [g for g in range(gpus) if g not in running]
-            if not free:
+        while pending:
+            exp = pending[0]
+            est = _est_gb(exp)
+            placed = False
+            for gpu in range(gpus):
+                if gpu_used[gpu] + est <= budget:
+                    pending.pop(0)
+                    edir = log_root / exp.name
+                    edir.mkdir(parents=True, exist_ok=True)
+                    logfile = open(edir / "train.log", "w")
+                    cmd = build_cmd(exp, gpu, str(edir))
+                    proc = subprocess.Popen(cmd, shell=True, stdout=logfile,
+                                             stderr=subprocess.STDOUT, cwd=str(ROOT))
+                    running[proc.pid] = (exp, proc, logfile, gpu, est, edir)
+                    gpu_used[gpu] += est
+                    launched += 1
+                    n_running = len(running)
+                    print(f"[GPU {gpu}] START {exp.name}  ({n_running} running, "
+                          f"GPU{gpu}={gpu_used[gpu]:.0f}GB, elapsed {time.time()-t0:.0f}s)")
+                    placed = True
+                    break
+            if not placed:
                 break
-            gpu = free[0]
-            exp = pending.pop(0)
-            edir = log_root / exp.name
-            edir.mkdir(parents=True, exist_ok=True)
-            logfile = open(edir / "train.log", "w")
-            cmd = build_cmd(exp, gpu, str(edir))
-            proc = subprocess.Popen(cmd, shell=True, stdout=logfile, stderr=subprocess.STDOUT,
-                                     cwd=str(ROOT))
-            running[gpu] = (exp, proc, logfile)
-            print(f"[GPU {gpu}] START {exp.name}  (elapsed {time.time()-t0:.0f}s)")
 
-        for gpu in list(running):
-            exp, proc, logfile = running[gpu]
+        finished = False
+        for pid in list(running):
+            exp, proc, logfile, gpu, est, edir = running[pid]
             if proc.poll() is not None:
                 logfile.close()
                 rc = proc.returncode
+                gpu_used[gpu] -= est
                 if rc == 0:
                     done.append(exp)
                     print(f"[GPU {gpu}] DONE  {exp.name}  (elapsed {time.time()-t0:.0f}s)")
@@ -325,9 +375,11 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False):
                             print(f"  {line}")
                         print(f"  {'─'*50}")
                     print(f"  log: {log_path}")
-                del running[gpu]
+                del running[pid]
+                finished = True
 
-        time.sleep(3)
+        if not finished:
+            time.sleep(2)
 
     print(f"\n{'='*60}")
     print(f"Finished: {len(done)} ok, {len(failed)} failed, {time.time()-t0:.0f}s total")
