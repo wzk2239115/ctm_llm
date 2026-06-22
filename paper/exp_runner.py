@@ -311,7 +311,20 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False):
                     print(f"[GPU {gpu}] DONE  {exp.name}  (elapsed {time.time()-t0:.0f}s)")
                 else:
                     failed.append(exp)
-                    print(f"[GPU {gpu}] FAIL  {exp.name}  (rc={rc}, elapsed {time.time()-t0:.0f}s)")
+                    log_path = edir / "train.log"
+                    err_tail = ""
+                    try:
+                        lines = log_path.read_text(errors="replace").strip().split("\n")
+                        err_tail = "\n".join(lines[-8:])
+                    except Exception:
+                        pass
+                    print(f"[GPU {gpu}] FAIL  {exp.name}  (rc={rc})")
+                    if err_tail:
+                        print(f"  {'─'*50}")
+                        for line in err_tail.split("\n"):
+                            print(f"  {line}")
+                        print(f"  {'─'*50}")
+                    print(f"  log: {log_path}")
                 del running[gpu]
 
         time.sleep(3)
