@@ -526,8 +526,12 @@ def parse_jepa_weight(sweep):
     return float(m.group(1)) if m else None
 
 
-def fig_jepa_weight(df_complete, out_dir):
-    """st04 jepa_weight scan (0.1, 0.5, 1.0): one line per task."""
+def fig_jepa_weight(df_complete, out_dir, exclude_tasks=None, filename=None):
+    """st04 jepa_weight scan (0.1, 0.5, 1.0): 2x2 bar chart, one panel per task.
+
+    exclude_tasks: list of task names to skip (e.g. ['sort']).
+    filename: output filename (default fig5_jepa_weight.png).
+    """
     sub = df_complete[df_complete["stage"] == "st04"].copy()
     sub["weight"] = sub["sweep"].apply(parse_jepa_weight)
     sub = sub.dropna(subset=["weight"])
@@ -535,38 +539,83 @@ def fig_jepa_weight(df_complete, out_dir):
         print("[fig5] no st04 jepa_weight data")
         return
 
+    exclude_tasks = exclude_tasks or []
     tasks = [t for t in ["cifar10", "mazes", "qamnist", "sort", "parity"]
-             if t in sub["task"].unique()]
-    fig, ax = plt.subplots(figsize=(9, 6.5))
-    for task in tasks:
+             if t in sub["task"].unique() and t not in exclude_tasks]
+    weights_all = [0.1, 0.5, 1.0]
+    bar_colors = ["#2ca02c", "#ff7f0e", "#d62728"]
+
+    n_tasks = len(tasks)
+    ncols = 2
+    nrows = (n_tasks + 1) // 2
+    fig, axes = plt.subplots(nrows, ncols, figsize=(11, 4.5 * nrows),
+                             squeeze=False)
+    axes_flat = axes.flatten()
+
+    for idx, task in enumerate(tasks):
+        ax = axes_flat[idx]
+        bl = BASELINE_PAPER.get(task, 0) * 100
         grp = sub[sub["task"] == task]
         agg = grp.groupby("weight").agg(
             mean=("best_test_acc", "mean"),
             std=("best_test_acc", "std"),
             n=("best_test_acc", "count"),
         ).reset_index().sort_values("weight")
-        x = agg["weight"].values
-        y = agg["mean"].values * 100
-        yerr = agg["std"].fillna(0).values * 100
-        ax.errorbar(x, y, yerr=yerr, marker="o", capsize=5, linewidth=2,
-                    markersize=9, color=TASK_COLORS.get(task, "gray"),
-                    label=f"{task}")
-        for xi, yi, n in zip(x, y, agg["n"].values):
-            ax.annotate(f"n={int(n)}", (xi, yi), textcoords="offset points",
-                        xytext=(8, -2), fontsize=7,
-                        color=TASK_COLORS.get(task, "gray"))
-    ax.set_xscale("log")
-    ax.set_xticks([0.1, 0.5, 1.0])
-    ax.set_xticklabels(["0.1", "0.5", "1.0"])
-    ax.set_xlabel("jepa_weight (auxiliary loss weight, log scale)")
-    ax.set_ylabel("best test acc (%)")
-    ax.set_title("st04: JEPA auxiliary loss weight sweep\n"
-                 "(lower weight = less JEPA regularisation)",
-                 fontsize=12, fontweight="bold")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=9)
-    fig.tight_layout()
-    path = out_dir / "fig5_jepa_weight.png"
+
+        vals, errs, present = [], [], []
+        for w in weights_all:
+            row = agg[agg["weight"] == w]
+            if not row.empty:
+                vals.append(row["mean"].values[0] * 100)
+                errs.append((row["std"].fillna(0).values[0]) * 100)
+                present.append(int(row["n"].values[0]))
+            else:
+                vals.append(0)
+                errs.append(0)
+                present.append(0)
+
+        x = np.arange(len(weights_all))
+        bars = ax.bar(x, vals, 0.55, color=bar_colors, edgecolor="black",
+                      linewidth=0.6, alpha=0.85, zorder=3,
+                      yerr=errs, capsize=4,
+                      error_kw={"elinewidth": 1, "ecolor": "#333"})
+        for i, (v, n) in enumerate(zip(vals, present)):
+            if n > 0:
+                d = v - bl
+                sign = "+" if d >= 0 else ""
+                ax.text(i, v + errs[i] + 1.2,
+                        f"{v:.1f}%\n({sign}{d:.1f}pp)",
+                        ha="center", fontsize=8, fontweight="bold",
+                        color="#2ca02c" if d >= 0 else "#d62728")
+
+        ax.axhline(bl, color="#333333", linestyle="--", linewidth=1.8,
+                   alpha=1.0, zorder=2)
+        ax.text(len(weights_all) - 0.5, bl + 0.6,
+                f"baseline = {bl:.1f}%", fontsize=9, fontweight="bold",
+                color="#333333", ha="right", va="bottom")
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"w={w}" for w in weights_all], fontsize=10)
+        ax.set_ylabel("best test acc (%)", fontsize=10)
+        ax.set_title(task, fontsize=12, fontweight="bold",
+                     color=TASK_COLORS.get(task, "black"))
+        ax.grid(True, axis="y", alpha=0.2)
+        top = max(vals + [bl]) + max(errs) + 8
+        bottom = max(0, min(vals + [bl]) - 10)
+        ax.set_ylim(bottom, top)
+
+    for idx in range(n_tasks, len(axes_flat)):
+        axes_flat[idx].set_visible(False)
+
+    if exclude_tasks:
+        fig.suptitle("st04: JEPA auxiliary loss weight sweep — visual tasks only"
+                     " (bar = mean, errorbar = std)",
+                     fontsize=13, fontweight="bold")
+    else:
+        fig.suptitle("st04: JEPA auxiliary loss weight sweep (bar = mean, errorbar = std)",
+                     fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    path = out_dir / (filename or "fig5_jepa_weight.png")
     fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"[fig5] -> {path}")
@@ -897,6 +946,559 @@ def fig_draft_revise(df_complete, out_dir, min_iter):
     print(f"[fig12] -> {path}")
 
 
+# ============================================================================
+# New figures: fig13-20
+# ============================================================================
+
+# ---- fig13: ideas heatmap (task × idea delta vs baseline) --------------------
+
+# Representative sweep per idea-stage (the "default" or "best" variant)
+IDEA_SWEEPS = {
+    "JEPA":          ("st04", "jepa_w0.1"),
+    "halt":          ("st06", "halt0.6"),
+    "sparsity":      ("st08", "sparsity0.5"),
+    "reflex":        ("st09", "reflex"),
+    "revise":        ("st10", "revise"),
+    "EMA":           ("st12", "ema"),
+    "JEPA+halt":     ("st13", "jepa_halt"),
+}
+IDEA_ORDER = list(IDEA_SWEEPS.keys())
+ALL_TASKS_HEATMAP = ["cifar10", "mazes", "parity", "qamnist", "sort"]
+
+
+def _idea_acc_lookup(df_complete, task, stage, sweep):
+    """Mean best_test_acc for a given (task, stage, sweep), or None."""
+    sub = df_complete[
+        (df_complete["task"] == task) &
+        (df_complete["stage"] == stage) &
+        (df_complete["sweep"] == sweep)
+    ]
+    if sub.empty:
+        return None, 0
+    return sub["best_test_acc"].mean(), len(sub)
+
+
+def fig_ideas_heatmap(df_complete, out_dir):
+    """Task × idea heatmap: best_test_acc (%) and delta vs paper baseline."""
+    # get baselines
+    baselines = {}
+    for task in ALL_TASKS_HEATMAP:
+        val, _ = _idea_acc_lookup(df_complete, task, "st00", "paper")
+        baselines[task] = val
+
+    # build matrices
+    acc_mat = np.full((len(ALL_TASKS_HEATMAP), len(IDEA_ORDER) + 1), np.nan)
+    n_seeds_mat = np.zeros_like(acc_mat, dtype=int)
+    col_labels = ["baseline"] + IDEA_ORDER
+
+    for i, task in enumerate(ALL_TASKS_HEATMAP):
+        # baseline column
+        if baselines[task] is not None:
+            acc_mat[i, 0] = baselines[task]
+            n_seeds_mat[i, 0] = 1
+        # idea columns
+        for j, idea in enumerate(IDEA_ORDER):
+            stage, sweep = IDEA_SWEEPS[idea]
+            val, n = _idea_acc_lookup(df_complete, task, stage, sweep)
+            if val is not None:
+                acc_mat[i, j + 1] = val
+                n_seeds_mat[i, j + 1] = n
+
+    baselines_array = np.array(
+        [baselines.get(t, np.nan) for t in ALL_TASKS_HEATMAP]
+    ).reshape(-1, 1)
+    delta_mat = acc_mat - baselines_array
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 5.5),
+                             gridspec_kw={"width_ratios": [1, 1]})
+
+    # --- Panel A: absolute acc heatmap ---
+    ax = axes[0]
+    mat_pct = acc_mat * 100
+    im = ax.imshow(mat_pct, cmap="RdYlGn", aspect="auto", vmin=0, vmax=100)
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels, rotation=35, ha="right", fontsize=9)
+    ax.set_yticks(range(len(ALL_TASKS_HEATMAP)))
+    ax.set_yticklabels(ALL_TASKS_HEATMAP, fontsize=10)
+    for i in range(mat_pct.shape[0]):
+        for j in range(mat_pct.shape[1]):
+            if np.isnan(mat_pct[i, j]):
+                ax.text(j, i, "—", ha="center", va="center", fontsize=9, color="gray")
+            else:
+                n = n_seeds_mat[i, j]
+                color = "white" if mat_pct[i, j] < 40 else "black"
+                tag = f"{mat_pct[i, j]:.1f}%"
+                if j > 0 and n > 0:
+                    tag += f"\n(n={n})"
+                ax.text(j, i, tag, ha="center", va="center", fontsize=7.5, color=color)
+    ax.set_title("(a) Best test accuracy (%)", fontsize=12, fontweight="bold")
+    plt.colorbar(im, ax=ax, shrink=0.8, label="acc (%)")
+
+    # --- Panel B: delta vs baseline ---
+    ax = axes[1]
+    # mask baseline column (delta = 0)
+    delta_display = delta_mat[:, 1:] * 100  # exclude baseline col
+    vmax_delta = max(abs(np.nanmin(delta_display)), abs(np.nanmax(delta_display)), 10)
+    im2 = ax.imshow(delta_display, cmap="RdBu_r", aspect="auto",
+                    vmin=-vmax_delta, vmax=vmax_delta)
+    ax.set_xticks(range(len(IDEA_ORDER)))
+    ax.set_xticklabels(IDEA_ORDER, rotation=35, ha="right", fontsize=9)
+    ax.set_yticks(range(len(ALL_TASKS_HEATMAP)))
+    ax.set_yticklabels(ALL_TASKS_HEATMAP, fontsize=10)
+    for i in range(delta_display.shape[0]):
+        for j in range(delta_display.shape[1]):
+            if np.isnan(delta_display[i, j]):
+                ax.text(j, i, "—", ha="center", va="center", fontsize=9, color="gray")
+            else:
+                color = "white" if abs(delta_display[i, j]) > vmax_delta * 0.6 else "black"
+                ax.text(j, i, f"{delta_display[i, j]:+.1f}", ha="center", va="center",
+                        fontsize=9, color=color)
+    ax.set_title("(b) Delta vs paper baseline (pp)", fontsize=12, fontweight="bold")
+    plt.colorbar(im2, ax=ax, shrink=0.8, label="delta (pp)")
+
+    fig.suptitle("What helps what? CTM ideas × tasks overview",
+                 fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    path = out_dir / "fig13_ideas_heatmap.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig13] -> {path}")
+
+
+# ---- fig14: JEPA × simplified core interaction (st05) -----------------------
+
+def fig_jepa_simplified(df_complete, out_dir):
+    """st05: JEPA combined with simplified core (sd2_mh2 / tick2) vs components."""
+    sub = df_complete[df_complete["stage"].isin(["st03", "st04", "st05"])].copy()
+
+    # define conditions: (label, stage, sweep)
+    conditions = [
+        ("baseline\n(st00 paper)", "st00", "paper"),
+        ("JEPA\n(st04 w0.1)",     "st04", "jepa_w0.1"),
+        ("simplified\n(st03 sd2_mh2)", "st03", "sd2_mh2"),
+        ("JEPA+simplified\n(st05 jepa_sd2_mh2)", "st05", "jepa_sd2_mh2"),
+        ("JEPA+tick2\n(st05 jepa_tick2)", "st05", "jepa_tick2"),
+        ("JEPA+tick2+simplified\n(st05)", "st05", "jepa_tick2_sd2_mh2"),
+    ]
+    # st00 is not in sub (filter), add separately
+    st00 = df_complete[df_complete["stage"] == "st00"]
+
+    tasks = [t for t in ["cifar10", "parity", "sort"]
+             if t in sub["task"].unique()]
+    n_tasks = len(tasks)
+    fig, axes = plt.subplots(1, n_tasks, figsize=(5.5 * n_tasks, 6), squeeze=False)
+
+    for idx, task in enumerate(tasks):
+        ax = axes[0][idx]
+        labels, means, stds, ns = [], [], [], []
+        for label, stage, sweep in conditions:
+            src = st00 if stage == "st00" else sub
+            grp = src[(src["task"] == task) & (src["stage"] == stage) &
+                      (src["sweep"] == sweep)]
+            if grp.empty:
+                labels.append(label)
+                means.append(0)
+                stds.append(0)
+                ns.append(0)
+            else:
+                labels.append(label)
+                means.append(grp["best_test_acc"].mean() * 100)
+                stds.append(float(grp["best_test_acc"].std(ddof=1)) * 100 if len(grp) > 1 else 0)
+                ns.append(len(grp))
+
+        x = np.arange(len(labels))
+        colors = plt.cm.Set2(np.linspace(0, 0.8, len(labels)))
+        bars = ax.bar(x, means, yerr=stds, capsize=4, color=colors,
+                      alpha=0.85, edgecolor="black", linewidth=0.5)
+        for xi, yi, n in zip(x, means, ns):
+            tag = f"{yi:.1f}%" if n > 0 else "N/A"
+            if n > 0:
+                tag += f"\n(n={n})"
+            ax.annotate(tag, (xi, yi), textcoords="offset points",
+                        xytext=(0, 6), ha="center", fontsize=7.5)
+        # baseline line
+        bl = st00[(st00["task"] == task) & (st00["sweep"] == "paper")]
+        if not bl.empty:
+            ax.axhline(bl["best_test_acc"].values[0] * 100, color="gray",
+                       linestyle="--", alpha=0.6, label="paper baseline")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=7, rotation=20)
+        ax.set_title(f"{task}", fontsize=12, fontweight="bold")
+        ax.set_ylabel("best test acc (%)" if idx == 0 else "")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(fontsize=8)
+
+    fig.suptitle("st05: Does JEPA compound with structural simplification?",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    path = out_dir / "fig14_jepa_simplified.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig14] -> {path}")
+
+
+# ---- fig15: sort failure mode across all stages -----------------------------
+
+def fig_sort_failure(df_complete, out_dir):
+    """Sort task accuracy across ALL stages — shows the dramatic collapse pattern."""
+    sort_df = df_complete[df_complete["task"] == "sort"].copy()
+    if sort_df.empty:
+        print("[fig15] no sort data")
+        return
+
+    # aggregate per (stage, sweep)
+    agg = sort_df.groupby(["stage", "sweep"]).agg(
+        mean=("best_test_acc", "mean"),
+        std=("best_test_acc", "std"),
+        n=("best_test_acc", "count"),
+    ).reset_index()
+
+    # stage order
+    stage_order = sorted(agg["stage"].unique(),
+                         key=lambda s: (int(s[2:])))
+
+    fig, ax = plt.subplots(figsize=(16, 7))
+
+    # jittered strip plot
+    np.random.seed(42)
+    for i, stage in enumerate(stage_order):
+        sub = agg[agg["stage"] == stage].sort_values("sweep")
+        for _, row in sub.iterrows():
+            x_jitter = i + np.random.uniform(-0.15, 0.15)
+            y = row["mean"] * 100
+            color = "#2ca02c" if y > 50 else "#d62728"
+            ax.scatter(x_jitter, y, s=80, color=color, alpha=0.8,
+                       edgecolors="black", linewidths=0.5, zorder=3)
+            # label sweep name
+            offset_y = 3 if y > 50 else -5
+            ax.annotate(f"{row['sweep']}\n({y:.1f}%)", (x_jitter, y),
+                        textcoords="offset points", xytext=(0, offset_y),
+                        ha="center", fontsize=5.5, color=color, alpha=0.8)
+
+    # baseline line
+    bl = sort_df[(sort_df["stage"] == "st00") & (sort_df["sweep"] == "paper")]
+    if not bl.empty:
+        ax.axhline(bl["best_test_acc"].values[0] * 100, color="gray",
+                   linestyle="--", alpha=0.6, linewidth=1.5,
+                   label=f"paper baseline ({bl['best_test_acc'].values[0]*100:.1f}%)")
+
+    # collapse zone
+    ax.axhspan(0, 5, color="red", alpha=0.06, zorder=0)
+    ax.text(len(stage_order) - 0.5, 3, "collapse zone (<5%)",
+            fontsize=9, color="red", alpha=0.6, ha="right")
+
+    ax.set_xticks(range(len(stage_order)))
+    ax.set_xticklabels(stage_order, rotation=45, fontsize=8)
+    ax.set_xlabel("stage", fontsize=11)
+    ax.set_ylabel("best test acc (%)", fontsize=11)
+    ax.set_title("Sort task: dramatic failure across most CTM ideas\n"
+                 "(green = working >50%, red = collapsed <5%)",
+                 fontsize=13, fontweight="bold")
+    ax.set_ylim(-5, 105)
+    ax.grid(True, axis="y", alpha=0.2)
+    ax.legend(fontsize=9, loc="upper left")
+
+    fig.tight_layout()
+    path = out_dir / "fig15_sort_failure.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig15] -> {path}")
+
+
+# ---- fig16: reflex + EMA bar charts -----------------------------------------
+
+def fig_reflex_ema(df_complete, out_dir):
+    """st09 (reflex) and st12 (EMA): side-by-side bar charts vs baseline."""
+    st00 = df_complete[df_complete["stage"] == "st00"]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    for panel_idx, (ax, (stage, idea_name)) in enumerate(zip(
+            axes, [("st09", "reflex"), ("st12", "EMA")])):
+        stage, idea_name = stage, idea_name
+        sub = df_complete[df_complete["stage"] == stage]
+        if sub.empty:
+            ax.text(0.5, 0.5, f"no {stage} data", ha="center", va="center",
+                    transform=ax.transAxes)
+            continue
+
+        tasks_present = [t for t in TASK_ORDER + ["qamnist"]
+                         if t in sub["task"].unique()]
+        labels, means, stds, ns, bl_vals = [], [], [], [], []
+        for task in tasks_present:
+            grp = sub[sub["task"] == task]
+            labels.append(task)
+            means.append(grp["best_test_acc"].mean() * 100)
+            stds.append(float(grp["best_test_acc"].std(ddof=1)) if not pd.isna(grp["best_test_acc"].std(ddof=1)) else 0.0 * 100 if len(grp) > 1 else 0)
+            ns.append(len(grp))
+            bl = st00[(st00["task"] == task) & (st00["sweep"] == "paper")]
+            bl_vals.append(bl["best_test_acc"].values[0] * 100 if not bl.empty else 0)
+
+        x = np.arange(len(labels))
+        width = 0.35
+        colors = [TASK_COLORS.get(t, "gray") for t in labels]
+        bars1 = ax.bar(x - width/2, means, width, yerr=stds, capsize=4,
+                       color=colors, alpha=0.85, edgecolor="black", linewidth=0.5,
+                       label=idea_name)
+        bars2 = ax.bar(x + width/2, bl_vals, width, color="gray", alpha=0.4,
+                       edgecolor="black", linewidth=0.5, label="paper baseline")
+        for xi, yi, n in zip(x - width/2, means, ns):
+            ax.annotate(f"{yi:.1f}%\n(n={n})", (xi, yi),
+                        textcoords="offset points", xytext=(0, 5),
+                        ha="center", fontsize=7.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=10)
+        ax.set_title(f"{stage}: {idea_name} vs baseline", fontsize=12,
+                     fontweight="bold")
+        ax.set_ylabel("best test acc (%)")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(fontsize=9)
+
+    fig.suptitle("Auxiliary training mechanisms (thin data — 1-3 seeds)",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    path = out_dir / "fig16_reflex_ema.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig16] -> {path}")
+
+
+# ---- fig17: per-task idea comparison ----------------------------------------
+
+def fig_ideas_per_task(df_complete, out_dir):
+    """Per-task horizontal bar: each idea vs paper baseline."""
+    st00 = df_complete[df_complete["stage"] == "st00"]
+    tasks = [t for t in TASK_ORDER + ["qamnist"]
+             if t in df_complete["task"].unique()]
+    n_tasks = len(tasks)
+    nrows = (n_tasks + 1) // 2
+    fig, axes = plt.subplots(nrows, 2, figsize=(14, 4.5 * nrows), squeeze=False)
+    axes = axes.flatten()
+
+    for idx, task in enumerate(tasks):
+        ax = axes[idx]
+        bl = st00[(st00["task"] == task) & (st00["sweep"] == "paper")]
+        bl_val = bl["best_test_acc"].values[0] * 100 if not bl.empty else 0
+
+        idea_labels, idea_vals, idea_errs, idea_colors = [], [], [], []
+        for idea_name, (stage, sweep) in IDEA_SWEEPS.items():
+            grp = df_complete[(df_complete["stage"] == stage) &
+                              (df_complete["sweep"] == sweep) &
+                              (df_complete["task"] == task)]
+            if grp.empty:
+                continue
+            idea_labels.append(idea_name)
+            idea_vals.append(grp["best_test_acc"].mean() * 100)
+            idea_errs.append(float(grp["best_test_acc"].std(ddof=1)) if not pd.isna(grp["best_test_acc"].std(ddof=1)) else 0.0 * 100
+                            if len(grp) > 1 else 0)
+            delta = grp["best_test_acc"].mean() - (bl_val / 100)
+            idea_colors.append("#2ca02c" if delta > 0 else "#d62728")
+
+        # add baseline bar
+        all_labels = ["paper baseline"] + idea_labels
+        all_vals = [bl_val] + idea_vals
+        all_errs = [0] + idea_errs
+        all_colors = ["gray"] + idea_colors
+
+        y = np.arange(len(all_labels))
+        ax.barh(y, all_vals, xerr=all_errs, capsize=3, color=all_colors,
+                alpha=0.8, edgecolor="black", linewidth=0.5)
+        for yi, vi in zip(y, all_vals):
+            ax.annotate(f"{vi:.1f}%", (vi, yi), textcoords="offset points",
+                        xytext=(5, 0), va="center", fontsize=8)
+        ax.set_yticks(y)
+        ax.set_yticklabels(all_labels, fontsize=9)
+        ax.set_title(task, fontsize=12, fontweight="bold")
+        ax.set_xlabel("best test acc (%)")
+        ax.grid(True, axis="x", alpha=0.3)
+        ax.invert_yaxis()
+
+    for j in range(n_tasks, len(axes)):
+        axes[j].axis("off")
+
+    fig.suptitle("Per-task idea comparison vs paper baseline",
+                 fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    path = out_dir / "fig17_ideas_per_task.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig17] -> {path}")
+
+
+# ---- fig18: combo ideas (jepa+halt, halt+sparsity) --------------------------
+
+def fig_combo_ideas(df_complete, out_dir):
+    """st13 (jepa+halt) and st15 (halt+sparsity) vs individual components."""
+    st00 = df_complete[df_complete["stage"] == "st00"]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # --- Panel A: JEPA + halt ---
+    ax = axes[0]
+    combo_defs_a = [
+        ("baseline",   "st00", "paper"),
+        ("JEPA",       "st04", "jepa_w0.1"),
+        ("halt",       "st06", "halt0.6"),
+        ("JEPA+halt",  "st13", "jepa_halt"),
+    ]
+    tasks_a = [t for t in TASK_ORDER + ["qamnist"]
+               if t in df_complete[df_complete["stage"] == "st13"]["task"].unique()]
+    x = np.arange(len(tasks_a))
+    width = 0.18
+    for k, (label, stage, sweep) in enumerate(combo_defs_a):
+        vals, errs = [], []
+        for task in tasks_a:
+            grp = df_complete[(df_complete["stage"] == stage) &
+                              (df_complete["sweep"] == sweep) &
+                              (df_complete["task"] == task)]
+            if grp.empty:
+                vals.append(0)
+                errs.append(0)
+            else:
+                vals.append(grp["best_test_acc"].mean() * 100)
+                errs.append(float(grp["best_test_acc"].std(ddof=1)) if not pd.isna(grp["best_test_acc"].std(ddof=1)) else 0.0 * 100
+                           if len(grp) > 1 else 0)
+        ax.bar(x + k * width, vals, width, yerr=errs, capsize=3,
+               label=label, alpha=0.85, edgecolor="black", linewidth=0.4)
+    ax.set_xticks(x + width * 1.5)
+    ax.set_xticklabels(tasks_a, fontsize=10)
+    ax.set_title("(a) JEPA + halt (st13) vs components", fontsize=11,
+                 fontweight="bold")
+    ax.set_ylabel("best test acc (%)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right")
+
+    # --- Panel B: halt + sparsity ---
+    ax = axes[1]
+    combo_defs_b = [
+        ("baseline",       "st00", "paper"),
+        ("halt",           "st06", "halt0.6"),
+        ("sparsity",       "st08", "sparsity0.5"),
+        ("halt+sparsity",  "st15", "halt_sparsity"),
+    ]
+    tasks_b = [t for t in TASK_ORDER
+               if t in df_complete[df_complete["stage"] == "st15"]["task"].unique()]
+    x = np.arange(len(tasks_b))
+    for k, (label, stage, sweep) in enumerate(combo_defs_b):
+        vals, errs = [], []
+        for task in tasks_b:
+            grp = df_complete[(df_complete["stage"] == stage) &
+                              (df_complete["sweep"] == sweep) &
+                              (df_complete["task"] == task)]
+            if grp.empty:
+                vals.append(0)
+                errs.append(0)
+            else:
+                vals.append(grp["best_test_acc"].mean() * 100)
+                errs.append(float(grp["best_test_acc"].std(ddof=1)) if not pd.isna(grp["best_test_acc"].std(ddof=1)) else 0.0 * 100
+                           if len(grp) > 1 else 0)
+        ax.bar(x + k * width, vals, width, yerr=errs, capsize=3,
+               label=label, alpha=0.85, edgecolor="black", linewidth=0.4)
+    ax.set_xticks(x + width * 1.5)
+    ax.set_xticklabels(tasks_b, fontsize=10)
+    ax.set_title("(b) halt + sparsity (st15) vs components", fontsize=11,
+                 fontweight="bold")
+    ax.set_ylabel("best test acc (%)")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right")
+
+    fig.suptitle("Combining CTM ideas: synergy or interference?",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    path = out_dir / "fig18_combo_ideas.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig18] -> {path}")
+
+
+# ---- fig19: most-certain tick gain boxplot ----------------------------------
+
+def fig_mc_gain(df_complete, out_dir):
+    """Boxplot of (best_test_acc_mc - best_test_acc) per task."""
+    sub = df_complete.dropna(subset=["best_test_acc_mc"]).copy()
+    sub = sub[(sub["best_test_acc_mc"] > 0) & (sub["best_test_acc"] > 0)]
+    sub = sub[sub["stage"] != "st00"]  # exclude baselines
+    if sub.empty:
+        print("[fig19] no MC data")
+        return
+
+    sub["mc_delta"] = (sub["best_test_acc_mc"] - sub["best_test_acc"]) * 100
+    tasks = [t for t in TASK_ORDER + ["qamnist"]
+             if t in sub["task"].unique()]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    data = [sub[sub["task"] == t]["mc_delta"].values for t in tasks]
+    bp = ax.boxplot(data, labels=tasks, patch_artist=True, widths=0.5,
+                    showmeans=True, meanprops=dict(marker="D", markerfacecolor="red",
+                                                   markersize=7))
+    for patch, task in zip(bp["boxes"], tasks):
+        patch.set_facecolor(TASK_COLORS.get(task, "gray"))
+        patch.set_alpha(0.6)
+    ax.axhline(0, color="black", linestyle="--", alpha=0.5, label="no gain")
+
+    # annotate means
+    for i, task in enumerate(tasks):
+        vals = sub[sub["task"] == task]["mc_delta"]
+        ax.annotate(f"mean={vals.mean():+.1f}%\nn={len(vals)}",
+                    (i + 1, vals.mean()),
+                    textcoords="offset points", xytext=(10, 0),
+                    fontsize=8, color="red")
+
+    ax.set_ylabel("MC gain (pp): most-certain tick acc − last-tick acc",
+                  fontsize=11)
+    ax.set_title("Most-certain tick selection: large gains on qamnist & cifar10,\n"
+                 "minimal on mazes (which already converges at the final tick)",
+                 fontsize=12, fontweight="bold")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    path = out_dir / "fig19_mc_gain.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig19] -> {path}")
+
+
+# ---- fig20: train vs test gap ------------------------------------------------
+
+def fig_train_test_gap(df_complete, out_dir):
+    """Scatter: best_train_acc vs best_test_acc, colored by task."""
+    sub = df_complete.dropna(subset=["best_train_acc", "best_test_acc"]).copy()
+    sub = sub[(sub["best_train_acc"] > 0) & (sub["best_test_acc"] > 0)]
+    if sub.empty:
+        print("[fig20] no train/test data")
+        return
+
+    tasks = [t for t in TASK_ORDER + ["qamnist"]
+             if t in sub["task"].unique()]
+
+    fig, ax = plt.subplots(figsize=(9, 8))
+    for task in tasks:
+        grp = sub[sub["task"] == task]
+        ax.scatter(grp["best_train_acc"] * 100, grp["best_test_acc"] * 100,
+                   label=task, color=TASK_COLORS.get(task, "gray"),
+                   alpha=0.5, s=35, edgecolors="white", linewidths=0.3)
+
+    # diagonal
+    lim = [0, 100]
+    ax.plot(lim, lim, "k--", alpha=0.4, label="y=x (no generalisation gap)")
+    # gap zones
+    ax.fill_between(lim, [v - 20 for v in lim], lim, alpha=0.05, color="red",
+                    label="20pp gap zone")
+
+    ax.set_xlim(lim)
+    ax.set_ylim(lim)
+    ax.set_xlabel("best train acc (%)", fontsize=11)
+    ax.set_ylabel("best test acc (%)", fontsize=11)
+    ax.set_title("Train–test gap across all experiments\n"
+                 "(points far below diagonal = poor generalisation)",
+                 fontsize=12, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9, loc="lower right")
+    fig.tight_layout()
+    path = out_dir / "fig20_train_test_gap.png"
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig20] -> {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -937,6 +1539,15 @@ def main():
     fig_cell_sparsity(df_complete, out_dir)
     fig_tick_halt(df_complete, out_dir)
     fig_draft_revise(df_complete, out_dir, cli.min_iter)
+    # new figures: fig13-20
+    fig_ideas_heatmap(df_complete, out_dir)
+    fig_jepa_simplified(df_complete, out_dir)
+    fig_sort_failure(df_complete, out_dir)
+    fig_reflex_ema(df_complete, out_dir)
+    fig_ideas_per_task(df_complete, out_dir)
+    fig_combo_ideas(df_complete, out_dir)
+    fig_mc_gain(df_complete, out_dir)
+    fig_train_test_gap(df_complete, out_dir)
 
     print(f"\nAll figures saved to: {out_dir}")
 

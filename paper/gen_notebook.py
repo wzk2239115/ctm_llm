@@ -301,8 +301,11 @@ for ax_i, task in enumerate(["cifar10", "mazes"]):
     ax.errorbar(xs, ys, yerr=es, fmt="-o", color=TASK_COLORS[task],
                 linewidth=2, markersize=9, capsize=5,
                 label=task, zorder=3)
-    ax.axhline(bl, color="gray", linestyle="--", alpha=0.6,
-               label=f"baseline ({bl:.1f}%)")
+    ax.axhline(bl, color="#d62728", linestyle="--", linewidth=2.2,
+               alpha=1.0, zorder=2)
+    ax.text(xs[-1] + (xs[-1] - xs[0]) * 0.02, bl + 0.8,
+            f"baseline = {bl:.1f}%", fontsize=10, fontweight="bold",
+            color="#d62728", ha="right", va="bottom")
 
     if ys:
         best_idx = int(np.argmax(ys))
