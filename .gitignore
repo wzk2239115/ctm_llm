@@ -24,3 +24,6 @@ model_tokenizer
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Local backups
+*.bak
