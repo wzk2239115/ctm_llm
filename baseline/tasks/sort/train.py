@@ -252,17 +252,36 @@ if __name__=='__main__':
     # --- Multi-Scale Hierarchy (N-level generalization) ---
     msh_levels = parse_msh_levels(getattr(args, 'msh_levels', ''))
     if msh_levels:
-        levels_product = 1
-        for l in msh_levels:
-            levels_product *= l
-        assert levels_product == args.iterations, \
-            f"MSH levels product ({levels_product}) != iterations ({args.iterations})"
-        print(f"MSH: {len(msh_levels)} levels = {msh_levels}, total={levels_product}, "
-              f"gradient_path={msh_levels[-1]}")
+        msh_mode = getattr(args, 'msh_mode', 'nested')
+        if msh_mode == 'nested':
+            levels_product = 1
+            for l in msh_levels:
+                levels_product *= l
+            assert levels_product == args.iterations, \
+                f"MSH nested: levels product ({levels_product}) != iterations ({args.iterations})"
+            grad_path = msh_levels[-1]
+        else:
+            from math import gcd
+            from functools import reduce
+            def _lcm(a, b):
+                return a * b // gcd(a, b)
+            full_cycle = reduce(_lcm, msh_levels)
+            grad_path = f"coprime (full resonance every {full_cycle} steps)"
+        print(f"MSH [{msh_mode}]: {len(msh_levels)} levels = {msh_levels}, "
+              f"total={args.iterations}, gradient_path={grad_path}")
         model.msh_levels = args.msh_levels
+        model.msh_mode = msh_mode
         model.msh_sn_scale = getattr(args, 'msh_sn_scale', 0.0)
+
+        # Build level synapses: coprime mode needs len(levels) synapses,
+        # nested mode needs len(levels)-1 (innermost IS the tick loop)
+        if msh_mode == 'coprime':
+            n_synapses = len(msh_levels)
+        else:
+            n_synapses = len(msh_levels) - 1
         model.msh_synapses = build_msh_synapses(
-            msh_levels, args.d_model,
+            msh_levels + [1] if msh_mode == 'nested' else msh_levels,  # +[1] so build_msh_synapses makes len-1
+            args.d_model,
             sn_scale=getattr(args, 'msh_sn_scale', 0.0),
             device=device,
         )

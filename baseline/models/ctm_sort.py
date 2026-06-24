@@ -94,9 +94,10 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         halt_exploration_prob = getattr(self, 'halt_exploration_prob', 0.0)
 
         # --- Multi-Scale Hierarchy (N-level) ---
-        from baseline.utils.dtt_ideas import parse_msh_levels, should_update_level
+        from baseline.utils.dtt_ideas import parse_msh_levels, should_update_level, should_update_level_coprime
         msh_levels_str = getattr(self, 'msh_levels', '')
         msh_levels = parse_msh_levels(msh_levels_str)
+        msh_mode = getattr(self, 'msh_mode', 'nested')
         use_msh = msh_levels is not None and hasattr(self, 'msh_synapses')
         msh_sn_scale = getattr(self, 'msh_sn_scale', 0.0)
 
@@ -132,9 +133,14 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         z_H = torch.zeros_like(activated_state) if use_hierarchical else None
         eff_l_cycles = l_cycles if l_cycles > 0 else max(1, self.iterations // max(1, h_cycles))
 
-        # --- MSH: initialize N-1 macro states ---
+        # --- MSH: initialize macro states ---
+        # Nested mode: n_macro = len(levels) - 1 (innermost level IS the tick loop)
+        # Coprime mode: n_macro = len(levels) (all levels are independent overlay states)
         if use_msh:
-            n_macro = len(msh_levels) - 1
+            if msh_mode == 'coprime':
+                n_macro = len(msh_levels)
+            else:
+                n_macro = len(msh_levels) - 1
             msh_states = [torch.zeros_like(activated_state) for _ in range(n_macro)]
 
         for stepi in range(self.iterations):
@@ -187,7 +193,11 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
                 # --- MSH: update macro states at level boundaries ---
                 if use_msh:
                     for level_idx in range(n_macro):
-                        if should_update_level(stepi, msh_levels, level_idx):
+                        if msh_mode == 'coprime':
+                            do_update = should_update_level_coprime(stepi, msh_levels, level_idx)
+                        else:
+                            do_update = should_update_level(stepi, msh_levels, level_idx)
+                        if do_update:
                             update = self.msh_synapses[level_idx](activated_state)
                             if msh_sn_scale > 0:
                                 update = update * msh_sn_scale

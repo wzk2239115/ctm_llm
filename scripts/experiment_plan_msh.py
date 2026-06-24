@@ -51,6 +51,8 @@ STAGES_ORDERED = [
     "msh05",
     "msh06",
     "msh07",
+    "msh08",
+    "msh09",
 ]
 ALL_STAGES = STAGES_ORDERED + ["all"]
 
@@ -406,6 +408,98 @@ def build_msh07_full(plan):
     return plan
 
 
+# ─── msh08: Coprime Prime-Period Hierarchy (PPH) ───
+
+def build_msh08_coprime(plan):
+    """Coprime prime-period hierarchy: resonance-based synchronization.
+
+    Instead of nested cumulative boundaries, each level updates independently
+    at a prime period. Synchronization patterns follow CRT:
+      - Solo updates (frequent, local)
+      - Pairwise sync (medium, cross-level)
+      - Full resonance (rare, global)
+
+    Coprime periods create 2^N - 1 distinct sync patterns vs N for nested.
+
+    Configs (T=50, primes with lcm | 50 or close):
+      [2,3,5]:   lcm=30, 7 sync patterns, full resonance at step 29
+      [2,5,7]:   lcm=70, full resonance at step 69 (beyond T=50, partial)
+      [3,5,7]:   lcm=105, no full resonance within T=50
+      [2,3,5,7]: lcm=210, rich but no full resonance within T=50
+      [2,3]:     lcm=6, very frequent resonance (8x in 50 steps)
+    """
+    module_n10, base_n10, _ = TASKS["sort_N10"]
+
+    configs = [
+        ("2,3,5",   "primes [2,3,5], lcm=30, full resonance at step 29+59..."),
+        ("2,3",     "primes [2,3], lcm=6, frequent resonance (8x in 50)"),
+        ("2,5,7",   "primes [2,5,7], lcm=70, partial resonance within T=50"),
+        ("3,5,7",   "primes [3,5,7], lcm=105, no full resonance in T=50"),
+        ("2,3,5,7", "primes [2,3,5,7], lcm=210, richest but no full res in T=50"),
+    ]
+    for primes_str, desc in configs:
+        cfg = dict(with_seed(base_n10, 0))
+        cfg["msh_levels"] = primes_str
+        cfg["msh_mode"] = "coprime"
+        cfg["log_dir"] = f"logs/msh/msh08/sort_N10_coprime_{primes_str.replace(',','x')}"
+        plan.append(exp(
+            f"msh08_sort_N10_coprime_{primes_str.replace(',','x')}",
+            f"sort(N=10): coprime [{primes_str}] — {desc}",
+            _p(module_n10, cfg),
+            tags=["sort", "N10", "coprime", f"primes_{primes_str}"],
+            impl_status="needs_impl",
+            hypothesis=f"Coprime [{primes_str}]: CRT-based resonance creates "
+                       f"diverse sync patterns. Full BPTT first — validate that "
+                       f"resonance structure helps learning.",
+        ))
+    return plan
+
+
+# ─── msh09: Coprime + bp_steps (one-step at resonance) ───
+
+def build_msh09_coprime_onestep(plan):
+    """Coprime + bp_steps=1: one-step gradient at the full-resonance moment.
+
+    The key experiment: with coprime periods and bp_steps=1, the gradient
+    flows through exactly ONE tick — which should be the full-resonance
+    step where all levels synchronize.
+
+    This tests whether the resonance structure provides enough information
+    density for one-step gradient to work.
+    """
+    module_n10, base_n10, _ = TASKS["sort_N10"]
+    module_n30, base_n30, _ = TASKS["sort_N30"]
+
+    # [2,3,5]: lcm=30, full resonance at step 29
+    # With T=30 and bp_steps=1, the last step IS the full resonance
+    configs = [
+        # (task, primes, iterations, bp_steps, desc)
+        ("N10", module_n10, base_n10, "2,3,5",   30, 1, "lcm=30, last step = full resonance"),
+        ("N10", module_n10, base_n10, "2,3,5",   30, 5, "lcm=30, bp=5 covers last resonance cycle"),
+        ("N10", module_n10, base_n10, "2,3",     30, 1, "lcm=6, frequent resonance, bp=1"),
+        ("N10", module_n10, base_n10, "2,5,7",   70, 1, "lcm=70, last step = full resonance"),
+        ("N30", module_n30, base_n30, "2,3,5",   30, 1, "N=30, lcm=30, one-step at resonance"),
+    ]
+    for task, module, base, primes, iters, bp, desc in configs:
+        cfg = dict(with_seed(base, 0))
+        cfg["msh_levels"] = primes
+        cfg["msh_mode"] = "coprime"
+        cfg["iterations"] = iters
+        cfg["bp_steps"] = bp
+        cfg["log_dir"] = f"logs/msh/msh09/sort_{task}_coprime_{primes.replace(',','x')}_T{iters}_bp{bp}"
+        plan.append(exp(
+            f"msh09_sort_{task}_coprime_{primes.replace(',','x')}_T{iters}_bp{bp}",
+            f"sort({task}): coprime [{primes}] T={iters} bp={bp} — {desc}",
+            _p(module, cfg),
+            tags=["sort", task, "coprime", "one-step", f"primes_{primes}", f"bp{bp}"],
+            impl_status="needs_impl",
+            hypothesis=f"Coprime [{primes}] + bp={bp}: one-step gradient aligned "
+                       f"with resonance moment. If this works, it proves the "
+                       f"resonance structure carries sufficient information.",
+        ))
+    return plan
+
+
 # ─── Registry ───
 
 STAGE_BUILDERS = {
@@ -417,6 +511,8 @@ STAGE_BUILDERS = {
     "msh05": build_msh05_bp_steps,
     "msh06": build_msh06_ablation,
     "msh07": build_msh07_full,
+    "msh08": build_msh08_coprime,
+    "msh09": build_msh09_coprime_onestep,
 }
 
 STAGE_DESCRIPTIONS = {
@@ -428,17 +524,21 @@ STAGE_DESCRIPTIONS = {
     "msh05": "MSH + bp_steps: combine hierarchy with gradient truncation",
     "msh06": "Level ablation: fix grad_path=1, vary inner structure [KEY ABLATION]",
     "msh07": "Full system: best hierarchy + spectral + atan2 + progressive",
+    "msh08": "Coprime prime-period hierarchy: CRT resonance patterns [NOVEL]",
+    "msh09": "Coprime + bp_steps=1: one-step gradient at full resonance [KEY]",
 }
 
 IMPL_PRIORITY = {
     "msh02": 1,
-    "msh06": 2,
-    "msh01": 3,
-    "msh04": 4,
-    "msh07": 5,
-    "msh05": 6,
-    "msh03": 7,
-    "msh00": 8,
+    "msh08": 2,
+    "msh09": 3,
+    "msh06": 4,
+    "msh01": 5,
+    "msh04": 6,
+    "msh07": 7,
+    "msh05": 8,
+    "msh03": 9,
+    "msh00": 10,
 }
 
 

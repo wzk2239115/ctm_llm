@@ -53,7 +53,16 @@ def add_dtt_args(parser):
     parser.add_argument("--msh_levels", type=str, default="",
                         help="N-level hierarchy periods, comma-separated innermost→outermost. "
                              "e.g. '10,5,1' = 3-level: 10 fast × 5 medium × 1 slow = 50 total. "
-                             "Empty = flat (no hierarchy). Product must equal --iterations.")
+                             "Empty = flat (no hierarchy). "
+                             "Nested mode: product must equal --iterations. "
+                             "Coprime mode: periods should be coprime (primes); "
+                             "T is independent, full resonance at lcm(periods).")
+    parser.add_argument("--msh_mode", type=str, default="nested",
+                        choices=["nested", "coprime"],
+                        help="Hierarchy mode: 'nested' = cumulative-product boundaries "
+                             "(HRM-style, product must equal iterations); "
+                             "'coprime' = independent prime periods, levels update "
+                             "independently creating resonance patterns via CRT.")
     parser.add_argument("--msh_sn_scale", type=float, default=0.0,
                         help="Spectral norm scale for level synapses. 0=disabled. "
                              "0.9 = enforce σ_max(W) ≤ 0.9 (contractive dynamics).")
@@ -443,4 +452,77 @@ def should_update_level(stepi, levels, level_idx):
     for j in range(level_idx + 1):
         cumulative *= levels[j]
     return (stepi + 1) % cumulative == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# Coprime Mode Helpers
+# ═══════════════════════════════════════════════════════════════
+
+def should_update_level_coprime(stepi, periods, level_idx):
+    """Check if macro level should update at step (coprime mode).
+
+    In coprime mode, each level updates independently at its own period.
+    No cumulative dependency between levels.
+
+    Args:
+        stepi: current step (0-indexed).
+        periods: list of coprime periods, e.g., [2, 3, 5].
+        level_idx: which level to check.
+
+    Returns:
+        True if level should update at this step.
+    """
+    return (stepi + 1) % periods[level_idx] == 0
+
+
+def get_resonance_patterns(periods, T):
+    """Enumerate all synchronization patterns for coprime periods over T steps.
+
+    For periods [2, 3, 5], T=30:
+      Returns dict mapping frozenset(active_levels) → list of step indices.
+
+    This reveals the "resonance spectrum": which levels co-activate when.
+    """
+    from math import gcd
+    from functools import reduce
+
+    def lcm(a, b):
+        return a * b // gcd(a, b)
+
+    full_cycle = reduce(lcm, periods)
+
+    patterns = {}
+    for stepi in range(min(T, full_cycle)):
+        active = frozenset(
+            i for i, p in enumerate(periods)
+            if (stepi + 1) % p == 0
+        )
+        if active:
+            patterns.setdefault(active, []).append(stepi)
+
+    return patterns
+
+
+def print_resonance_report(periods, T):
+    """Print a human-readable resonance pattern report."""
+    patterns = get_resonance_patterns(periods, T)
+
+    from math import gcd
+    from functools import reduce
+    def lcm(a, b):
+        return a * b // gcd(a, b)
+    full_cycle = reduce(lcm, periods)
+
+    print(f"\n  Coprime periods: {periods}")
+    print(f"  Full resonance cycle: lcm = {full_cycle}")
+    print(f"  Distinct sync patterns: {len(patterns)}")
+    print(f"  Pattern breakdown:")
+
+    for active in sorted(patterns, key=lambda s: (len(s), sorted(s))):
+        steps = patterns[active]
+        labels = "+".join(f"L{i}" for i in sorted(active))
+        density = len(steps) / min(T, full_cycle)
+        full = " ★ FULL RESONANCE" if len(active) == len(periods) else ""
+        print(f"    {{{labels}}}: {len(steps)} times "
+              f"(density {density:.3f}){full}")
 
