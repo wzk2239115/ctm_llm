@@ -32,7 +32,7 @@ for entry in "${EXPERIMENTS[@]}"; do
 
   echo "[GPU $GPU] Launching: $name"
   CUDA_VISIBLE_DEVICES=$GPU python -m baseline.tasks.sort.train \
-    $COMMON_ARGS --$args --device 0 &
+    $COMMON_ARGS $args --device 0 &
 
   GPU=$((GPU + 1))
 done

@@ -23,7 +23,7 @@ for entry in "${EXPERIMENTS[@]}"; do
   args="${entry#*|}"
   if [ $GPU -ge $NUM_GPUS ]; then wait -n 2>/dev/null || wait; GPU=0; fi
   echo "[GPU $GPU] $name"
-  CUDA_VISIBLE_DEVICES=$GPU python -m baseline.tasks.sort.train $COMMON --$args &
+  CUDA_VISIBLE_DEVICES=$GPU python -m baseline.tasks.sort.train $COMMON $args &
   GPU=$((GPU + 1))
 done
 wait
