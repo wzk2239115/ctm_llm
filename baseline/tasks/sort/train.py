@@ -23,6 +23,7 @@ from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args, compute_bp_steps, EMATracker, compute_act_q_loss
+from baseline.utils.dtt_ideas import add_dtt_args, get_sort_out_dims, per_tick_sort_loss, compute_per_tick_accuracy, compute_per_tick_fine_accuracy
 
 import torchvision
 torchvision.disable_beta_transforms_warning()
@@ -130,6 +131,7 @@ def parse_args():
     add_all_idea_args(parser)
     add_train_idea_args(parser)
     add_hrm_idea_args(parser)
+    add_dtt_args(parser)
     args = parser.parse_args()
     return args
 
@@ -158,7 +160,7 @@ if __name__=='__main__':
     
 
     prediction_reshaper = [-1]  # Problem specific
-    args.out_dims = args.N_to_sort + 1
+    args.out_dims = get_sort_out_dims(args.N_to_sort, args.sort_loss_mode)
 
     # For total reproducibility
     # Python 3.x
@@ -394,11 +396,12 @@ if __name__=='__main__':
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
                 if args.do_compile:
                     torch.compiler.cudagraph_mark_step_begin()
+                dtt_active = args.sort_loss_mode == 'per_tick_ce'
                 ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
                                 args.tick_loss_mode != 'last' or args.reflex_head or
                                 args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
                                 args.ema_distill_weight > 0 or args.draft_revise_weight > 0 or
-                                args.act_halt)
+                                args.act_halt or dtt_active)
                 if ideas_active:
                     out = model(inputs, return_per_tick_synch=(args.cross_tick_jepa_weight > 0))
                     if isinstance(out[-1], dict):
@@ -407,15 +410,25 @@ if __name__=='__main__':
                     else:
                         predictions, certainties, synchronisation = out
                         extras = {}
-                    loss = compute_multi_tick_loss(predictions, targets, sort_loss,
-                                                   mode=args.tick_loss_mode,
-                                                   certainties=certainties,
-                                                   weights=args.tick_loss_weights) if args.loss_type == 'softmax_ce' else \
-                           compute_multi_tick_loss(predictions, targets,
-                                                   lambda p, t: sort_loss(p, t, loss_type=args.loss_type),
-                                                   mode=args.tick_loss_mode,
-                                                   certainties=certainties,
-                                                   weights=args.tick_loss_weights)
+                    if dtt_active:
+                        loss = per_tick_sort_loss(
+                            predictions, targets,
+                            certainties=certainties,
+                            N_to_sort=args.N_to_sort,
+                            progressive_mode=args.dtt_progressive_mode,
+                            exp_decay=args.dtt_exp_decay,
+                            loss_type=args.loss_type,
+                        )
+                    else:
+                        loss = compute_multi_tick_loss(predictions, targets, sort_loss,
+                                                       mode=args.tick_loss_mode,
+                                                       certainties=certainties,
+                                                       weights=args.tick_loss_weights) if args.loss_type == 'softmax_ce' else \
+                               compute_multi_tick_loss(predictions, targets,
+                                                       lambda p, t: sort_loss(p, t, loss_type=args.loss_type),
+                                                       mode=args.tick_loss_mode,
+                                                       certainties=certainties,
+                                                       weights=args.tick_loss_weights)
                     # JEPA loss
                     if args.cross_tick_jepa_weight > 0 and hasattr(model, 'cross_tick_predictor') and 'synch_per_tick' in extras:
                         from baseline.utils.jepa import compute_jepa_loss
@@ -470,7 +483,10 @@ if __name__=='__main__':
             if ema_tracker is not None:
                 ema_tracker.update(model)
 
-            accuracy = compute_ctc_accuracy(predictions, targets, predictions.shape[1]-1)
+            if dtt_active:
+                accuracy = compute_per_tick_accuracy(predictions, targets, args.N_to_sort)
+            else:
+                accuracy = compute_ctc_accuracy(predictions, targets, predictions.shape[1]-1)
             pbar.set_description(f'Sorting {args.N_to_sort} real numbers. Loss={loss.item():0.3f}. Accuracy={accuracy:0.3f}. LR={current_lr:0.6f}')
 
 
@@ -513,15 +529,19 @@ if __name__=='__main__':
                                 else:
                                     these_predictions, certainties, synchronisation = out
 
-                                loss = sort_loss(these_predictions, targets)
-                                all_losses.append(loss.item())
-
-                                all_targets.append(targets.detach().cpu().numpy())
-
-                                decoded = [d[:targets.shape[1]] for d in decode_predictions(these_predictions, predictions.shape[1]-1)]
-                                decoded = torch.stack([torch.concatenate((d, torch.zeros(targets.shape[1] - len(d), device=targets.device)+targets.shape[1])) if len(d) < targets.shape[1] else d for d in decoded], 0)
-
-                                all_predictions.append(decoded.detach().cpu().numpy())
+                                if dtt_active:
+                                    loss = per_tick_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, loss_type=args.loss_type)
+                                    all_losses.append(loss.item())
+                                    all_targets.append(targets.detach().cpu().numpy())
+                                    decoded = these_predictions.reshape(-1, args.N_to_sort, args.N_to_sort, these_predictions.size(-1))[..., -1].argmax(dim=-1)
+                                    all_predictions.append(decoded.detach().cpu().numpy())
+                                else:
+                                    loss = sort_loss(these_predictions, targets)
+                                    all_losses.append(loss.item())
+                                    all_targets.append(targets.detach().cpu().numpy())
+                                    decoded = [d[:targets.shape[1]] for d in decode_predictions(these_predictions, predictions.shape[1]-1)]
+                                    decoded = torch.stack([torch.concatenate((d, torch.zeros(targets.shape[1] - len(d), device=targets.device)+targets.shape[1])) if len(d) < targets.shape[1] else d for d in decoded], 0)
+                                    all_predictions.append(decoded.detach().cpu().numpy())
                                 
                                 if args.n_test_batches!=-1 and inferi%args.n_test_batches==0 and inferi!=0 : break
                                 pbar_inner.set_description('Computing metrics for train')
@@ -551,15 +571,19 @@ if __name__=='__main__':
                                 else:
                                     these_predictions, certainties, synchronisation = out
 
-                                loss = sort_loss(these_predictions, targets)
-                                all_losses.append(loss.item())
-
-                                all_targets.append(targets.detach().cpu().numpy())
-
-                                decoded = [d[:targets.shape[1]] for d in decode_predictions(these_predictions, predictions.shape[1]-1)]
-                                decoded = torch.stack([torch.concatenate((d, torch.zeros(targets.shape[1] - len(d), device=targets.device)+targets.shape[1])) if len(d) < targets.shape[1] else d for d in decoded], 0)
-
-                                all_predictions.append(decoded.detach().cpu().numpy())
+                                if dtt_active:
+                                    loss = per_tick_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, loss_type=args.loss_type)
+                                    all_losses.append(loss.item())
+                                    all_targets.append(targets.detach().cpu().numpy())
+                                    decoded = these_predictions.reshape(-1, args.N_to_sort, args.N_to_sort, these_predictions.size(-1))[..., -1].argmax(dim=-1)
+                                    all_predictions.append(decoded.detach().cpu().numpy())
+                                else:
+                                    loss = sort_loss(these_predictions, targets)
+                                    all_losses.append(loss.item())
+                                    all_targets.append(targets.detach().cpu().numpy())
+                                    decoded = [d[:targets.shape[1]] for d in decode_predictions(these_predictions, predictions.shape[1]-1)]
+                                    decoded = torch.stack([torch.concatenate((d, torch.zeros(targets.shape[1] - len(d), device=targets.device)+targets.shape[1])) if len(d) < targets.shape[1] else d for d in decoded], 0)
+                                    all_predictions.append(decoded.detach().cpu().numpy())
                                 
                                 if args.n_test_batches!=-1 and inferi%args.n_test_batches==0 and inferi!=0 : break
                                 pbar_inner.set_description('Computing metrics for train')
