@@ -579,7 +579,7 @@ def build_plan(stage="all"):
             if s in STAGE_BUILDERS:
                 STAGE_BUILDERS[s](plan)
     elif stage in STAGE_BUILDERS:
-        STAGE_BUILDERS[s](plan)
+        STAGE_BUILDERS[stage](plan)
     else:
         print(f"Unknown stage: {stage}. Available: {STAGES_ORDERED}")
         return []
