@@ -152,8 +152,8 @@ BASE_CONFIGS = {
 }
 
 BASELINE_ACC = {
-    "cifar10": 0.6443, "mazes": 0.8028, "parity": 0.6797,
-    "qamnist": 0.3662, "sort": 0.7146,
+    "cifar10": 0.6443, "mazes": 0.9117, "parity": 0.6797,
+    "qamnist": 0.3662, "sort": 0.8753,
 }
 
 TASK_COLORS = {
@@ -500,12 +500,13 @@ def collect(log_root="logs/deep"):
             rows.append(dict(name=edir.name, ckpt=ck.name, error=str(e)[:80]))
             continue
         acc = None
-        for k in ["test_accuracies_full_list", "test_accuracies", "val_accuracies", "accuracy"]:
+        for k in ["test_accuracies_full_list", "test_accuracies", "val_accuracies",
+                  "accuracy", "test_accuracies_most_certain"]:
             v = d.get(k) if isinstance(d, dict) else None
             if isinstance(v, (list, tuple)) and v:
                 nums = [x for x in v if isinstance(x, (int, float))]
                 if nums:
-                    acc = nums[-1]
+                    acc = max(nums)
                     break
         task = edir.name.split("_")[0]
         if task == "cifar10":
@@ -516,6 +517,32 @@ def collect(log_root="logs/deep"):
             delta=(acc - BASELINE_ACC[task]) if acc and task in BASELINE_ACC else None,
         ))
     return pd.DataFrame(rows)
+
+
+def collect_csv(csv_path):
+    """Load results exported from the compute machine (no checkpoints needed).
+
+    Reads a CSV with columns: name,task,best_acc,... and returns a DataFrame
+    in the same schema as collect() (name,task,ckpt,best_acc,baseline,delta).
+    """
+    import pandas as pd
+    p = _resolve(csv_path)
+    if not p.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(p)
+    if df.empty or "best_acc" not in df:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "name": df["name"],
+        "task": df["task"],
+        "ckpt": df.get("metric", ""),
+        "best_acc": pd.to_numeric(df["best_acc"], errors="coerce"),
+    })
+    out["baseline"] = out["task"].map(BASELINE_ACC)
+    out["delta"] = out.apply(
+        lambda r: (r["best_acc"] - r["baseline"])
+        if pd.notna(r["best_acc"]) and pd.notna(r["baseline"]) else None, axis=1)
+    return out
 
 
 def plot_delta_bars(df, title="Experiments vs baseline", savepath=None):
