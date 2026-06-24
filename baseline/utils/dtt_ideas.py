@@ -45,11 +45,18 @@ def add_dtt_args(parser):
 
     # ─── State Momentum Correction ───
     parser.add_argument("--dtt_momentum_weight", type=float, default=0.0,
-                        help="State momentum correction weight. 0=disabled. "
-                             "When >0, maintains EMA of synchronisation accumulators "
-                             "and applies correction to prevent detached state drift.")
+                        help="State momentum correction weight. 0=disabled.")
     parser.add_argument("--dtt_momentum_decay", type=float, default=0.99,
                         help="EMA decay rate for state momentum accumulators.")
+
+    # ─── Multi-Scale Hierarchy (MSH) ───
+    parser.add_argument("--msh_levels", type=str, default="",
+                        help="N-level hierarchy periods, comma-separated innermost→outermost. "
+                             "e.g. '10,5,1' = 3-level: 10 fast × 5 medium × 1 slow = 50 total. "
+                             "Empty = flat (no hierarchy). Product must equal --iterations.")
+    parser.add_argument("--msh_sn_scale", type=float, default=0.0,
+                        help="Spectral norm scale for level synapses. 0=disabled. "
+                             "0.9 = enforce σ_max(W) ≤ 0.9 (contractive dynamics).")
 
     return parser
 
@@ -342,3 +349,98 @@ class StateMomentumTracker:
         self._initialized = False
         self.alpha_ema = None
         self.beta_ema = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# Multi-Scale Hierarchy (MSH) Helpers
+# ═══════════════════════════════════════════════════════════════
+
+def parse_msh_levels(levels_str):
+    """Parse MSH levels string into a list of ints.
+
+    '10,5,1' → [10, 5, 1]
+    Product of levels = total iterations.
+    levels[0] = innermost (fastest), levels[-1] = outermost (slowest).
+    Gradient path = levels[-1].
+    """
+    if not levels_str:
+        return None
+    levels = [int(x.strip()) for x in levels_str.split(',')]
+    assert all(l > 0 for l in levels), f"Level periods must be positive: {levels}"
+    return levels
+
+
+def compute_level_boundaries(levels):
+    """Compute the step boundaries at which each macro level updates.
+
+    For levels = [10, 5, 1]:
+      Level 0 (fastest macro): updates every 10 steps → boundaries = [9, 19, 29, 39, 49]
+      Level 1 (slowest macro): updates every 50 steps → boundaries = [49]
+
+    Returns:
+        list of sets: boundaries[i] = set of step indices where level i updates.
+    """
+    n_macro = len(levels) - 1
+    total = 1
+    for l in levels:
+        total *= l
+
+    boundaries = []
+    cumulative = 1
+    for i in range(n_macro):
+        cumulative *= levels[i]
+        period = cumulative
+        bset = set()
+        for stepi in range(total):
+            if (stepi + 1) % period == 0:
+                bset.add(stepi)
+        boundaries.append(bset)
+
+    return boundaries
+
+
+def build_msh_synapses(levels, d_model, sn_scale=0.0, device='cpu'):
+    """Build N-1 level synapse modules for the MSH hierarchy.
+
+    Each level synapse maps activated_state → state update (additive).
+    Structure: LayerNorm → Linear → GLU → LayerNorm (same as HRM's h_synapse).
+
+    Args:
+        levels: list of level periods (e.g., [10, 5, 1]).
+        d_model: model dimension.
+        sn_scale: spectral norm scale. 0 = disabled.
+
+    Returns:
+        nn.ModuleList of N-1 synapse modules.
+    """
+    import torch.nn as nn
+
+    n_macro = len(levels) - 1
+    synapses = []
+    for i in range(n_macro):
+        syn = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model * 2),
+            nn.GLU(),
+            nn.LayerNorm(d_model),
+        )
+        if sn_scale > 0:
+            for m in syn:
+                if isinstance(m, nn.Linear):
+                    torch.nn.utils.parametrizations.spectral_norm(m)
+        synapses.append(syn)
+
+    result = nn.ModuleList(synapses).to(device)
+    return result
+
+
+def should_update_level(stepi, levels, level_idx):
+    """Check if macro level `level_idx` should update at step `stepi`.
+
+    Level i updates every (product of levels[0:i+1]) steps.
+    """
+    cumulative = 1
+    for j in range(level_idx + 1):
+        cumulative *= levels[j]
+    return (stepi + 1) % cumulative == 0
+

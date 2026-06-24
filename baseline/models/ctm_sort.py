@@ -93,6 +93,13 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         halt_max_steps = getattr(self, 'halt_max_steps', self.iterations)
         halt_exploration_prob = getattr(self, 'halt_exploration_prob', 0.0)
 
+        # --- Multi-Scale Hierarchy (N-level) ---
+        from baseline.utils.dtt_ideas import parse_msh_levels, should_update_level
+        msh_levels_str = getattr(self, 'msh_levels', '')
+        msh_levels = parse_msh_levels(msh_levels_str)
+        use_msh = msh_levels is not None and hasattr(self, 'msh_synapses')
+        msh_sn_scale = getattr(self, 'msh_sn_scale', 0.0)
+
         # --- Tracking Initialization ---
         pre_activations_tracking = []
         post_activations_tracking = []
@@ -125,6 +132,11 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
         z_H = torch.zeros_like(activated_state) if use_hierarchical else None
         eff_l_cycles = l_cycles if l_cycles > 0 else max(1, self.iterations // max(1, h_cycles))
 
+        # --- MSH: initialize N-1 macro states ---
+        if use_msh:
+            n_macro = len(msh_levels) - 1
+            msh_states = [torch.zeros_like(activated_state) for _ in range(n_macro)]
+
         for stepi in range(self.iterations):
 
             # --- Truncated BPTT + State detach ---
@@ -140,8 +152,15 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
                     phases = [int(p) for p in async_phases.split(',')] if async_phases else None
                     async_mask = get_async_tick_mask(stepi, d_model, periods, phases, device=device)
 
-                # --- Hierarchical: inject H-level state ---
-                state_for_syn = activated_state + z_H if z_H is not None else activated_state
+                # --- Hierarchical / MSH: inject macro-level state(s) ---
+                if use_msh:
+                    state_for_syn = activated_state
+                    for ms in msh_states:
+                        state_for_syn = state_for_syn + ms
+                elif z_H is not None:
+                    state_for_syn = activated_state + z_H
+                else:
+                    state_for_syn = activated_state
                 if async_mask is not None:
                     state_for_syn = state_for_syn * async_mask.unsqueeze(0).float()
                 pre_synapse_input = torch.concatenate((x, state_for_syn), dim=-1)
@@ -164,6 +183,15 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
                 # --- Hierarchical: H-level update every l_cycles ticks ---
                 if z_H is not None and (stepi + 1) % eff_l_cycles == 0:
                     z_H = z_H + h_synapse(activated_state)
+
+                # --- MSH: update macro states at level boundaries ---
+                if use_msh:
+                    for level_idx in range(n_macro):
+                        if should_update_level(stepi, msh_levels, level_idx):
+                            update = self.msh_synapses[level_idx](activated_state)
+                            if msh_sn_scale > 0:
+                                update = update * msh_sn_scale
+                            msh_states[level_idx] = msh_states[level_idx] + update
 
                 synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
 

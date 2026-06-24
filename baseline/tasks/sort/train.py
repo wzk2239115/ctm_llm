@@ -23,7 +23,7 @@ from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args, compute_bp_steps, EMATracker, compute_act_q_loss
-from baseline.utils.dtt_ideas import add_dtt_args, get_sort_out_dims, per_tick_sort_loss, compute_per_tick_accuracy, compute_per_tick_fine_accuracy
+from baseline.utils.dtt_ideas import add_dtt_args, get_sort_out_dims, per_tick_sort_loss, compute_per_tick_accuracy, compute_per_tick_fine_accuracy, parse_msh_levels, build_msh_synapses
 
 import torchvision
 torchvision.disable_beta_transforms_warning()
@@ -248,6 +248,24 @@ if __name__=='__main__':
             nn.GLU(),
             nn.LayerNorm(args.d_model),
         ).to(device)
+
+    # --- Multi-Scale Hierarchy (N-level generalization) ---
+    msh_levels = parse_msh_levels(getattr(args, 'msh_levels', ''))
+    if msh_levels:
+        levels_product = 1
+        for l in msh_levels:
+            levels_product *= l
+        assert levels_product == args.iterations, \
+            f"MSH levels product ({levels_product}) != iterations ({args.iterations})"
+        print(f"MSH: {len(msh_levels)} levels = {msh_levels}, total={levels_product}, "
+              f"gradient_path={msh_levels[-1]}")
+        model.msh_levels = args.msh_levels
+        model.msh_sn_scale = getattr(args, 'msh_sn_scale', 0.0)
+        model.msh_synapses = build_msh_synapses(
+            msh_levels, args.d_model,
+            sn_scale=getattr(args, 'msh_sn_scale', 0.0),
+            device=device,
+        )
 
     # Reflex head
     if args.reflex_head:
