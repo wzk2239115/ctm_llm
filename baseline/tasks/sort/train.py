@@ -273,14 +273,12 @@ if __name__=='__main__':
         model.msh_mode = msh_mode
         model.msh_sn_scale = getattr(args, 'msh_sn_scale', 0.0)
 
-        # Build level synapses: coprime mode needs len(levels) synapses,
-        # nested mode needs len(levels)-1 (innermost IS the tick loop)
-        if msh_mode == 'coprime':
-            n_synapses = len(msh_levels)
-        else:
-            n_synapses = len(msh_levels) - 1
+        # Build level synapses:
+        #   build_msh_synapses always creates len(input_levels) - 1 synapses
+        #   nested mode: needs len(msh_levels) - 1 synapses → pass msh_levels as-is
+        #   coprime mode: needs len(msh_levels) synapses → pass msh_levels + [1]
         model.msh_synapses = build_msh_synapses(
-            msh_levels + [1] if msh_mode == 'nested' else msh_levels,  # +[1] so build_msh_synapses makes len-1
+            msh_levels if msh_mode == 'nested' else msh_levels + [1],
             args.d_model,
             sn_scale=getattr(args, 'msh_sn_scale', 0.0),
             device=device,
