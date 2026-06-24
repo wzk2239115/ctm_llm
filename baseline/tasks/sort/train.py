@@ -284,6 +284,18 @@ if __name__=='__main__':
             device=device,
         )
 
+        # Learnable gates
+        if msh_mode == 'learnable':
+            from baseline.utils.dtt_ideas import init_gate_logits
+            n_macro_learn = len(msh_levels)
+            gate_init = getattr(args, 'msh_gate_init', 'coprime')
+            gate_logits = init_gate_logits(
+                n_macro_learn, args.iterations, init_mode=gate_init,
+                periods=msh_levels,
+            ).to(device)
+            model.msh_gate_logits = torch.nn.Parameter(gate_logits)
+            print(f"  Learnable gates: {n_macro_learn}×{args.iterations}, init={gate_init}")
+
     # Reflex head
     if args.reflex_head:
         model.reflex_head = ReflexHead(
@@ -492,6 +504,12 @@ if __name__=='__main__':
                         q_T = extras['q_logits'].size(-1)
                         is_correct = is_correct.unsqueeze(1).expand(-1, q_T)
                         loss = loss + compute_act_q_loss(extras['q_logits'], is_correct, weight=args.halt_q_weight)
+
+                    # Gate sparsity loss
+                    gate_sparsity_w = getattr(args, 'msh_gate_sparsity', 0.0)
+                    if gate_sparsity_w > 0 and hasattr(model, 'msh_gate_logits'):
+                        from baseline.utils.dtt_ideas import compute_gate_sparsity_loss
+                        loss = loss + gate_sparsity_w * compute_gate_sparsity_loss(model.msh_gate_logits)
                 else:
                     out = model(inputs)
                     if isinstance(out[-1], dict):

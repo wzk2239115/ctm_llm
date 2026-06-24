@@ -56,16 +56,25 @@ def add_dtt_args(parser):
                              "Empty = flat (no hierarchy). "
                              "Nested mode: product must equal --iterations. "
                              "Coprime mode: periods should be coprime (primes); "
-                             "T is independent, full resonance at lcm(periods).")
+                             "T is independent, full resonance at lcm(periods). "
+                             "Learnable mode: periods used for gate initialization only.")
     parser.add_argument("--msh_mode", type=str, default="nested",
-                        choices=["nested", "coprime"],
-                        help="Hierarchy mode: 'nested' = cumulative-product boundaries "
-                             "(HRM-style, product must equal iterations); "
-                             "'coprime' = independent prime periods, levels update "
-                             "independently creating resonance patterns via CRT.")
+                        choices=["nested", "coprime", "learnable"],
+                        help="Hierarchy mode: 'nested' = cumulative-product boundaries; "
+                             "'coprime' = independent prime periods via CRT; "
+                             "'learnable' = soft gates learned during training "
+                             "(init from coprime pattern, can drift to task-optimal).")
     parser.add_argument("--msh_sn_scale", type=float, default=0.0,
-                        help="Spectral norm scale for level synapses. 0=disabled. "
-                             "0.9 = enforce σ_max(W) ≤ 0.9 (contractive dynamics).")
+                        help="Spectral norm scale for level synapses. 0=disabled.")
+    parser.add_argument("--msh_gate_init", type=str, default="coprime",
+                        choices=["coprime", "random", "uniform"],
+                        help="Learnable mode: gate initialization. "
+                             "'coprime' = init from msh_levels pattern; "
+                             "'random' = random normal; "
+                             "'uniform' = all zeros (50% update probability).")
+    parser.add_argument("--msh_gate_sparsity", type=float, default=0.0,
+                        help="Learnable mode: sparsity regularization weight for gates. "
+                             "Penalizes high average gate activation to encourage sparse updates.")
 
     return parser
 
@@ -525,4 +534,83 @@ def print_resonance_report(periods, T):
         full = " ★ FULL RESONANCE" if len(active) == len(periods) else ""
         print(f"    {{{labels}}}: {len(steps)} times "
               f"(density {density:.3f}){full}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Learnable Gate Helpers
+# ═══════════════════════════════════════════════════════════════
+
+def init_gate_logits(n_macro, iterations, init_mode='coprime', periods=None):
+    """Initialize learnable gate logits for MSH learnable mode.
+
+    Args:
+        n_macro: number of macro levels.
+        iterations: total number of ticks (T).
+        init_mode: 'coprime' (init from periods pattern), 'random', or 'uniform'.
+        periods: list of periods for coprime init (e.g., [2, 3, 5]).
+
+    Returns:
+        Tensor of shape (n_macro, iterations) — raw logits before sigmoid.
+    """
+    import torch
+
+    if init_mode == 'coprime' and periods is not None:
+        logits = torch.full((n_macro, iterations), -5.0)
+        for level_idx in range(min(n_macro, len(periods))):
+            period = periods[level_idx]
+            for t in range(iterations):
+                if (t + 1) % period == 0:
+                    logits[level_idx, t] = 5.0
+        return logits
+    elif init_mode == 'uniform':
+        return torch.zeros(n_macro, iterations)
+    else:
+        return torch.randn(n_macro, iterations) * 2.0
+
+
+def compute_gate_sparsity_loss(gate_logits):
+    """Sparsity regularization for learnable gates.
+
+    Encourages gates to be sparse (most ticks: gate ≈ 0, few ticks: gate ≈ 1).
+    Uses L1 on sigmoid(gate_logits).
+
+    Returns:
+        Scalar loss tensor.
+    """
+    import torch
+    return torch.sigmoid(gate_logits).mean()
+
+
+def visualize_learned_gates(gate_logits, iterations):
+    """Print a text visualization of learned gate patterns.
+
+    Args:
+        gate_logits: (n_macro, iterations) learned parameter.
+        iterations: T.
+    """
+    import torch
+
+    gates = torch.sigmoid(gate_logits).detach().cpu()
+    n_macro = gates.size(0)
+
+    print(f"\n  Learned gate patterns ({n_macro} levels × {iterations} ticks):")
+    for level_idx in range(n_macro):
+        row = gates[level_idx]
+        active = (row > 0.5).sum().item()
+        density = active / iterations
+        bar = ''.join('█' if g > 0.5 else ('▒' if g > 0.1 else '·') for g in row)
+        print(f"    L{level_idx}: [{bar}] active={active}/{iterations} ({density:.1%})")
+
+    # Check pairwise coprimality of learned periods
+    print(f"  Inferred approximate periods:")
+    for level_idx in range(n_macro):
+        row = gates[level_idx]
+        active_steps = (row > 0.5).nonzero(as_tuple=True)[0]
+        if len(active_steps) > 1:
+            diffs = active_steps[1:] - active_steps[:-1]
+            median_period = diffs.float().median().item()
+            print(f"    L{level_idx}: ~period {median_period:.1f} "
+                  f"(steps: {active_steps[:10].tolist()}{'...' if len(active_steps) > 10 else ''})")
+        else:
+            print(f"    L{level_idx}: ~period N/A (too few activations)")
 

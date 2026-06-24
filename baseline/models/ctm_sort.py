@@ -193,15 +193,26 @@ class ContinuousThoughtMachineSORT(ContinuousThoughtMachine):
                 # --- MSH: update macro states at level boundaries ---
                 if use_msh:
                     for level_idx in range(n_macro):
-                        if msh_mode == 'coprime':
-                            do_update = should_update_level_coprime(stepi, msh_levels, level_idx)
+                        if msh_mode == 'learnable':
+                            gate_logits = getattr(self, 'msh_gate_logits', None)
+                            if gate_logits is not None:
+                                gate = torch.sigmoid(gate_logits[level_idx, stepi])
+                                update = self.msh_synapses[level_idx](activated_state)
+                                if msh_sn_scale > 0:
+                                    update = update * msh_sn_scale
+                                msh_states[level_idx] = msh_states[level_idx] + gate * update
+                        elif msh_mode == 'coprime':
+                            if should_update_level_coprime(stepi, msh_levels, level_idx):
+                                update = self.msh_synapses[level_idx](activated_state)
+                                if msh_sn_scale > 0:
+                                    update = update * msh_sn_scale
+                                msh_states[level_idx] = msh_states[level_idx] + update
                         else:
-                            do_update = should_update_level(stepi, msh_levels, level_idx)
-                        if do_update:
-                            update = self.msh_synapses[level_idx](activated_state)
-                            if msh_sn_scale > 0:
-                                update = update * msh_sn_scale
-                            msh_states[level_idx] = msh_states[level_idx] + update
+                            if should_update_level(stepi, msh_levels, level_idx):
+                                update = self.msh_synapses[level_idx](activated_state)
+                                if msh_sn_scale > 0:
+                                    update = update * msh_sn_scale
+                                msh_states[level_idx] = msh_states[level_idx] + update
 
                 synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
 
