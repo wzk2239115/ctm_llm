@@ -31,7 +31,7 @@ def extract_experiment(log_dir):
         for token in args_text.split():
             if "=" in token and not token.startswith("-"):
                 k, v = token.split("=", 1)
-                config[k] = v.strip("'\"")
+                config[k] = v.strip("'\"").rstrip(",").strip("'\"")
 
     ta = ckpt.get("test_accuracies", [])
     taf = ckpt.get("test_accuracies_full_list", [])
@@ -69,7 +69,8 @@ def extract_experiment(log_dir):
 
 
 def main():
-    output = sys.argv[1] if len(sys.argv) > 1 else "csv_data/msh_results.csv"
+    log_dirs = sys.argv[1:-1] if len(sys.argv) > 2 else LOG_DIRS
+    output = sys.argv[-1] if len(sys.argv) > 1 else "csv_data/msh_results.csv"
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
 
     results = []

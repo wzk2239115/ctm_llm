@@ -23,7 +23,7 @@ from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args, compute_bp_steps, EMATracker, compute_act_q_loss
-from baseline.utils.dtt_ideas import add_dtt_args, get_sort_out_dims, per_tick_sort_loss, compute_per_tick_accuracy, compute_per_tick_fine_accuracy, parse_msh_levels, build_msh_synapses
+from baseline.utils.dtt_ideas import add_dtt_args, get_sort_out_dims, per_tick_sort_loss, compute_per_tick_accuracy, compute_per_tick_fine_accuracy, parse_msh_levels, build_msh_synapses, per_tick_sinkhorn_sort_loss, decode_permutation_hungarian, compute_sinkhorn_accuracy
 
 import torchvision
 torchvision.disable_beta_transforms_warning()
@@ -443,7 +443,8 @@ if __name__=='__main__':
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
                 if args.do_compile:
                     torch.compiler.cudagraph_mark_step_begin()
-                dtt_active = args.sort_loss_mode == 'per_tick_ce'
+                dtt_active = args.sort_loss_mode in ('per_tick_ce', 'per_tick_sinkhorn')
+                sinkhorn_active = args.sort_loss_mode == 'per_tick_sinkhorn'
                 ideas_active = (args.cross_tick_jepa_weight > 0 or args.tick_halt_mode != 'none' or 
                                 args.tick_loss_mode != 'last' or args.reflex_head or
                                 args.topk_neurons < 1.0 or args.async_tick_mode != 'none' or
@@ -458,14 +459,29 @@ if __name__=='__main__':
                         predictions, certainties, synchronisation = out
                         extras = {}
                     if dtt_active:
-                        loss = per_tick_sort_loss(
-                            predictions, targets,
-                            certainties=certainties,
-                            N_to_sort=args.N_to_sort,
-                            progressive_mode=args.dtt_progressive_mode,
-                            exp_decay=args.dtt_exp_decay,
-                            loss_type=args.loss_type,
-                        )
+                        if sinkhorn_active:
+                            loss = per_tick_sinkhorn_sort_loss(
+                                predictions, targets,
+                                certainties=certainties,
+                                N_to_sort=args.N_to_sort,
+                                progressive_mode=args.dtt_progressive_mode,
+                                exp_decay=args.dtt_exp_decay,
+                                sinkhorn_iters=args.sinkhorn_iters,
+                                sinkhorn_tau=args.sinkhorn_tau,
+                                sinkhorn_tau_min=args.sinkhorn_tau_min,
+                                anneal=args.sinkhorn_anneal,
+                                cur_step=bi,
+                                total_steps=args.training_iterations,
+                            )
+                        else:
+                            loss = per_tick_sort_loss(
+                                predictions, targets,
+                                certainties=certainties,
+                                N_to_sort=args.N_to_sort,
+                                progressive_mode=args.dtt_progressive_mode,
+                                exp_decay=args.dtt_exp_decay,
+                                loss_type=args.loss_type,
+                            )
                     else:
                         loss = compute_multi_tick_loss(predictions, targets, sort_loss,
                                                        mode=args.tick_loss_mode,
@@ -537,7 +553,10 @@ if __name__=='__main__':
                 ema_tracker.update(model)
 
             if dtt_active:
-                accuracy = compute_per_tick_accuracy(predictions, targets, args.N_to_sort)
+                if sinkhorn_active:
+                    accuracy, _ = compute_sinkhorn_accuracy(predictions, targets, args.N_to_sort)
+                else:
+                    accuracy = compute_per_tick_accuracy(predictions, targets, args.N_to_sort)
             else:
                 accuracy = compute_ctc_accuracy(predictions, targets, predictions.shape[1]-1)
             pbar.set_description(f'Sorting {args.N_to_sort} real numbers. Loss={loss.item():0.3f}. Accuracy={accuracy:0.3f}. LR={current_lr:0.6f}')
@@ -583,11 +602,15 @@ if __name__=='__main__':
                                     these_predictions, certainties, synchronisation = out
 
                                 if dtt_active:
-                                    loss = per_tick_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, loss_type=args.loss_type)
+                                    if sinkhorn_active:
+                                        loss = per_tick_sinkhorn_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, sinkhorn_iters=args.sinkhorn_iters, sinkhorn_tau=args.sinkhorn_tau, sinkhorn_tau_min=args.sinkhorn_tau_min, anneal=args.sinkhorn_anneal)
+                                        decoded = decode_permutation_hungarian(these_predictions, N_to_sort=args.N_to_sort)
+                                    else:
+                                        loss = per_tick_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, loss_type=args.loss_type)
+                                        decoded = these_predictions.reshape(-1, args.N_to_sort, args.N_to_sort, these_predictions.size(-1))[..., -1].argmax(dim=-1).detach().cpu().numpy()
                                     all_losses.append(loss.item())
                                     all_targets.append(targets.detach().cpu().numpy())
-                                    decoded = these_predictions.reshape(-1, args.N_to_sort, args.N_to_sort, these_predictions.size(-1))[..., -1].argmax(dim=-1)
-                                    all_predictions.append(decoded.detach().cpu().numpy())
+                                    all_predictions.append(decoded)
                                 else:
                                     loss = sort_loss(these_predictions, targets)
                                     all_losses.append(loss.item())
@@ -625,11 +648,15 @@ if __name__=='__main__':
                                     these_predictions, certainties, synchronisation = out
 
                                 if dtt_active:
-                                    loss = per_tick_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, loss_type=args.loss_type)
+                                    if sinkhorn_active:
+                                        loss = per_tick_sinkhorn_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, sinkhorn_iters=args.sinkhorn_iters, sinkhorn_tau=args.sinkhorn_tau, sinkhorn_tau_min=args.sinkhorn_tau_min, anneal=args.sinkhorn_anneal)
+                                        decoded = decode_permutation_hungarian(these_predictions, N_to_sort=args.N_to_sort)
+                                    else:
+                                        loss = per_tick_sort_loss(these_predictions, targets, N_to_sort=args.N_to_sort, loss_type=args.loss_type)
+                                        decoded = these_predictions.reshape(-1, args.N_to_sort, args.N_to_sort, these_predictions.size(-1))[..., -1].argmax(dim=-1).detach().cpu().numpy()
                                     all_losses.append(loss.item())
                                     all_targets.append(targets.detach().cpu().numpy())
-                                    decoded = these_predictions.reshape(-1, args.N_to_sort, args.N_to_sort, these_predictions.size(-1))[..., -1].argmax(dim=-1)
-                                    all_predictions.append(decoded.detach().cpu().numpy())
+                                    all_predictions.append(decoded)
                                 else:
                                     loss = sort_loss(these_predictions, targets)
                                     all_losses.append(loss.item())
@@ -687,6 +714,7 @@ if __name__=='__main__':
 
             # Save model
             if (bi%args.save_every==0 or bi==args.training_iterations-1) and bi != start_iter:
+                peak_mem_gb = (torch.cuda.max_memory_allocated(device) / (1024**3)) if "cuda" in device else 0.0
                 torch.save(
                     {
                     'model_state_dict':model.state_dict(),
@@ -702,6 +730,9 @@ if __name__=='__main__':
                     'test_losses':test_losses,
                     'iters':iters,
                     'args':args,
+                    'peak_memory_gb':peak_mem_gb,
+                    'bp_steps':getattr(model,'bp_steps',0),
+                    'sort_loss_mode':args.sort_loss_mode,
                     'torch_rng_state': torch.get_rng_state(),
                     'numpy_rng_state': np.random.get_state(),
                     'random_rng_state': random.getstate(),

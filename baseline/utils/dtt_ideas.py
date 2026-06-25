@@ -27,10 +27,27 @@ def add_dtt_args(parser):
     """Add CLI arguments for Decoupled Thought Training."""
     # ─── Loss Reformulation ───
     parser.add_argument("--sort_loss_mode", type=str, default="ctc",
-                        choices=["ctc", "per_tick_ce"],
+                        choices=["ctc", "per_tick_ce", "per_tick_sinkhorn"],
                         help="Sort loss: 'ctc' (sequence alignment, needs full BPTT) "
                              "or 'per_tick_ce' (each tick independently predicts full "
-                             "ordering, compatible with one-step gradient).")
+                             "ordering, compatible with one-step gradient) "
+                             "or 'per_tick_sinkhorn' (per-tick prediction + Sinkhorn "
+                             "doubly-stochastic projection; truncation-native AND "
+                             "enforces valid permutation structure).")
+
+    # ─── Sinkhorn Permutation Structure (for per_tick_sinkhorn mode) ───
+    parser.add_argument("--sinkhorn_iters", type=int, default=5,
+                        help="Sinkhorn normalization iterations. More -> closer to a "
+                             "true permutation but costlier. 0 disables (== per_tick_ce).")
+    parser.add_argument("--sinkhorn_tau", type=float, default=1.0,
+                        help="Sinkhorn temperature at start of training. Higher = softer "
+                             "(more uniform), lower = sharper (closer to hard permutation).")
+    parser.add_argument("--sinkhorn_tau_min", type=float, default=0.1,
+                        help="Sinkhorn temperature annealed toward this by end of training. "
+                             "Set == sinkhorn_tau to disable annealing.")
+    parser.add_argument("--sinkhorn_anneal", type=str, default="linear",
+                        choices=["none", "linear"],
+                        help="Temperature anneal schedule. 'none' keeps tau constant.")
 
     # ─── Progressive Weighting ───
     parser.add_argument("--dtt_progressive_mode", type=str, default="none",
@@ -87,9 +104,9 @@ def get_sort_out_dims(N_to_sort, sort_loss_mode):
     """Compute out_dims for the sort task based on loss mode.
 
     CTC mode: each tick outputs 1 distribution over N+1 classes (N + blank).
-    Per-tick CE mode: each tick outputs N distributions, each over N classes.
+    Per-tick CE / Sinkhorn mode: each tick outputs N distributions, each over N classes.
     """
-    if sort_loss_mode == "per_tick_ce":
+    if sort_loss_mode in ("per_tick_ce", "per_tick_sinkhorn"):
         return N_to_sort * N_to_sort
     else:
         return N_to_sort + 1
@@ -292,6 +309,129 @@ def compute_per_tick_fine_accuracy(
 
     accuracy = (predicted_ordering == targets).float().mean().item()
     return accuracy
+
+
+# ═══════════════════════════════════════════════════════════════
+# Sinkhorn Permutation Structure (truncation-native sort loss)
+# ═══════════════════════════════════════════════════════════════
+
+def sinkhorn_normalize(scores, n_iters=5, tau=1.0):
+    """Differentiable Sinkhorn normalization → doubly-stochastic matrix.
+
+    A doubly-stochastic matrix is the continuous relaxation of a permutation
+    matrix: each row and each column sums to 1. This enforces the bijection
+    constraint that per_tick_ce lacks (no two positions can claim the same element).
+
+    Operates in log-space for numerical stability. Each call is LOCAL to one tick
+    (no cross-tick dependency) → remains truncation-native (bp_steps=1 compatible).
+
+    Args:
+        scores: (..., N, N) raw logits. dim[-2] = position, dim[-1] = element.
+        n_iters: Sinkhorn iterations (alternating row/col normalization).
+        tau: temperature. Higher = softer (uniform), lower = sharper (permutation).
+
+    Returns:
+        (..., N, N) doubly-stochastic matrix (probabilities).
+    """
+    log_alpha = scores / max(tau, 1e-6)
+    for _ in range(n_iters):
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-1, keepdim=True)
+        log_alpha = log_alpha - torch.logsumexp(log_alpha, dim=-2, keepdim=True)
+    return log_alpha.exp()
+
+
+def _current_tau(args_tau, args_tau_min, cur_step, total_steps, anneal="linear"):
+    """Resolve the effective Sinkhorn temperature, with optional annealing."""
+    if anneal == "none" or args_tau_min >= args_tau or total_steps is None or total_steps <= 0 or cur_step is None:
+        return args_tau
+    frac = min(1.0, max(0.0, float(cur_step) / float(total_steps)))
+    return args_tau + (args_tau_min - args_tau) * frac
+
+
+def per_tick_sinkhorn_sort_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    certainties: Optional[torch.Tensor] = None,
+    N_to_sort: Optional[int] = None,
+    progressive_mode: str = "none",
+    exp_decay: float = 0.95,
+    sinkhorn_iters: int = 5,
+    sinkhorn_tau: float = 1.0,
+    sinkhorn_tau_min: float = 0.1,
+    anneal: str = "linear",
+    cur_step: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Truncation-native sort loss with enforced permutation structure.
+
+    Each tick independently predicts the full N-position ordering (truncation-native,
+    like per_tick_ce), but the N×N score matrix is projected through Sinkhorn to a
+    doubly-stochastic matrix before the loss. This restores the bijection constraint
+    that lets sort scale to large N, WITHOUT any cross-tick dependency (so one-step
+    gradient / bp_steps=1 stays valid).
+
+    Args:
+        predictions: (B, N*N, T) — N positions × N classes per tick.
+        targets: (B, N) — sorted indices. targets[b, j] = element at position j.
+    """
+    B = predictions.size(0)
+    T = predictions.size(-1)
+    N = N_to_sort if N_to_sort is not None else targets.size(-1)
+
+    pred = predictions.reshape(B, N, N, T)
+    tgt = targets.long()
+
+    tau = _current_tau(sinkhorn_tau, sinkhorn_tau_min, cur_step, total_steps, anneal)
+
+    per_tick_losses = torch.empty(B, T, device=predictions.device, dtype=torch.float32)
+    for t in range(T):
+        pred_t = pred[..., t]
+        P = sinkhorn_normalize(pred_t, sinkhorn_iters, tau)
+        p_correct = P.gather(2, tgt.unsqueeze(-1)).squeeze(-1)
+        per_tick_losses[:, t] = -torch.log(p_correct + 1e-9).mean(dim=1)
+
+    if reduction == "none":
+        return per_tick_losses
+
+    weights = compute_progressive_weights(
+        certainties, T, progressive_mode, exp_decay, predictions.device,
+    )
+    return (per_tick_losses * weights.unsqueeze(0)).sum(dim=1).mean()
+
+
+def decode_permutation_hungarian(predictions, N_to_sort=None, tick=None):
+    """Decode a valid permutation via exact Hungarian assignment (eval only).
+
+    Guarantees a valid bijection, unlike argmax. Runs on CPU.
+
+    Returns:
+        (B, N) numpy array: predicted element index at each position.
+    """
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    B = predictions.size(0)
+    T = predictions.size(-1)
+    N = N_to_sort if N_to_sort is not None else int(round(predictions.size(1) ** 0.5))
+    t = tick if tick is not None else T - 1
+    scores = predictions.reshape(B, N, N, T)[..., t].detach().float().cpu().numpy()
+
+    out = np.empty((B, N), dtype=np.int64)
+    for b in range(B):
+        row, col = linear_sum_assignment(-scores[b])
+        out[b] = col[np.argsort(row)]
+    return out
+
+
+def compute_sinkhorn_accuracy(predictions, targets, N_to_sort=None):
+    """Return (fine_acc, full_acc) using Hungarian decoding on the last tick."""
+    import numpy as np
+    decoded = decode_permutation_hungarian(predictions, N_to_sort)
+    tgt = targets.detach().cpu().numpy()
+    fine = float((decoded == tgt).mean())
+    full = float((decoded == tgt).all(axis=1).mean())
+    return fine, full
 
 
 # ═══════════════════════════════════════════════════════════════
