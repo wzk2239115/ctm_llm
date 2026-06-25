@@ -476,9 +476,9 @@ def _find_latest_ckpt(d):
     p = d / "checkpoint.pt"
     if p.exists():
         return p
-    num = [c for c in ckpts if re.search(r"_(\d+)\.pt$", c)]
+    num = [c for c in ckpts if re.search(r"_(\d+)\.pt$", c.name)]
     if num:
-        return max(num, key=lambda c: int(re.search(r"_(\d+)\.pt$", c).group(1)))
+        return max(num, key=lambda c: int(re.search(r"_(\d+)\.pt$", c.name).group(1)))
     return ckpts[-1]
 
 
