@@ -488,8 +488,10 @@ if __name__=='__main__':
                         # Draft-revise loss
                         if args.draft_revise_weight > 0 and 'draft_prediction' in extras:
                             dp = extras['draft_prediction']
-                            draft_loss = F.cross_entropy(dp.view(-1, dp.size(-1)), targets.reshape(-1))
-                            loss = loss + args.draft_revise_weight * draft_loss
+                            dp_flat = dp.reshape(-1, dp.size(-1))
+                            tgt_flat = targets.reshape(-1)
+                            if dp_flat.size(0) == tgt_flat.size(0):
+                                loss = loss + args.draft_revise_weight * F.cross_entropy(dp_flat, tgt_flat.long())
                     else:
                         out = model(inputs)
                         if isinstance(out[-1], dict):
