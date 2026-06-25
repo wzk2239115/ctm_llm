@@ -60,6 +60,15 @@ python scripts/experiment_plan_ctm_paper.py submit --stage all --no-wait
 2. **再跑 pool** (测集群基建): `python scripts/smoke_baseline.py --iterations 10`
 3. 两轮都过了再正式 submit 实验计划
 
+## 实验验证两步走: smoke + 功能验证 (强制)
+任何 idea/特性的实验, **两步都过才算正规实验**, 缺一步会导致"跑了等于没跑"——整批结果无效却看不出来.
+- **Step 1 — Smoke 验证 (能跑通)**: 少量 iter, 不崩、shape/loss 正常 (见上).
+- **Step 2 — 功能验证 (有效果)**: 证明该特性**确实改变了模型行为**, 而不是参数被静默丢弃. 固定 seed, 跑两组「关键超参取不同值」(如 draft-revise 的 `corrupt_prob=0.05 vs 0.3`, sparsity 的 `topk=0.25 vs 0.75`), 对比训练曲线/best_acc:
+  - **应不同的两组若逐点相同 → idea 没接入, 立即排查, 绝不批量跑.**
+  - 代码侧根因排查: CTM forward 用 `getattr(self, '<idea>_mode', 默认值)` 读特性开关, 各 task `train.py` 的 "Set idea attributes on model" 块**必须把 `args.*` 拷到 model**; 漏赋值 → forward 恒取默认值 → 特性 inert.
+  - **判据**: 同 seed、不同关键超参 → 结果必须不同. 不要拿"vs 旧 `BASELINE_ACC` 常量的 delta"当效果证据 (常量会过时, 非确定性噪声会造假 delta).
+- **历史教训**: `01_revise` 119 个 run 全是 baseline——4 个 task `train.py` 漏了 `model.draft_mode` 等 4 行赋值, draft-revise 从未生效. 只因 sort 训练可复现 (同 seed 逐位相同) 才暴露, cifar10/mazes/parity 靠非确定性噪声伪装出假 delta, 浪费大量卡时.
+
 ### 算力机调试注意
 - **`.fail.json` 和 per-experiment `.log` 文件在算力机上生成**, 开发机无法直接访问. 需要用户从算力机手动复制到开发机 (或粘贴内容) 才能诊断失败原因.
 - 调试失败任务时, 请用户提供: `runs/metrics/{exp_name}.fail.json` 内容 + 对应的 `logs/{exp_name}.log` 末尾 traceback.

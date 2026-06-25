@@ -194,6 +194,10 @@ if __name__=='__main__':
         model.tick_halt_mode = args.tick_halt_mode
         model.tick_halt_threshold = args.tick_halt_threshold
         model.tick_min_ticks = args.tick_min_ticks
+        model.draft_mode = args.draft_mode
+        model.draft_revise_weight = args.draft_revise_weight
+        model.draft_corrupt_prob = args.draft_corrupt_prob
+        model.draft_block_size = args.draft_block_size
 
         # --- HRM-inspired attributes ---
         model.bp_steps = args.bp_steps
