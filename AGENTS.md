@@ -17,6 +17,7 @@
 - `model_tokenizer` 同理, 指向各自路径下的 `minimind-o/model/`
 
 ## 注意事项
+- **实验运行/分析一律用 `.py`/`.sh` 脚本, 默认不再用 notebook (`.ipynb`)**: notebook 难以在算力机后台 `nohup` 跑、cell 状态隐式难复现、两步走验证不便、且 `.ipynb` 的 JSON diff 噪音大不利 git 同步. 范例见 `paper/run_02_jepa.py`、`paper/run_04_combos.py` (各自取代同名 deep notebook); 分析也写成独立脚本, 用 `exp_runner.collect_csv` 读 `csv_data/*.csv` 出图, 不依赖 cell 执行顺序. 新需求优先新增 `run_*.py`/`export_*.py`, 不要再新建 notebook.
 - **算力机启动 server/worker 前必须设代理** (否则 huggingface/datasets 下载会卡):
   ```bash
   export http_proxy="http://public-proxy.qihoo.net:3128"
