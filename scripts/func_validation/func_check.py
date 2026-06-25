@@ -2,8 +2,8 @@
 """Functional validation: prove an idea actually changes model behavior.
 
 This is Step 2 of the mandatory two-step verification (see AGENTS.md):
-  Step 1 (smoke)   = it runs without crashing   -> scripts/smoke_baseline.py
-  Step 2 (functional) = it actually has an effect -> this script
+  Step 1 (smoke)     = it runs without crashing   -> scripts/smoke_baseline.py
+  Step 2 (functional) = it actually has an effect  -> this script
 
 For a given task + idea, it runs TWO short configs with the SAME seed but
 DIFFERENT values of the idea's key hyperparameter, then compares the test-acc
@@ -11,20 +11,21 @@ trajectories:
   - identical curves -> the idea is inert (args not wired onto the model) -> FAIL
   - differing curves -> the idea takes effect                       -> PASS
 
-The base configs are deterministic (dropout=0), so an inert idea yields
-bit-identical curves and a reliable FAIL (unlike long noisy training).
+Runs are launched CONCURRENTLY and packed several-per-GPU (the smoke configs are
+tiny), so a full --all sweep finishes in roughly one single-run time.
 
 Usage:
     python scripts/func_validation/func_check.py --task sort   --idea revise
     python scripts/func_validation/func_check.py --task mazes  --idea revise
-    python scripts/func_validation/func_check.py --task sort   --idea jepa
-    python scripts/func_validation/func_check.py --task sort   --idea sparsity
-    python scripts/func_validation/func_check.py --all        # every task x idea
+    python scripts/func_validation/func_check.py --all                 # every task x idea
+    python scripts/func_validation/func_check.py --all --devices 0,1,2,3 --pack 6
 
 Options:
-    --device N     CUDA device (default 0)
-    --iters N      training iterations per run (default 600)
-    --ticks N      CTM thought-ticks / iterations (default: per task)
+    --device N       single CUDA device (default 0; ignored if --devices/--all)
+    --devices a,b,c  explicit device list
+    --iters N        training iterations per run (default 300)
+    --ticks N        CTM thought-ticks / iterations (default: per task)
+    --pack K         concurrent jobs per GPU (default 4; models are tiny)
 """
 
 from __future__ import annotations
@@ -32,11 +33,14 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT))
+
+import torch  # noqa: E402
 
 from smoke_baseline import TASKS  # noqa: E402
 
@@ -61,7 +65,7 @@ IDEAS = {
     },
 }
 
-DEFAULT_TICKS = {"sort": 50, "mazes": 50, "cifar10": 30, "parity": 30, "qamnist": 30}
+DEFAULT_TICKS = {"sort": 20, "mazes": 20, "cifar10": 15, "parity": 15, "qamnist": 15}
 
 
 def build_cfg(task, idea, vary_val, device, iters, ticks):
@@ -69,7 +73,7 @@ def build_cfg(task, idea, vary_val, device, iters, ticks):
     cfg = dict(base)
     cfg["iterations"] = ticks
     cfg["training_iterations"] = iters
-    cfg["track_every"] = max(50, iters // 6)
+    cfg["track_every"] = max(25, iters // 6)
     cfg["save_every"] = 10 ** 9
     cfg["reload"] = False
     cfg["device"] = [device]
@@ -102,8 +106,8 @@ def latest_ckpt(log_dir):
     return cks[-1] if cks else None
 
 
-def run_one(task, idea, vary_val, device, iters, ticks, log_dir):
-    import torch
+def run_job(job, device, iters):
+    task, idea, vary_val, log_dir, ticks = job
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
     module, cfg = build_cfg(task, idea, vary_val, device, iters, ticks)
@@ -122,22 +126,60 @@ def run_one(task, idea, vary_val, device, iters, ticks, log_dir):
     return None, "no test_accuracies found in checkpoint"
 
 
-def check(task, idea, device, iters, ticks):
-    vary_param, (lo, hi) = IDEAS[idea]["vary"]
-    a, err = run_one(task, idea, lo, device, iters, ticks,
-                     f"/tmp/func_check/{task}_{idea}_lo")
-    if err:
-        return False, f"{task}/{idea} {vary_param}={lo}: {err}"
-    b, err = run_one(task, idea, hi, device, iters, ticks,
-                     f"/tmp/func_check/{task}_{idea}_hi")
-    if err:
-        return False, f"{task}/{idea} {vary_param}={hi}: {err}"
-    n = min(len(a), len(b))
-    same = a[:n] == b[:n]
-    detail = (f"{task}/{idea}  {vary_param}={lo} vs {hi}\n"
-              f"    {lo}: {a}\n    {hi}: {b}")
-    verdict = "FAIL (curves identical -> idea inert)" if same else "PASS (curves differ -> idea active)"
-    return (not same), f"{verdict}\n{detail}"
+def make_jobs(pairs, iters, ticks_override):
+    jobs = {}
+    for task, idea in pairs:
+        ticks = ticks_override or DEFAULT_TICKS.get(task, 15)
+        for val in IDEAS[idea]["vary"][1]:
+            log = f"/tmp/func_check/{task}_{idea}_{val}"
+            jobs[(task, idea, val)] = (task, idea, val, log, ticks)
+    return jobs
+
+
+def run_concurrent(jobs, devices, iters, pack):
+    n_gpu = len(devices)
+    max_workers = max(1, n_gpu * pack)
+    results = {}
+    keys = list(jobs.keys())
+    print(f"Launching {len(keys)} runs on {n_gpu} GPU(s) x {pack} pack "
+          f"= {max_workers} concurrent workers\n")
+
+    def worker(idx, key):
+        dev = devices[idx % n_gpu]
+        return key, run_job(jobs[key], dev, iters)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(worker, i, k) for i, k in enumerate(keys)]
+        for fut in as_completed(futs):
+            key, (curve, err) = fut.result()
+            results[key] = (curve, err)
+            done += 1
+            tag = "ok " if err is None else "ERR"
+            tail = "" if err is None else " -> " + err.splitlines()[-1][:70]
+            print(f"  [{done}/{len(keys)}] {tag} {key[0]}/{key[1]} val={key[2]}{tail}")
+    return results
+
+
+def evaluate(pairs, results):
+    out = []
+    for task, idea in pairs:
+        vary_param, (lo, hi) = IDEAS[idea]["vary"]
+        a, ea = results.get((task, idea, lo), (None, "missing"))
+        b, eb = results.get((task, idea, hi), (None, "missing"))
+        err = ea or eb
+        if err:
+            out.append((task, idea, False,
+                        f"{task}/{idea} {vary_param}: {err}"))
+            continue
+        n = min(len(a), len(b))
+        same = a[:n] == b[:n]
+        detail = (f"{task}/{idea}  {vary_param}={lo} vs {hi}\n"
+                  f"    {lo}: {a}\n    {hi}: {b}")
+        verdict = ("FAIL (curves identical -> idea inert)" if same
+                   else "PASS (curves differ -> idea active)")
+        out.append((task, idea, not same, f"{verdict}\n{detail}"))
+    return out
 
 
 def main():
@@ -147,32 +189,43 @@ def main():
     ap.add_argument("--idea", choices=list(IDEAS.keys()))
     ap.add_argument("--all", action="store_true", help="check every task x idea")
     ap.add_argument("--device", type=int, default=0)
-    ap.add_argument("--iters", type=int, default=600)
+    ap.add_argument("--devices", type=str, default=None,
+                    help="comma-separated device list, e.g. 0,1,2,3")
+    ap.add_argument("--iters", type=int, default=300)
     ap.add_argument("--ticks", type=int, default=None)
+    ap.add_argument("--pack", type=int, default=4, help="concurrent jobs per GPU")
     args = ap.parse_args()
 
     if args.all:
         pairs = [(t, i) for t in TASKS for i in IDEAS]
+        if args.devices is not None:
+            devices = [int(x) for x in args.devices.split(",") if x.strip() != ""]
+        else:
+            n = torch.cuda.device_count() or 1
+            devices = list(range(n))
     else:
         if not args.task or not args.idea:
             ap.error("provide --task and --idea, or use --all")
         pairs = [(args.task, args.idea)]
+        devices = ([int(x) for x in args.devices.split(",") if x.strip() != ""]
+                   if args.devices else [args.device])
 
-    results = []
-    for task, idea in pairs:
-        ticks = args.ticks or DEFAULT_TICKS.get(task, 30)
-        ok, msg = check(task, idea, args.device, args.iters, ticks)
-        results.append((task, idea, ok))
-        print(f"\n[{task}/{idea}] {'PASS' if ok else 'FAIL'}")
+    jobs = make_jobs(pairs, args.iters, args.ticks)
+    results = run_concurrent(jobs, devices, args.iters, args.pack)
+    evaluated = evaluate(pairs, results)
+
+    print()
+    for task, idea, ok, msg in evaluated:
+        print(f"[{task}/{idea}] {'PASS' if ok else 'FAIL'}")
         print("  " + msg.replace("\n", "\n  "))
 
     print("\n" + "=" * 60)
-    npass = sum(1 for _, _, ok in results if ok)
-    print(f"FUNC VALIDATION: {npass}/{len(results)} passed")
-    for task, idea, ok in results:
+    npass = sum(1 for _, _, ok, _ in evaluated if ok)
+    print(f"FUNC VALIDATION: {npass}/{len(evaluated)} passed")
+    for task, idea, ok, _ in evaluated:
         print(f"  {'PASS' if ok else 'FAIL'}  {task}/{idea}")
     print("=" * 60)
-    return 0 if npass == len(results) else 1
+    return 0 if npass == len(evaluated) else 1
 
 
 if __name__ == "__main__":
