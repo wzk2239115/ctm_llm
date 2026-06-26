@@ -104,6 +104,8 @@ def main():
     ap = argparse.ArgumentParser(description="Run st10 draft-revise locally")
     ap.add_argument("--devices", type=str, default="0,1,2,3",
                     help="comma-separated GPU IDs")
+    ap.add_argument("--pack", type=int, default=2,
+                    help="concurrent jobs per GPU (watch memory!)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--training-iterations", type=int, default=None,
                     help="override training_iterations (e.g. 500 for quick test)")
@@ -111,18 +113,18 @@ def main():
 
     devices = [int(x) for x in args.devices.split(",") if x.strip()]
     configs = build_st10_configs()
-    print(f"Total experiments: {len(configs)}, GPUs: {devices}")
+    pack = args.pack
+    print(f"Total experiments: {len(configs)}, GPUs: {devices}, pack={pack}")
     print()
 
     if args.training_iterations is not None:
         for _, _, _, cfg in configs:
             cfg["training_iterations"] = args.training_iterations
 
-    procs = {}
-    def _launch(idx, cfg, device):
+    def _launch(cfg, device):
         module = cfg.pop("module")
         exp_name = cfg.pop("name")
-        task_name = cfg.pop("task_name")
+        _ = cfg.pop("task_name")
         cfg["device"] = device
         cmd = [sys.executable, "-m", module]
         for k, v in cfg.items():
@@ -147,37 +149,48 @@ def main():
         return subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, text=True,
                                 cwd=str(ROOT))
 
-    def _poll(procs):
-        done = []
-        for idx, p in list(procs.items()):
-            ret = p.poll()
-            if ret is not None:
-                done.append(idx)
-        for idx in done:
-            procs.pop(idx)
-        return done
+    dev_count = {d: 0 for d in devices}
+    # Assign each config a device round-robin, track by name
+    name_to_info = {c[2]: c for c in configs}
+    queue = list(name_to_info.keys())
+    # device assignments (round-robin on original order)
+    dev_of = {c[2]: devices[i % len(devices)] for i, c in enumerate(configs)}
 
-    idx = 0
-    running = {}
-    while idx < len(configs) or running:
-        while len(running) < len(devices) and idx < len(configs):
-            task_name, module, name, cfg = configs[idx]
+    next_idx = 0
+    running = {}  # name → (Popen, device)
+    while next_idx < len(queue) or running:
+        launched = False
+        while next_idx < len(queue):
+            name = queue[next_idx]
+            dev = dev_of[name]
+            if dev_count[dev] >= pack:
+                break
+            task_name, module, _, cfg = name_to_info[name]
             cfg["task_name"] = task_name
             cfg["module"] = module
             cfg["name"] = name
-            dev = devices[idx % len(devices)]
-            p = _launch(idx, dict(cfg), dev)
+            p = _launch(dict(cfg), dev)
             if p:
-                running[idx] = p
-            idx += 1
-        if running:
+                running[name] = (p, dev)
+                dev_count[dev] += 1
+            next_idx += 1
+            launched = True
+        if not running:
+            break
+        if not launched:
             time.sleep(10)
-            done = _poll(running)
-            if done:
-                print(f"  done: {[configs[i][2] for i in done]}")
-                sys.stdout.flush()
-        else:
-            time.sleep(1)
+        done_names = []
+        for name, (p, dev) in list(running.items()):
+            ret = p.poll()
+            if ret is not None:
+                done_names.append((name, dev, p))
+        for name, dev, p in done_names:
+            running.pop(name)
+            dev_count[dev] -= 1
+            if dev_count[dev] < 0:
+                dev_count[dev] = 0
+            print(f"  done: {name} (rc={p.returncode})")
+            sys.stdout.flush()
 
     print("\nAll experiments completed.")
     return 0
