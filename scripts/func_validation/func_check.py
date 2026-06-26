@@ -176,7 +176,7 @@ def evaluate(pairs, results):
                         f"{task}/{idea} {vary_param}: {err}"))
             continue
         n = min(len(a), len(b))
-        same = all(abs(x - y) < 1e-4 for x, y in zip(a[:n], b[:n]))
+        same = all(abs(x - y) < 5e-5 for x, y in zip(a[:n], b[:n]))
         detail = (f"{task}/{idea}  {vary_param}={lo} vs {hi}\n"
                   f"    {lo}: {a}\n    {hi}: {b}")
         verdict = ("FAIL (curves identical -> idea inert)" if same
