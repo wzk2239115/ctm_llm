@@ -6,8 +6,8 @@ This is Step 2 of the mandatory two-step verification (see AGENTS.md):
   Step 2 (functional) = it actually has an effect  -> this script
 
 For a given task + idea, it runs TWO short configs with the SAME seed but
-DIFFERENT values of the idea's key hyperparameter, then compares the test-acc
-trajectories:
+DIFFERENT values of the idea's key hyperparameter, then compares the metric
+trajectories (test_loss preferred — sensitive even at 0% accuracy):
   - identical curves -> the idea is inert (args not wired onto the model) -> FAIL
   - differing curves -> the idea takes effect                       -> PASS
 
@@ -44,8 +44,11 @@ import torch  # noqa: E402
 
 from smoke_baseline import TASKS  # noqa: E402
 
-ACC_KEYS = ["test_accuracies_full_list", "test_accuracies",
-            "val_accuracies", "test_accuracies_most_certain"]
+# Prefer loss over accuracy: loss is always non-zero and varies even when
+# the model hasn't reached non-trivial accuracy (e.g. sort at 300 iters).
+# This makes the comparison discriminative for all training stages.
+METRIC_KEYS = ["test_losses", "test_accuracies_full_list", "test_accuracies",
+               "val_accuracies", "test_accuracies_most_certain"]
 
 IDEAS = {
     "revise": {
@@ -119,11 +122,11 @@ def run_job(job, device, iters):
     if ck is None:
         return None, "no checkpoint written"
     d = torch.load(ck, map_location="cpu", weights_only=False)
-    for k in ACC_KEYS:
+    for k in METRIC_KEYS:
         v = d.get(k) if isinstance(d, dict) else None
         if isinstance(v, (list, tuple)) and v:
-            return [round(x, 5) for x in v], None
-    return None, "no test_accuracies found in checkpoint"
+            return [round(float(x), 5) for x in v], None
+    return None, "no metrics found in checkpoint"
 
 
 def make_jobs(pairs, iters, ticks_override):
@@ -173,7 +176,7 @@ def evaluate(pairs, results):
                         f"{task}/{idea} {vary_param}: {err}"))
             continue
         n = min(len(a), len(b))
-        same = a[:n] == b[:n]
+        same = all(abs(x - y) < 1e-4 for x, y in zip(a[:n], b[:n]))
         detail = (f"{task}/{idea}  {vary_param}={lo} vs {hi}\n"
                   f"    {lo}: {a}\n    {hi}: {b}")
         verdict = ("FAIL (curves identical -> idea inert)" if same
