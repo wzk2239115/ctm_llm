@@ -104,8 +104,8 @@ def main():
     ap = argparse.ArgumentParser(description="Run st10 draft-revise locally")
     ap.add_argument("--devices", type=str, default="0,1,2,3",
                     help="comma-separated GPU IDs")
-    ap.add_argument("--pack", type=int, default=2,
-                    help="concurrent jobs per GPU (watch memory!)")
+    ap.add_argument("--pack", type=int, default=4,
+                    help="concurrent jobs per GPU")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--training-iterations", type=int, default=None,
                     help="override training_iterations (e.g. 500 for quick test)")
