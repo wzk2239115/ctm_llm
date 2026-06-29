@@ -46,10 +46,20 @@ from worldmodel.wm import (
 )
 from worldmodel.train import train_world_model
 
-MODELS_BY_ENV = {
-    "point-state": ["jepa-mlp", "stream-ctm"],
-    "point-image": ["jepa-mlp", "stream-ctm", "ctm-encoder"],
-}
+IMAGE_ENVS = {"point-image", "tworoom"}  # ctm-encoder (image-only) applies here
+
+
+def models_for_env(env_name: str) -> list[str]:
+    """Models applicable to an env: image envs get the CTM encoder too."""
+    base = env_name.lower().replace("_", "-")
+    is_image = base in IMAGE_ENVS or (base.startswith("tworoom") and not base.endswith("state"))
+    return ["jepa-mlp", "stream-ctm", "ctm-encoder"] if is_image else ["jepa-mlp", "stream-ctm"]
+
+
+DEFAULT_ENVS = [
+    "cartpole", "cartpole-partial", "pendulum", "pendulum-partial", "reacher",
+    "tworoom-state", "tworoom", "point-state", "point-image",
+]
 FIELDS = [
     "env", "model", "seed", "horizon", "success_rate", "random_rate",
     "final_loss", "dynamics_err", "latent_var", "elapsed_s",
@@ -93,8 +103,7 @@ def evaluate(model, env_name, env_kw, num_envs, cem_samples, cem_steps, horizon,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--envs", nargs="*", default=["point-state", "point-image"],
-                    choices=["point-state", "point-image"])
+    ap.add_argument("--envs", nargs="*", default=None)
     ap.add_argument("--models", nargs="*", default=None,
                     help="subset of models; default = all applicable per env")
     ap.add_argument("--seeds", nargs="*", type=int, default=[0, 1, 2])
@@ -127,10 +136,10 @@ def main():
     write_header = not os.path.exists(csv_path)
 
     # Build the full task grid, then take this worker's shard.
-    envs = args.envs if args.envs else list(MODELS_BY_ENV.keys())
+    envs = args.envs if args.envs else list(DEFAULT_ENVS)
     tasks: list[tuple[str, str, int]] = []
     for env_name in envs:
-        models = args.models if args.models else MODELS_BY_ENV[env_name]
+        models = args.models if args.models else models_for_env(env_name)
         for m in models:
             for seed in args.seeds:
                 tasks.append((env_name, m, seed))
@@ -187,12 +196,10 @@ def main():
                   f"(rand {rand:4.1f}%) loss={row['final_loss']} var={row['latent_var']}")
 
     print(f"\n[compare] shard {args.shard} wrote {len(rows)} rows -> {csv_path}")
-
-    print(f"\n[compare] shard {args.shard} wrote {len(rows)} rows -> {csv_path}")
     if args.nshards == 1:
         print("\n[compare] summary (success_rate mean+-std over seeds):")
         for env_name in args.envs:
-            models = args.models if args.models else MODELS_BY_ENV[env_name]
+            models = args.models if args.models else models_for_env(env_name)
             for m in models:
                 rs = [r["success_rate"] for r in rows if r["env"] == env_name and r["model"] == m]
                 if rs:
