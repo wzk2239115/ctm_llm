@@ -110,6 +110,9 @@ def main():
     ap.add_argument("--eval_episodes", type=int, default=16)
     ap.add_argument("--num_envs", type=int, default=4)
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--shard", type=int, default=0, help="this worker's shard id (0..nshards-1)")
+    ap.add_argument("--nshards", type=int, default=1, help="total parallel workers")
+    ap.add_argument("--csv_suffix", default="", help="append to csv filename (per-shard isolation)")
     ap.add_argument("--quick", action="store_true")
     args = ap.parse_args()
 
@@ -120,63 +123,83 @@ def main():
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     Path("csv_data").mkdir(exist_ok=True)
-    csv_path = "csv_data/worldmodel_compare_results.csv"
+    csv_path = f"csv_data/worldmodel_compare_results{args.csv_suffix}.csv"
     write_header = not os.path.exists(csv_path)
-    rows = []
 
+    # Build the full task grid, then take this worker's shard.
+    envs = args.envs if args.envs else list(MODELS_BY_ENV.keys())
+    tasks: list[tuple[str, str, int]] = []
+    for env_name in envs:
+        models = args.models if args.models else MODELS_BY_ENV[env_name]
+        for m in models:
+            for seed in args.seeds:
+                tasks.append((env_name, m, seed))
+    shard_tasks = tasks[args.shard :: args.nshards]
+    print(f"[compare] shard {args.shard}/{args.nshards}: {len(shard_tasks)}/{len(tasks)} tasks "
+          f"-> {csv_path}  device={device}")
+
+    rows = []
     with open(csv_path, "a", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=FIELDS)
         if write_header:
             wr.writeheader()
-        for env_name in args.envs:
-            env_kw = {"image_size": args.image_size} if env_name == "point-image" else {}
-            obs_key = "pixels" if env_name == "point-image" else "state"
-            env = make_env(env_name, **env_kw)
-            obs_shape, action_dim = env.observation_space.shape, env.action_space.shape[0]
-            models = args.models if args.models else MODELS_BY_ENV[env_name]
-            print(f"\n=== {env_name}  obs={obs_key}{obs_shape}  models={models} ===")
 
-            # Shared dataset per env (collected once).
-            buffer = wm.data.ReplayBuffer()
+        # Group shard tasks by env so each env's dataset is collected only once.
+        buffers: dict[str, wm.data.ReplayBuffer] = {}
+        for env_name in sorted({t[0] for t in shard_tasks}):
+            env_kw = {"image_size": args.image_size} if env_name == "point-image" else {}
+            buf = wm.data.ReplayBuffer()
             cw = wm.World(lambda: make_env(env_name, **env_kw), num_envs=args.num_envs)
             cw.set_policy(wm.RandomPolicy())
-            cw.collect(buffer, episodes=args.episodes, seed=0)
-            print(f"  collected {len(buffer.episodes)} episodes / {buffer.total_steps} steps")
+            cw.collect(buf, episodes=args.episodes, seed=0)
+            buffers[env_name] = (buf, env_kw)
+            print(f"=== {env_name}: collected {len(buf.episodes)} episodes / {buf.total_steps} steps ===")
 
-            for model_name in models:
-                for seed in args.seeds:
-                    t0 = time.time()
-                    torch.manual_seed(seed); np.random.seed(seed)
-                    model = build_model(model_name, obs_key, obs_shape, action_dim,
-                                        args.latent_dim, args.var_weight, device)
-                    hist = train_world_model(model, buffer, horizon=args.horizon, epochs=args.epochs,
-                                             batch_size=args.batch_size, device=device,
-                                             log_every=10**9, seed=seed)
-                    last = hist[-1] if hist else {}
-                    model = model.to(device).eval()
-                    succ, rand = evaluate(model, env_name, env_kw, args.num_envs,
-                                          args.cem_samples, args.cem_steps, args.horizon,
-                                          args.eval_episodes, device)
-                    row = {
-                        "env": env_name, "model": model_name, "seed": seed, "horizon": args.horizon,
-                        "success_rate": round(succ, 1), "random_rate": round(rand, 1),
-                        "final_loss": round(float(last.get("loss", float("nan"))), 5),
-                        "dynamics_err": round(float(last.get("dynamics_err", float("nan"))), 5),
-                        "latent_var": round(float(last.get("latent_var", float("nan"))), 5),
-                        "elapsed_s": round(time.time() - t0, 1),
-                    }
-                    wr.writerow(row); f.flush(); rows.append(row)
-                    print(f"  {model_name:<12} seed{seed}: succ={succ:5.1f}% (rand {rand:4.1f}%) "
-                          f"loss={row['final_loss']} var={row['latent_var']}")
+        for env_name, model_name, seed in shard_tasks:
+            buf, env_kw = buffers[env_name]
+            obs_key = "pixels" if env_name == "point-image" else "state"
+            if env_name not in buffers:
+                continue
+            env = make_env(env_name, **env_kw)
+            obs_shape, action_dim = env.observation_space.shape, env.action_space.shape[0]
+            t0 = time.time()
+            torch.manual_seed(seed); np.random.seed(seed)
+            model = build_model(model_name, obs_key, obs_shape, action_dim,
+                                args.latent_dim, args.var_weight, device)
+            hist = train_world_model(model, buf, horizon=args.horizon, epochs=args.epochs,
+                                     batch_size=args.batch_size, device=device,
+                                     log_every=10**9, seed=seed)
+            last = hist[-1] if hist else {}
+            model = model.to(device).eval()
+            succ, rand = evaluate(model, env_name, env_kw, args.num_envs,
+                                  args.cem_samples, args.cem_steps, args.horizon,
+                                  args.eval_episodes, device)
+            row = {
+                "env": env_name, "model": model_name, "seed": seed, "horizon": args.horizon,
+                "success_rate": round(succ, 1), "random_rate": round(rand, 1),
+                "final_loss": round(float(last.get("loss", float("nan"))), 5),
+                "dynamics_err": round(float(last.get("dynamics_err", float("nan"))), 5),
+                "latent_var": round(float(last.get("latent_var", float("nan"))), 5),
+                "elapsed_s": round(time.time() - t0, 1),
+            }
+            wr.writerow(row); f.flush(); rows.append(row)
+            print(f"  {env_name:<12} {model_name:<12} seed{seed}: succ={succ:5.1f}% "
+                  f"(rand {rand:4.1f}%) loss={row['final_loss']} var={row['latent_var']}")
 
-    print(f"\n[compare] wrote {len(rows)} rows -> {csv_path}")
-    print("\n[compare] summary (success_rate mean+-std over seeds):")
-    for env_name in args.envs:
-        models = args.models if args.models else MODELS_BY_ENV[env_name]
-        for m in models:
-            rs = [r["success_rate"] for r in rows if r["env"] == env_name and r["model"] == m]
-            if rs:
-                print(f"  {env_name:<12} {m:<12} {np.mean(rs):5.1f} +- {np.std(rs):4.1f}  (n={len(rs)})")
+    print(f"\n[compare] shard {args.shard} wrote {len(rows)} rows -> {csv_path}")
+
+    print(f"\n[compare] shard {args.shard} wrote {len(rows)} rows -> {csv_path}")
+    if args.nshards == 1:
+        print("\n[compare] summary (success_rate mean+-std over seeds):")
+        for env_name in args.envs:
+            models = args.models if args.models else MODELS_BY_ENV[env_name]
+            for m in models:
+                rs = [r["success_rate"] for r in rows if r["env"] == env_name and r["model"] == m]
+                if rs:
+                    print(f"  {env_name:<12} {m:<12} {np.mean(rs):5.1f} +- {np.std(rs):4.1f}  (n={len(rs)})")
+    else:
+        print("[compare] (multi-shard: merge per-shard CSVs and summarize after; "
+              "see scripts/run_worldmodel_compare.sh)")
 
 
 if __name__ == "__main__":
