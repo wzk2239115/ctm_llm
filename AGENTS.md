@@ -84,6 +84,20 @@ python scripts/experiment_plan_ctm_paper.py submit --stage all --no-wait
 - **`.fail.json` 和 per-experiment `.log` 文件在算力机上生成**, 开发机无法直接访问. 需要用户从算力机手动复制到开发机 (或粘贴内容) 才能诊断失败原因.
 - 调试失败任务时, 请用户提供: `runs/metrics/{exp_name}.fail.json` 内容 + 对应的 `logs/{exp_name}.log` 末尾 traceback.
 
+## 实验记录规范 (强制)
+每批实验必须有据可查, 方便日后回溯"为什么跑、当时怎么想的、结论是什么". 全部记录在 **`EXPERIMENT_LOG.md`**(根目录, 倒序追加, 最新在最上).
+- **何时记**: 提交实验前先写一段(至少思路+配置+预期), 收菜/分析后回填结果+结论. 不要等忘光了再补.
+- **必填字段**(缺一不可):
+  1. **日期** `YYYY-MM-DD`
+  2. **思路(用户提供)**: 一句话写清楚这次实验的**动机/来源**, 尤其是用户口头给的 idea 或方向. 这是日后看懂"为什么有这批实验"的关键, 必须记原话意图, 不要只记技术细节.
+  3. **配置**: stage 名 / 关键超参 / 跑在哪(`logs/...` 路径).
+  4. **预期**: 期望看到什么现象.
+  5. **结果**: best_acc / delta / 口径(mc-vs-mc 还是 final) / 样本数.
+  6. **结论**: idea 是否有效, 口径是否需修正(如 sparsity 看 Pareto 而非单精度).
+  7. **下一步**: 是否有 follow-up / 待补 seed / 待修 wiring.
+- **和已有文件分工**: `EXPERIMENT_PLAN.md` = 将来要跑的计划(matrix size/命令); `EXPERIMENT_LOG.md` = 跑过的日志(日期+思路+结论). 两者互补, 不要混.
+- 范例见 `EXPERIMENT_LOG.md` 首条(0629 收菜分析).
+
 ## 实验结果分析准则 (强制)
 判 idea 是否有效, 单看"精度 delta vs baseline"经常**误导**, 必须按 idea 性质选对口径. 已踩的坑:
 
