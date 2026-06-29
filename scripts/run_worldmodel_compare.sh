@@ -8,7 +8,8 @@
 #   NGPU=8 ./scripts/run_worldmodel_compare.sh --seeds 0 1 2 3 4 --epochs 80
 #   NGPU=1 ./scripts/run_worldmodel_compare.sh --quick     # serial sanity check
 # Extra args after the script are forwarded to run_worldmodel_compare.py.
-set -e
+# (No `set -e`: a single failed shard should not block the merge/summary, so a
+# smoke run surfaces which cell crashed instead of aborting silently.)
 NGPU=${NGPU:-4}
 PY=${PYTHON:-python}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
