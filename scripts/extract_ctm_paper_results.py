@@ -16,9 +16,11 @@ Usage:
 import argparse
 import csv
 import json
+import os
 import statistics
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -162,6 +164,63 @@ def fmt_mean_std(xs):
     return f"{m * 100:.2f}"
 
 
+def _worker_load(ck_path):
+    """ProcessPool worker: load one checkpoint, return summary dict.
+
+    Returns (ck_path, summary_dict). load_summary already encodes errors as
+    {"_error": ...} so the worker never raises into the main process.
+    """
+    return ck_path, load_summary(Path(ck_path))
+
+
+def _assemble_row(stage, exp_name, task, sweep, seed, ck_path, s, cli):
+    """Build a CSV row (+ optional curve entry) from a loaded summary dict."""
+    ck_name = Path(ck_path).name
+    if "_error" in s:
+        return {
+            "stage": stage, "exp": exp_name, "task": task,
+            "sweep": sweep, "seed": seed, "status": "error",
+            "error": s["_error"], "ckpt": ck_name,
+        }, None
+    row = {
+        "stage": stage, "exp": exp_name, "task": task,
+        "sweep": sweep, "seed": seed, "status": "ok",
+        "ckpt": ck_name,
+        "n_points": s["n_points"],
+        "final_iter": s["final_iter"],
+        "final_test_acc": s["final_test_acc"],
+        "best_test_acc": s["best_test_acc"],
+        "final_train_acc": s["final_train_acc"],
+        "best_train_acc": s["best_train_acc"],
+        "final_test_acc_mc": s["final_test_acc_mc"],
+        "best_test_acc_mc": s["best_test_acc_mc"],
+        "final_test_loss": s["final_test_loss"],
+    }
+    if not cli.no_args:
+        a = s["args"]
+        for k in KEY_ARGS:
+            row[k] = a.get(k, "")
+    curve_entry = None
+    if cli.curves and "test_acc_curve" in s:
+        meta = {
+            "stage": stage, "task": task, "sweep": sweep, "seed": seed,
+            "best_test_acc": s["best_test_acc"],
+            "final_test_acc": s["final_test_acc"],
+            "final_iter": s["final_iter"],
+        }
+        if not cli.no_args:
+            a = s["args"]
+            for k in KEY_ARGS:
+                meta[k] = a.get(k, "")
+        curve_entry = {
+            "key": f"{stage}/{exp_name}",
+            "meta": meta,
+            "iters": s.get("iters_curve", []),
+            "test_acc": s["test_acc_curve"],
+        }
+    return row, curve_entry
+
+
 def collect(cli):
     stages = None if cli.stages == "all" else set(cli.stages.split(","))
     tasks = None if cli.tasks == "all" else set(cli.tasks.split(","))
@@ -179,6 +238,8 @@ def collect(cli):
         print(f"ERROR: {logs_path} does not exist")
         return rows, curves, 0, 0, time.time() - t0
 
+    # Phase 1: enumerate candidate checkpoints (fast: stat only, no torch.load)
+    candidates = []  # (stage, exp_name, task, sweep, seed, ck_path)
     for stage_dir in sorted(logs_path.iterdir()):
         if not stage_dir.is_dir():
             continue
@@ -194,67 +255,71 @@ def collect(cli):
             task, sweep, seed = parse_exp_name(exp_dir.name)
             if tasks is not None and task not in tasks:
                 continue
+            candidates.append((stage, exp_dir.name, task, sweep, seed, str(ck)))
+            if cli.limit and len(candidates) >= cli.limit:
+                break
+        if cli.limit and len(candidates) >= cli.limit:
+            break
 
-            s = load_summary(ck)
-            if "_error" in s:
-                row = {
-                    "stage": stage, "exp": exp_dir.name, "task": task,
-                    "sweep": sweep, "seed": seed, "status": "error",
-                    "error": s["_error"], "ckpt": ck.name,
-                }
-                n_err += 1
-            else:
-                row = {
-                    "stage": stage, "exp": exp_dir.name, "task": task,
-                    "sweep": sweep, "seed": seed, "status": "ok",
-                    "ckpt": ck.name,
-                    "n_points": s["n_points"],
-                    "final_iter": s["final_iter"],
-                    "final_test_acc": s["final_test_acc"],
-                    "best_test_acc": s["best_test_acc"],
-                    "final_train_acc": s["final_train_acc"],
-                    "best_train_acc": s["best_train_acc"],
-                    "final_test_acc_mc": s["final_test_acc_mc"],
-                    "best_test_acc_mc": s["best_test_acc_mc"],
-                    "final_test_loss": s["final_test_loss"],
-                }
-                if not cli.no_args:
-                    a = s["args"]
-                    for k in KEY_ARGS:
-                        row[k] = a.get(k, "")
-                if cli.curves and "test_acc_curve" in s:
-                    meta = {
-                        "stage": stage,
-                        "task": task,
-                        "sweep": sweep,
-                        "seed": seed,
-                        "best_test_acc": s["best_test_acc"],
-                        "final_test_acc": s["final_test_acc"],
-                        "final_iter": s["final_iter"],
-                    }
-                    if not cli.no_args:
-                        a = s["args"]
-                        for k in KEY_ARGS:
-                            meta[k] = a.get(k, "")
-                    curves[f"{stage}/{exp_dir.name}"] = {
-                        "meta": meta,
-                        "iters": s.get("iters_curve", []),
-                        "test_acc": s["test_acc_curve"],
-                    }
-                n_ok += 1
+    n_total = len(candidates)
+    if n_total == 0:
+        return rows, curves, 0, 0, time.time() - t0
 
+    workers = max(1, cli.workers)
+    use_pool = workers > 1 and n_total > 1
+    print(f"Loading {n_total} checkpoints with "
+          f"{'ProcessPool(' + str(workers) + ' workers)' if use_pool else 'serial'} ...",
+          flush=True)
+
+    # Phase 2: load checkpoints (parallel if workers>1, else serial)
+    done = 0
+    if use_pool:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_worker_load, c[5]): c for c in candidates}
+            for fut in as_completed(futs):
+                c = futs[fut]
+                ck_path, s = fut.result()
+                row, curve_entry = _assemble_row(
+                    c[0], c[1], c[2], c[3], c[4], ck_path, s, cli)
+                rows.append(row)
+                if curve_entry is not None:
+                    curves[curve_entry["key"]] = {
+                        "meta": curve_entry["meta"],
+                        "iters": curve_entry["iters"],
+                        "test_acc": curve_entry["test_acc"],
+                    }
+                if row.get("status") == "ok":
+                    n_ok += 1
+                else:
+                    n_err += 1
+                done += 1
+                ft = row.get("final_test_acc")
+                bt = row.get("best_test_acc")
+                print(f"[{done:3d}/{n_total}] {c[0]}/{c[1]:42s} "
+                      f"final={fmt_pct(ft):>7s} best={fmt_pct(bt):>7s}  "
+                      f"[{time.time() - t0:.0f}s]", flush=True)
+    else:
+        for c in candidates:
+            ck_path, s = _worker_load(c[5])
+            row, curve_entry = _assemble_row(
+                c[0], c[1], c[2], c[3], c[4], ck_path, s, cli)
             rows.append(row)
-            elapsed = time.time() - t0
+            if curve_entry is not None:
+                curves[curve_entry["key"]] = {
+                    "meta": curve_entry["meta"],
+                    "iters": curve_entry["iters"],
+                    "test_acc": curve_entry["test_acc"],
+                }
+            if row.get("status") == "ok":
+                n_ok += 1
+            else:
+                n_err += 1
+            done += 1
             ft = row.get("final_test_acc")
             bt = row.get("best_test_acc")
-            print(f"[{n_ok + n_err:3d}] {stage}/{exp_dir.name:42s} "
-                  f"final={fmt_pct(ft):>7s} best={fmt_pct(bt):>7s}  [{elapsed:.0f}s]",
-                  flush=True)
-
-            if cli.limit and n_ok + n_err >= cli.limit:
-                break
-        if cli.limit and n_ok + n_err >= cli.limit:
-            break
+            print(f"[{done:3d}/{n_total}] {c[0]}/{c[1]:42s} "
+                  f"final={fmt_pct(ft):>7s} best={fmt_pct(bt):>7s}  "
+                  f"[{time.time() - t0:.0f}s]", flush=True)
 
     return rows, curves, n_ok, n_err, time.time() - t0
 
@@ -318,7 +383,11 @@ def main():
     ap.add_argument("--no-args", action="store_true", help="skip args dump (faster)")
     ap.add_argument("--curves", action="store_true",
                     help="also dump full test_acc curves to runs/metrics/<logs_name>_curves.json")
+    ap.add_argument("--workers", type=int, default=0,
+                    help="parallel checkpoint loaders (0 = min(cpu_count, 16); 1 = serial)")
     cli = ap.parse_args()
+    if cli.workers == 0:
+        cli.workers = min(os.cpu_count() or 4, 16)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
