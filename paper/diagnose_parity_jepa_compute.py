@@ -126,39 +126,47 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=0.9)
     ap.add_argument("--steps", type=int, default=40, help="训练步数(40步够看崩/NaN)")
     ap.add_argument("--timeout", type=int, default=600, help="单配置超时秒数")
+    ap.add_argument("--jepa_w", type=str, default="0.1",
+                    help="JEPA weight(s): 单值如 0.1, 或逗号分隔扫描如 0.1,0.03,0.01")
     args = ap.parse_args()
     import math
     assert int(math.sqrt(args.seq))**2 == args.seq, "seq 必须是完全平方数"
 
+    weights = [float(w) for w in args.jepa_w.split(",")]
+
     print(f"parity 诊断 (算力机真实配置) | d_model={args.d_model} seq={args.seq} "
           f"batch={args.batch} ticks={args.iterations} steps={args.steps}")
     print(f"GPU: {__import__('torch').cuda.get_device_name(0)}")
+    print(f"JEPA weights to test: {weights}")
 
     results = {}
-    results["baseline"] = run("1) BASELINE (jepa=0) — 控制组", args, 0.0)
-    results["jepa_w0.1"] = run("2) JEPA w=0.1 — 算力机 killed 的配置", args, 0.1)
+    results["baseline"] = run("0) BASELINE (jepa=0) — 控制组", args, 0.0)
+    for i, w in enumerate(weights, 1):
+        results[f"jepa_w{w}"] = run(f"{i}) JEPA w={w}", args, w)
 
     print("\n" + "=" * 70)
     print("FINAL VERDICT")
     print("=" * 70)
     for k, v in results.items():
-        print(f"  {k:12s} -> {v}")
+        print(f"  {k:16s} -> {v}")
 
-    b, j = results["baseline"], results["jepa_w0.1"]
-    if b == "OK" and j in ("OOM", "NAN", "CRASH"):
-        print(f"\n结论: baseline 正常但 JEPA 崩 -> JEPA 特有问题({j})。")
-        if j == "OOM": print("  克服: JEPA predictor 占额外显存, 降 batch 到 48。")
-        if j == "NAN": print("  克服: 加强 grad_clip(0.5) / stablemax_ce / 降 lr。")
+    b = results["baseline"]
+    # 关键判定: baseline 在学但 JEPA 卡 0.5 = 辅助 loss 压制主任务
+    if b == "OK":
+        print("\nbaseline 在学。看各 JEPA weight 是否让 acc 脱离 0.5:")
+        for k, v in results.items():
+            if k.startswith("jepa"):
+                w = k.replace("jepa_w", "")
+                if v == "OK":
+                    print(f"  w={w}: 在学 ✓ — 这个 weight 不压制主任务")
+                elif v == "STALLED":
+                    print(f"  w={w}: 压制主任务 ✗ — weight 太强, 再降")
+        print("找到最大的 '在学' weight = parity 上能用 JEPA 的甜点。")
+        print("若全 STALLED: JEPA 在 parity(seq=64)上本质压制主任务, 用 warmup 或放弃。")
     elif b in ("OOM", "NAN", "CRASH"):
-        print(f"\n结论: baseline 也崩({b}) -> 不是 JEPA 问题, 是 parity 大配置本身不稳。")
-        print("  克服: 降 batch/d_model, 或查算力机当时是否多任务抢显存。")
-    elif b == "OK" and j == "OK":
-        print("\n结论: 两者都不崩 -> 算力机 final_iter=0 是 pool/checkpoint 工程问题。")
-        print("  下一步: cat runs/metrics/st04*parity*.fail.json + tail logs/ 对应 .log")
-    elif b == "OK" and j == "STALLED":
-        print("\n结论: JEPA 不崩但训练停滞 -> idea 接上了但干扰学习, 调小 jepa_weight。")
+        print(f"\n结论: baseline 也崩({b}) -> 不是 JEPA 问题, 是 parity 大配置不稳。")
     else:
-        print(f"\n结论: baseline={b}, jepa={j}。看上面各 VERDICT 行的详细建议。")
+        print(f"\n结论: baseline={b}。步数可能不够, 加 --steps。")
 
 
 if __name__ == "__main__":
