@@ -95,7 +95,7 @@ python scripts/experiment_plan_ctm_paper.py submit --stage all --no-wait
   5. **结果**: best_acc / delta / 口径(mc-vs-mc 还是 final) / 样本数.
   6. **结论**: idea 是否有效, 口径是否需修正(如 sparsity 看 Pareto 而非单精度).
   7. **下一步**: 是否有 follow-up / 待补 seed / 待修 wiring.
-- **和已有文件分工**: `EXPERIMENT_PLAN.md` = 将来要跑的计划(matrix size/命令); `EXPERIMENT_LOG.md` = 跑过的日志(日期+思路+结论). 两者互补, 不要混.
+- **和已有文件分工**: `EXPERIMENT_PLAN.md` = 将来要跑的计划(matrix size/命令); `EXPERIMENT_LOG.md` = 跑过的日志(日期+思路+结论); `VERIFIED_CONCLUSIONS.md` = 已验证有效、可写论文的结论(JEPA/revise/sparsity 三块, 含口径+边界). 两者互补, 不要混.
 - 范例见 `EXPERIMENT_LOG.md` 首条(0629 收菜分析).
 
 ## 实验结果分析准则 (强制)
