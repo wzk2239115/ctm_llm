@@ -31,13 +31,17 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA = ROOT / "csv_data"
 DEFAULT_OUT = ROOT / "runs" / "figures" / "ctm_paper"
 
-# baseline reference accs from st00 (paper config) for horizontal lines
+# baseline reference accs = st00 paper REPRODUCED best_test_acc (final-tick).
+# NOTE: must match csv_data/ctm_paper_summary.csv st00/paper rows. Earlier
+# versions used stale values (mazes 0.8028, sort 0.7146, qamnist 0.2341) that
+# could NOT be reproduced from checkpoints and inflated every delta (mazes
+# alone +11pp phantom). See paper/explain/03_sparsity_robustness.md:35.
 BASELINE_PAPER = {
-    "cifar10": 0.6443,
-    "mazes": 0.8028,
+    "cifar10": 0.6690,
+    "mazes": 0.9016,
     "parity": 0.6797,
-    "qamnist": 0.2341,
-    "sort": 0.7146,
+    "qamnist": 0.3662,
+    "sort": 0.8753,
 }
 # ff (feed-forward) baseline for cifar10
 BASELINE_FF = {"cifar10": 0.8407}

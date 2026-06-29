@@ -7,6 +7,23 @@
 
 ---
 
+## 2026-06-29 — JEPA 口径修正 + baseline 过时修复
+
+- **思路(用户提供)**: cross_tick_jepa 是验证通过的优化方法, 之前的分析漏了它, 检查一下.
+- **排查**: `paper/explain/fig5b_jepa_weight.md` 已结论"JEPA 有效 +9~30pp"(final-tick 口径). 但我之前的 `analyze_deep.py` 只用 mc-vs-mc 把 JEPA 判中性, 是口径偏差.
+- **结果**:
+  - **JEPA final-tick 真实有效**: cifar10 +7.5pp(n=3), qamnist +17pp(n=2). 这是真的, JEPA 让"相邻 tick 隐状态可预测", 提升最后一步预测.
+  - **JEPA 不抬 mc 天花板**: cifar10/mazes/qamnist 的 mc delta 都 -0.5~-1pp(中性). JEPA 改善"平均 tick 质量"而非"最优 tick".
+  - **fig5b 报告自己的 bug**: 它说 mazes +9.6pp(最佳场景), 但用了过时 baseline `BASELINE_PAPER["mazes"]=0.8028`(旧值). 真实 st00 mazes=0.9016, 实际 mazes JEPA = -1.2pp(中性, 不是最佳场景). cifar10 baseline(0.6443)也偏低, 真实 0.6690.
+- **修复**: `scripts/plot_ctm_paper_results.py:BASELINE_PAPER` 改成 st00 复现值(cifar10 0.6690 / mazes 0.9016 / qamnist 0.3662 / sort 0.8753; parity 0.6797 不变). 修复后 fig5 mazes 的 baseline 线从 80% 升到 90%, JEPA 柱不再"超过".
+- **修正后的有效方法清单**:
+  | 方法 | 有效 | 真实证据 | 口径 |
+  |---|---|---|---|
+  | JEPA | ✅ | cifar10 +7.5pp, qamnist +17pp | final-tick |
+  | revise | ✅ | parity mc +10pp | mc, n=5 |
+  | sparsity | ✅ | mazes 省 90% 算力掉 1pp | Pareto 效率 |
+- **下一步**: 教训——判 idea 有效性要先确认指标口径(final-tick vs mc), 且 baseline 必须用同口径的复现值, 不能用过时常量. fig5b 的 md 文本描述尚未同步更新(mazes"最佳场景"那段需改).
+
 ## 2026-06-29 — 0629 收菜 + idea 有效性深度分析
 
 - **思路(用户提供)**: 算力机上 ctm_paper st00-st24 + deep 01-04 已经跑了一部分,开始收菜然后做深入分析;后来追问"哪个优化方法有效",并指出 sparsity 要结合"省算力 vs 掉点"看,不能只比精度。
