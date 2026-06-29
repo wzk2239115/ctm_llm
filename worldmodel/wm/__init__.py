@@ -10,6 +10,7 @@ builders here assemble the two encoders we compare:
 from .world_model import WorldModel
 from .encoders import CNNEncoder, CTMEncoder, MLPEncoder
 from .predictors import MLPPredictor
+from .streaming import StreamingCTMPredictor
 from .ctm_wm import build_ctm_wm
 from .jepa_wm import build_jepa_wm
 
@@ -19,6 +20,7 @@ __all__ = [
     'CTMEncoder',
     'MLPEncoder',
     'MLPPredictor',
+    'StreamingCTMPredictor',
     'build_ctm_wm',
     'build_jepa_wm',
 ]

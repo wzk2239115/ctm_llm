@@ -19,6 +19,7 @@
 - **关键陷阱 — JEPA encoder 崩塌**: 从零训 JEPA latent 预测时, encoder 易崩塌为常数 (latent_var→0, cost 无梯度, CEM 退化为随机). `WorldModel` 内置 VICReg 方差正则 (`var_weight>0`) + 可选 EMA target encoder (`ema_decay>0`) 防崩塌. **CTM encoder 因深递归梯度流弱, 比 CNN 更易崩塌**, 是真实研究点. 诊断看 `latent_var` 列: ~0 = 崩塌.
 - **Smoke**: `python scripts/smoke_worldmodel.py --env point-state --local` (state, 最快) / `--env point-image --var_weight 1.0` (image+CNN) / `--model ctm --env point-image --var_weight 1.0` (image+CTM).
 - **对比实验**: `python paper/run_worldmodel.py --env point-image --episodes 60 --epochs 50 --var_weight 1.0` → 扫 CTM `iterations` × JEPA `latent_dim`, 写 `csv_data/worldmodel_results.csv` (success_rate/loss/latent_var). sweep 故意变 encoder 关键超参, 起两步走「功能验证」作用.
+- **流式 CTM (闭环改造)**: `worldmodel/wm/streaming.py` 的 `StreamingCTMPredictor` 是"持续 ingest/思考/emit"的潜空间动力学预测器 —— 持久 NLM 状态 `(activated_state, trace)` 跨 tick 携带, 每个 tick 同时吃反馈(action)→思考(synapse+NLM)→emit(latent), 无冻结输入、无 per-sample reset. 作为 `WorldModel` 的 predictor 滴入(复用同 encoder/CEM/数据), `rollout` 自动委托给它. 保留 CTM 的 NLM+synchronisation 思想, 砸掉冻结-kv attention 和固定 iterations. 实验 `scripts/experiment_streaming_ctm.py`: 对比 `jepa-mlp`(Markov) vs `stream-ctm`(持续思考), 写 `csv_data/streaming_ctm_results.csv`. **state env 上 stream-ctm 100% success (WORKS, 撑起 CEM 规划)**; image env 上 from-scratch CNN encoder 易 JEPA 崩塌 (影响两者, 与流式无关), 是独立待解问题.
 - **算力机后台**: `nohup python paper/run_worldmodel.py --env point-image --episodes 80 --epochs 80 --var_weight 1.0 > logs/worldmodel.log 2>&1 &` (无需代理, 无外部下载)
 
 ## 路径差异

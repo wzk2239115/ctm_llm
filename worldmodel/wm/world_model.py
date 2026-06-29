@@ -78,7 +78,13 @@ class WorldModel(nn.Module):
             actions:     ``(..., H, A)``.
         Returns:
             Predicted latents ``(..., H, D)``.
+
+        If the predictor exposes its own ``rollout`` (e.g. the streaming CTM,
+        which carries persistent state across ticks), delegate to it so the
+        recurrence stays unbroken across the horizon.
         """
+        if hasattr(self.predictor, 'rollout'):
+            return self.predictor.rollout(init_latent, actions)
         preds = []
         z = init_latent
         H = actions.shape[-2]
