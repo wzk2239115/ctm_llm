@@ -151,6 +151,22 @@ def _worker(rank, args, nworkers, all_tasks):
     print(f"[gpu{rank}] done {len(rows)} tasks -> {out_path}", flush=True)
 
 
+def _load_shards():
+    """从 shard CSV 读取所有 runs, 数值字段转 float (csv.DictReader 返回 str)。"""
+    rows = []
+    _NUM = ("success_rate", "random_rate", "dynamics_err", "latent_var", "elapsed_s", "memory_length")
+    for p in sorted(Path("csv_data").glob("stream_ctm_diag_shard*.csv")):
+        with open(p) as f:
+            for r in csv.DictReader(f):
+                for k in _NUM:
+                    try:
+                        r[k] = float(r[k])
+                    except (ValueError, TypeError):
+                        pass
+                rows.append(r)
+    return rows
+
+
 def judge(rows, envs):
     """打印结果表 + 根因判定 + 正对照。rows: list of row dict。"""
     res = {(r["env"], r["variant"]): r for r in rows}
@@ -223,12 +239,22 @@ def main():
     ap.add_argument("--nworkers", type=int, default=0,
                     help="并行 worker 数 (=GPU 数). 0=自动探测. 1=串行.")
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--judge-only", action="store_true",
+                    help="跳过训练, 从已有 shard CSV 直接判定 (judge 挂了重出结果用)")
     ap.add_argument("--csv", default="csv_data/stream_ctm_diagnosis.csv")
     args = ap.parse_args()
 
     if args.quick:
         args.episodes = 20; args.epochs = 15; args.eval_episodes = 8
         args.cem_samples = 64; args.cem_steps = 4; args.horizon = 4
+
+    if args.judge_only:
+        rows = _load_shards()
+        if not rows:
+            raise SystemExit("[judge-only] 没找到 csv_data/stream_ctm_diag_shard*.csv, 先正常跑一次")
+        print(f"[judge-only] 从 shard CSV 读取 {len(rows)} runs (不重跑训练)\n")
+        judge(rows, args.envs)
+        return
 
     all_tasks = [(env, v[0], v[1], v[2], v[3]) for env in args.envs for v in VARIANTS]
     n_tasks = len(all_tasks)
@@ -281,12 +307,7 @@ def main():
             _worker, args=(args, nw, all_tasks), nprocs=nw, join=True,
         )
         # merge shard csv
-        rows = []
-        for rank in range(nw):
-            p = f"csv_data/stream_ctm_diag_shard{rank}.csv"
-            if os.path.exists(p):
-                with open(p) as f:
-                    rows.extend(csv.DictReader(f))
+        rows = _load_shards()
 
     print(f"\n[total] {len(rows)}/{n_tasks} runs 完成, 耗时 {time.time()-t_start:.0f}s")
     # 写合并 csv
