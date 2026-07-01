@@ -43,7 +43,7 @@ STAGES_ORDERED = [
     "st00", "st01", "st02", "st03", "st04", "st05", "st06",
     "st07", "st08", "st09", "st10", "st11", "st12",
     "st13", "st14", "st15", "st16", "st17", "st18",
-    "st19", "st20", "st21", "st22",     "st23", "st24",
+    "st19", "st20", "st21", "st22",     "st23", "st24", "st25",
 ]
 ALL_STAGES = STAGES_ORDERED + ["all"]
 
@@ -909,6 +909,52 @@ def build_st24_jepa_halt_sparsity(plan):
     return plan
 
 
+def build_st25_adaptive_jepa(plan):
+    """Adaptive JEPA weight schemes (A/B/C) vs fixed baseline.
+
+    Motivation: st04 showed parity+JEPA at w=0.1 collapses (acc stuck at
+    chance, final_iter=0) — the static JEPA weight over-constrains the synch
+    representation, suppressing the main task ("too busy constraining, not
+    learning the data"). This stage tests three adaptive weight schemes that
+    aim to remove the need to hand-tune cross_tick_jepa_weight:
+      fixed       : static weight (control — reproduces st04's suppression)
+      balance (A) : loss-magnitude balancing (eff_w = ratio * L_main / L_jepa)
+      gate    (B) : acc-gated sigmoid (JEPA opens only after main task learns)
+      uncertainty(C): learnable sigma (Kendall 2018, optimizer picks the weight)
+    All at base_weight=0.1 (the parity-suppressing point) so the question is
+    cleanly "does the adaptive scheme rescue the main task where fixed fails".
+    Schemes implemented in baseline/utils/jepa.py:AdaptiveJEPAController.
+    Diagnosis script: paper/diagnose_parity_jepa_compute.py --jepa_mode ...
+    """
+    jepa_defaults = dict(
+        cross_tick_jepa_hidden_dim=128,
+        cross_tick_jepa_predictor_depth=2,
+        cross_tick_jepa_dropout=0.0,
+    )
+    modes = {
+        "fixed":       {},
+        "balance":     {"jepa_balance_ratio": 0.3},
+        "gate":        {"jepa_gate_threshold": 0.6, "jepa_gate_temp": 0.05},
+        "uncertainty": {"jepa_log_sigma_init": 0.0},
+    }
+    for task_name, (module, base, _) in TASKS.items():
+        for mode, extra in modes.items():
+            for seed in SEEDS:
+                cfg = dict(with_seed(base, seed))
+                cfg["log_dir"] = f"logs/ctm_paper/st25/{task_name}_{mode}_s{seed}"
+                cfg.update(jepa_defaults)
+                cfg["cross_tick_jepa_weight"] = 0.1
+                cfg["jepa_weight_mode"] = mode
+                cfg.update(extra)
+                plan.append(exp(
+                    f"st25_{task_name}_{mode}_s{seed}",
+                    f"{task_name}: adaptive JEPA {mode} (w=0.1) seed={seed}",
+                    _p(module, cfg),
+                    tags=[task_name, "adaptive-jepa", mode],
+                ))
+    return plan
+
+
 # ─── Registry ───
 
 STAGE_BUILDERS = {
@@ -937,6 +983,7 @@ STAGE_BUILDERS = {
     "st22": build_st22_sparsity_multitick,
     "st23": build_st23_async_multitick,
     "st24": build_st24_jepa_halt_sparsity,
+    "st25": build_st25_adaptive_jepa,
 }
 
 STAGE_DESCRIPTIONS = {

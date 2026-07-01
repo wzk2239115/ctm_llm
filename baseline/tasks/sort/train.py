@@ -18,7 +18,7 @@ from baseline.models.ctm_sort import ContinuousThoughtMachineSORT
 from baseline.tasks.image_classification.plotting import plot_neural_dynamics, make_classification_gif
 from baseline.utils.housekeeping import set_seed, zip_python_code
 from baseline.utils.losses import sort_loss
-from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
+from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss, update_jepa_gate_acc
 from baseline.tasks.sort.utils import compute_ctc_accuracy, decode_predictions
 from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
@@ -504,7 +504,8 @@ if __name__=='__main__':
                         loss = loss + compute_jepa_loss(
                             model.cross_tick_predictor, synch_per_tick,
                             args.cross_tick_jepa_weight, args.cross_tick_jepa_loss,
-                            args.cross_tick_jepa_target_stop_grad)
+                            args.cross_tick_jepa_target_stop_grad,
+                            main_loss=loss.detach())
                     # Tick compute penalty
                     if args.tick_compute_weight > 0:
                         n_steps = extras.get('n_steps_used', args.iterations)
@@ -566,6 +567,7 @@ if __name__=='__main__':
                     accuracy = compute_per_tick_accuracy(predictions, targets, args.N_to_sort)
             else:
                 accuracy = compute_ctc_accuracy(predictions, targets, predictions.shape[1]-1)
+            update_jepa_gate_acc(getattr(model, 'cross_tick_predictor', None), accuracy)
             pbar.set_description(f'Sorting {args.N_to_sort} real numbers. Loss={loss.item():0.3f}. Accuracy={accuracy:0.3f}. LR={current_lr:0.6f}')
 
 

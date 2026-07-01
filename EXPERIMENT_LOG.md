@@ -7,6 +7,30 @@
 
 ---
 
+## 2026-06-30 — 自适应 JEPA 权重 (ABC 三方案) 解除 parity 压制
+
+- **思路(用户提供)**: parity+JEPA w=0.1 全 KILLED 的根因是"约束太大、光顾着约束没学训练数据"——JEPA 辅助 loss 的梯度把 synch 表示推向"可预测下一 tick", 挤掉了 parity 判别信号。用户提: **能否给正则项加一个自适应乘数, 从而不用人工调 `cross_tick_jepa_weight`**。实现 ABC 三方案让实验说话。
+- **根因诊断** (`paper/diagnose_parity_jepa_compute.py`): subprocess 调 parity.train, 算力机真实配置(d_model=1024 seq=64 batch=64 ticks=75)跑 5000 步:
+  - baseline(jepa=0): 在学, final acc 0.587
+  - fixed w=0.1: **acc 卡 0.498(随机), STALLED** — 不是 pool/crash, 是 w=0.1 本身压制主任务
+  - fixed w=0.03: 0.559(在学) / w=0.01: 0.581(≈baseline) — 甜点 ≤0.03, 而 st04 sweep [0.1,0.5,1.0] 全超甜点
+  - 旧 verdict 有 bug: `acc<0.52 AND loss>0.69` 判 STALLED, 但 JEPA 辅助 loss 会拉低总 loss(0.682<0.69)制造"在学"假象 → w=0.1 被误判 OK。已修为纯 acc 判据。
+- **配置**: st25 `build_st25_adaptive_jepa`, 5 task(sort/parity/mazes/cifar10/qamnist) × 4 mode × 3 seed = 60 runs, 全部 base_weight=0.1(parity 压制点)。三方案实现于 `baseline/utils/jepa.py:AdaptiveJEPAController`:
+  - **A balance**: `eff_w = clip(ratio·L_main / (L_jepa+ε), lo, hi)`, JEPA 贡献恒≈主任务的 ratio%(默认 0.3)。零额外反传, base_weight 退化为"语义比例"。
+  - **B gate**: `eff_w = base·sigmoid((acc_ema−τ)/T)`, 主任务没学会(acc<τ)→JEPA 关闭, 学会→放开。acc_ema 跨 step EMA buffer。
+  - **C uncertainty**: Kendall 2018, `loss=exp(−logσ)·L_jepa + logσ`, logσ 是可学习参数(挂 controller, 自动进 optimizer), 模型自己定相对权重。
+  - fixed 模式完全向后兼容(走老 CrossTickJEPAPredictor 路径, 零开销)。
+- **预期**: parity 上 fixed=STALLED(复现压制), 三个 adaptive 至少一个让 acc 脱离 0.5(解除压制); 其他 task(sort/cifar, w=0.1 本就 OK)上 adaptive 应保持或改善 final acc, 不退化。最看好 A balance(直接对症量级压制)和 B gate(主任务优先)。
+- **smoke(本地 CPU 已过)**: 四模式各 5 步 parity.train, 全 exit=0, loss 量级精确反映 adaptive weight 生效: fixed≈0.79 / balance≈0.90(eff_w 0.215) / gate≈0.70(eff_w 0.012 门关) / uncertainty≈1.68(eff_w 1.0)。三方案真实接入。
+- **结果**: 待算力机收菜。
+- **结论**: 待。
+- **下一步**:
+  1. 算力机快速验证: `python paper/diagnose_parity_jepa_compute.py --steps 5000 --timeout 2400`(看 ABC 哪个解除 parity 压制)
+  2. 算力机长跑: `python scripts/experiment_plan_ctm_paper.py submit --stage st25 --no-wait`(60 runs, 多 task 多 seed)
+  3. 收菜后用 mc-vs-mc 口径对比 fixed vs adaptive(注意 parity 的 final_iter==0 过滤), 出 fig 看 Pareto(精度 vs 是否免调参)
+
+---
+
 ## 2026-06-29 — JEPA 口径修正 + baseline 过时修复
 
 - **思路(用户提供)**: cross_tick_jepa 是验证通过的优化方法, 之前的分析漏了它, 检查一下.

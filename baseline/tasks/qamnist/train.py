@@ -22,7 +22,7 @@ from baseline.utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR
 from baseline.tasks.parity.utils import reshape_attention_weights
 from baseline.tasks.qamnist.utils import get_dataset, prepare_model
 from baseline.models.utils import reshape_predictions, get_latest_checkpoint
-from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
+from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss, update_jepa_gate_acc
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args
@@ -335,7 +335,8 @@ if __name__=='__main__':
                     loss = loss + compute_jepa_loss(
                         model.cross_tick_predictor, synch_per_tick,
                         args.cross_tick_jepa_weight, args.cross_tick_jepa_loss,
-                        args.cross_tick_jepa_target_stop_grad)
+                        args.cross_tick_jepa_target_stop_grad,
+                        main_loss=loss.detach())
                 if args.tick_compute_weight > 0 and args.model_type == 'ctm':
                     n_steps = extras.get('n_steps_used', args.training_iterations)
                     loss = loss + compute_tick_penalty(n_steps, args.training_iterations, args.tick_compute_weight)
@@ -354,6 +355,7 @@ if __name__=='__main__':
             scheduler.step()
 
             accuracy = (predictions_answer_steps.argmax(1)[torch.arange(predictions_answer_steps.size(0), device=predictions.device),where_most_certain] == targets).float().mean().item()
+            update_jepa_gate_acc(getattr(model, 'cross_tick_predictor', None), accuracy)
             pbar.set_description(f'Dataset=QAMNIST. Loss={loss.item():0.3f}. Accuracy={accuracy:0.3f}. LR={current_lr:0.6f}. Where_certain={where_most_certain.float().mean().item():0.2f}+-{where_most_certain.float().std().item():0.2f} ({where_most_certain.min().item():d}<->{where_most_certain.max().item():d})')
 
             # Metrics tracking and plotting

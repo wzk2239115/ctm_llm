@@ -22,7 +22,7 @@ from baseline.tasks.mazes.plotting import make_maze_gif
 from baseline.tasks.image_classification.plotting import plot_neural_dynamics 
 from baseline.utils.housekeeping import set_seed, zip_python_code
 from baseline.utils.losses import maze_loss
-from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss
+from baseline.utils.jepa import add_jepa_args, build_jepa_predictor, compute_jepa_loss, update_jepa_gate_acc
 from baseline.utils.ctm_model_ideas import add_all_idea_args, ReflexHead
 from baseline.utils.ctm_train_ideas import add_train_idea_args, compute_multi_tick_loss, compute_tick_penalty
 from baseline.utils.hrm_ideas import add_hrm_idea_args, build_optimizer_from_args, GRUGate, compute_bp_steps, EMATracker
@@ -481,7 +481,8 @@ if __name__=='__main__':
                             loss = loss + compute_jepa_loss(
                                 model.cross_tick_predictor, synch_per_tick,
                                 args.cross_tick_jepa_weight, args.cross_tick_jepa_loss,
-                                args.cross_tick_jepa_target_stop_grad)
+                                args.cross_tick_jepa_target_stop_grad,
+                                main_loss=loss.detach())
                         if args.tick_compute_weight > 0:
                             n_steps = extras.get('n_steps_used', args.iterations)
                             loss = loss + compute_tick_penalty(n_steps, args.iterations, args.tick_compute_weight)
@@ -557,6 +558,7 @@ if __name__=='__main__':
                 ema_tracker.update(model)
 
             # Conditional Tqdm Description
+            update_jepa_gate_acc(getattr(model, 'cross_tick_predictor', None), accuracy_finegrained)
             pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}. LR={current_lr:0.6f}.'
             if args.model in ['ctm', 'lstm'] or torch.is_tensor(where_most_certain): # Show stats if available
                  pbar_desc += f' Where_certain={where_most_certain_val:0.2f}+-{where_most_certain_std:0.2f} ({where_most_certain_min:d}<->{where_most_certain_max:d}).'
