@@ -41,9 +41,9 @@ wait
 $PY - <<'PYEOF'
 import csv, glob, statistics
 from collections import defaultdict
-    shards = sorted(glob.glob("csv_data/worldmodel_compare_results_shard*.csv"))
-    if not shards:
-        raise SystemExit("[merge] no shard CSVs found — check logs/wm_compare_shard*.log")
+shards = sorted(glob.glob("csv_data/worldmodel_compare_results_shard*.csv"))
+if not shards:
+    raise SystemExit("[merge] no shard CSVs found — check logs/wm_compare_shard*.log")
 rows, fields = [], None
 for p in shards:
     with open(p) as f:
