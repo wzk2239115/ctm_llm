@@ -68,11 +68,13 @@ class StreamingCTMPredictor(nn.Module):
         memory_length: int = 8,
         nlm_hidden: int = 8,
         act_emb: int = 16,
+        state_gate: str = "none",
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.d_model = int(d_model)
         self.memory_length = int(memory_length)
+        self.state_gate = str(state_gate)
 
         self.in_proj = nn.Linear(latent_dim, d_model)          # seed thought from obs latent
         self.action_embed = nn.Sequential(
@@ -85,6 +87,10 @@ class StreamingCTMPredictor(nn.Module):
         self.emit = nn.Sequential(                             # synchronisation readout -> latent
             nn.LayerNorm(d_model), nn.Linear(d_model, latent_dim),
         )
+        # GRU-style gating lets `activated` accumulate across ticks instead of being
+        # overwritten each step (state_gate='none' = legacy overwrite; 'gru' = gated residual).
+        if self.state_gate == "gru":
+            self.gate_linear = nn.Linear(d_model, d_model)
 
         # Persistent state (reset per rollout).
         self._trace: torch.Tensor | None = None
@@ -107,7 +113,14 @@ class StreamingCTMPredictor(nn.Module):
         # SuperLinear operates on exactly 3D (B, d_model, mem_len); flatten leading dims.
         trace_flat = self._trace.reshape(-1, self.d_model, self.memory_length)
         act_flat = self.trace_processor(trace_flat)            # (B', d_model)
-        self._activated = act_flat.reshape(*lead_shape, self.d_model)
+        if self.state_gate == "gru":
+            # gated residual: keep part of the old thought so state accumulates across ticks
+            old_flat = self._activated.reshape(-1, self.d_model)
+            gate = torch.sigmoid(self.gate_linear(old_flat))   # (B', d_model)
+            merged = gate * act_flat + (1.0 - gate) * old_flat
+            self._activated = merged.reshape(*lead_shape, self.d_model)
+        else:
+            self._activated = act_flat.reshape(*lead_shape, self.d_model)
         return self.emit(self._activated)                      # (..., latent_dim)
 
     def rollout(self, init_latent: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
