@@ -13,3 +13,8 @@ from .ppo import (
     build_policy,
 )
 from .dreamer import DreamerTrainer, DreamerWorldModel, Actor as DreamerActor, Critic as DreamerCritic
+from .memory_policy import (
+    build_memory_policy, MemoryPolicyNetwork,
+    CTMMemory, LSTMMemory, GRUMemory, TransformerMemory, MLPMemory,
+    build_backbone, build_encoder,
+)

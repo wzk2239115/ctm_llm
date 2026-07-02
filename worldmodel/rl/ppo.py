@@ -290,13 +290,14 @@ class PPOTrainer:
                 lpb = logp_old[ti, ei]
                 advb = adv_flat[ti, ei]
                 retb = ret_flat[ti, ei]
-                # recompute from the snapshot taken at collect time (recurrent-correct)
+                # recompute from the snapshot taken at collect time (recurrent-correct).
+                # state is a tuple of tensors (CTM:(act,trace), LSTM:(h,c), MLP:()).
+                snap0 = snaps[0]
                 snaps_b = []
-                if snaps[0] is not None:
+                if snap0 is not None and len(snap0) > 0:
                     for (tt, ee) in zip(ti.tolist(), ei.tolist()):
-                        act, tr = snaps[int(tt)]
-                        snaps_b.append((act[int(ee)], tr[int(ee)]))
-                # batched recompute
+                        full = snaps[int(tt)]
+                        snaps_b.append(tuple(comp[int(ee)] for comp in full))
                 dist, value = self._recompute_batch(xb, snaps_b)
                 logp = dist.log_prob(ab).sum(-1)
                 ent = dist.entropy().sum(-1).mean()
@@ -315,12 +316,15 @@ class PPOTrainer:
         return {k: stats[k] / max(stats["n"], 1) for k in ("pg", "v", "ent")}
 
     def _recompute_batch(self, xb, snaps_b):
-        # CTM needs per-sample state; batch them by stacking snapshots.
-        if snaps_b == [] or snaps_b is None:
+        # Generic: state is a tuple of tensors. Stack each position across the
+        # minibatch. MLP (empty tuple) -> recompute with no state.
+        if not snaps_b:
             return self.policy.recompute(xb, None)
-        act = torch.stack([s[0] for s in snaps_b], 0)
-        tr = torch.stack([s[1] for s in snaps_b], 0)
-        return self.policy.recompute(xb, (act, tr))
+        n = len(snaps_b[0])
+        if n == 0:
+            return self.policy.recompute(xb, ())
+        state = tuple(torch.stack([s[i] for s in snaps_b], 0) for i in range(n))
+        return self.policy.recompute(xb, state)
 
     def train(self, total_steps, log_iters=20, eval_episodes=12, seed=0):
         torch.manual_seed(seed); np.random.seed(seed)
