@@ -272,6 +272,13 @@ class MemoryPolicyNetwork(nn.Module):
         feat = self.backbone.step(z)
         return self._heads(feat)
 
+    def forward_feat(self, x):
+        """Same as forward but also returns the backbone feature (for probing)."""
+        z = self.encoder(x)
+        feat = self.backbone.step(z)
+        dist, value = self._heads(feat)
+        return feat, dist, value
+
     def recompute(self, x, state):
         z = self.encoder(x)
         if state is None:
