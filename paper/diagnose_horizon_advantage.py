@@ -28,14 +28,14 @@ from stream_ctm_deep_eval import build_one, evaluate, run_one, _collect_env, DEE
 import torch.multiprocessing as mp
 
 ENVS = ["pendulum", "pendulum-partial", "tworoom-state"]
-HORIZONS = [6, 12, 20, 30]
+HORIZONS = [6, 12, 20, 30, 40, 50, 60]
 SEEDS = [0, 1, 2, 3, 4]
 # (name, mem, gate, kind)
 MODELS = [("jepa-mlp", 8, "none", "jepa"), ("stream-base", 8, "none", "stream")]
 
 
-def _worker(rank, args, nworkers, all_tasks):
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+def _worker(rank, args, nworkers, n_gpu, all_tasks):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank % max(n_gpu, 1))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     my = all_tasks[rank::nworkers]
     envs_in = sorted({t[0] for t in my})
@@ -71,6 +71,7 @@ def _mean(xs):
 
 
 def report(rows):
+    horizons = sorted({r["horizon"] for r in rows})
     by = defaultdict(list)  # (env, model, horizon) -> [succ]
     dby = defaultdict(list)
     for r in rows:
@@ -80,14 +81,14 @@ def report(rows):
          f"生成: {time.strftime('%Y-%m-%d %H:%M:%S')} | runs: {len(rows)}\n"]
     # success vs horizon 表
     L.append("\n## success_rate vs horizon (mean over seeds)\n")
-    L.append("| env | model | h6 | h12 | h20 | h30 | 衰减(h30-h6) |")
-    L.append("|---|---|---|---|---|---|---|")
+    L.append("| env | model | " + " | ".join(f"h{h}" for h in horizons) + " | 衰减(末-首) |")
+    L.append("|" + "---|" * (len(horizons) + 3))
     decay = {}
     for env in ENVS:
         for mname, *_ in MODELS:
             cells = [env, mname]
             succs = []
-            for h in HORIZONS:
+            for h in horizons:
                 m = _mean(by.get((env, mname, h), []))
                 succs.append(m)
                 cells.append(f"{m:.1f}" if m == m else "-")
@@ -97,12 +98,12 @@ def report(rows):
             L.append("| " + " | ".join(cells) + " |")
     # dyn_err vs horizon
     L.append("\n## dynamics_err vs horizon (长程累积误差, 越低越稳)\n")
-    L.append("| env | model | h6 | h12 | h20 | h30 |")
-    L.append("|---|---|---|---|---|---|")
+    L.append("| env | model | " + " | ".join(f"h{h}" for h in horizons) + " |")
+    L.append("|" + "---|" * (len(horizons) + 2))
     for env in ENVS:
         for mname, *_ in MODELS:
             cells = [env, mname]
-            for h in HORIZONS:
+            for h in horizons:
                 m = _mean(dby.get((env, mname, h), []))
                 cells.append(f"{m:.5f}" if m == m else "-")
             L.append("| " + " | ".join(cells) + " |")
@@ -151,19 +152,27 @@ def main():
     ap.add_argument("--eval_episodes", type=int, default=12)
     ap.add_argument("--num_envs", type=int, default=4)
     ap.add_argument("--nworkers", type=int, default=0)
+    ap.add_argument("--procs-per-gpu", type=int, default=4,
+                    help="每卡并发进程数 (worldmodel 任务小, 4-8 填满算力)")
     args = ap.parse_args()
 
     all_tasks = [(env, m[0], m[1], m[2], m[3], seed, hor)
                  for env in args.envs for m in MODELS
                  for hor in args.horizons for seed in args.seeds]
     n_gpu = torch.cuda.device_count()
-    nw = args.nworkers if args.nworkers > 0 else (min(n_gpu, len(all_tasks)) if n_gpu >= 1 else 1)
+    ppg = max(1, args.procs_per_gpu)
+    if args.nworkers > 0:
+        nw = args.nworkers
+    elif n_gpu >= 1:
+        nw = min(n_gpu * ppg, len(all_tasks))
+    else:
+        nw = 1
     for p in Path("csv_data").glob("horizon_sweep_shard*.csv"):
         p.unlink()
     print("=" * 78)
     print("horizon sweep: CTM 长程稳定性试金石")
     print("=" * 78)
-    print(f"GPU={n_gpu} workers={nw}  {len(args.envs)} envs x {len(MODELS)} models "
+    print(f"GPU={n_gpu} workers={nw} ({ppg}/gpu)  {len(args.envs)} envs x {len(MODELS)} models "
           f"x {len(args.horizons)} horizons {args.horizons} x {len(args.seeds)} seeds = {len(all_tasks)} runs\n")
     t0 = time.time()
     if nw <= 1 or n_gpu < 1:
@@ -184,7 +193,7 @@ def main():
             rows.append(r)
             print(f"[serial] {env:<16}{mname:<12}h{hor} succ={r['success_rate']} [{r['elapsed_s']:.0f}s]")
     else:
-        mp.spawn(_worker, args=(args, nw, all_tasks), nprocs=nw, join=True)
+        mp.spawn(_worker, args=(args, nw, n_gpu, all_tasks), nprocs=nw, join=True)
         rows = []
         for p in sorted(Path("csv_data").glob("horizon_sweep_shard*.csv")):
             with open(p) as f:
