@@ -32,7 +32,7 @@ from worldmodel.rl.dreamer import DreamerTrainer
 
 ENVS = ["pendulum", "pendulum-partial", "cartpole", "cartpole-partial",
         "tworoom-state", "point-state", "reacher"]
-METHODS = ["cem-jepa", "cem-ctm", "ppo-mlp", "ppo-ctm", "dreamer"]
+METHODS = ["cem-jepa", "cem-ctm", "ppo-mlp", "ppo-ctm", "ppo-ctm-pretrain", "dreamer"]
 SEEDS = [0, 1, 2, 3, 4]
 FIELDS = ["env", "method", "seed", "success_rate", "dynamics_err", "elapsed_s"]
 
@@ -46,14 +46,52 @@ def run_cem(env, kind, seed, args, device):
     return float(row["success_rate"]), float(row.get("dynamics_err", -1))
 
 
+def pretrain_ctm_predictor(env, seed, args, device):
+    """Pretrain a CTM predictor via the world-model dynamics objective (JEPA
+    next-latent prediction on random env data). The synapse + trace_processor
+    (the NLM thought loop) then transfer to a PPO policy backbone — turning the
+    world-model from a failed CEM-query target into a useful pretrain init."""
+    from worldmodel.wm import WorldModel, MLPEncoder, StreamingCTMPredictor
+    buf, env_kw = _collect_env(env, args)
+    e = make_env(env, **env_kw)
+    obs_dim = int(np.prod(e.observation_space.shape))
+    action_dim = int(np.prod(e.action_space.shape))
+    encoder = MLPEncoder(obs_dim=obs_dim, latent_dim=args.latent_dim)
+    predictor = StreamingCTMPredictor(
+        args.latent_dim, action_dim, d_model=args.d_model,
+        memory_length=args.memory_length, nlm_hidden=8,
+        act_emb=getattr(args, "emb", 32), state_gate=args.state_gate)
+    wm = WorldModel(encoder, predictor, obs_key="state", action_dim=action_dim,
+                    cost_mode="last", var_weight=args.var_weight)
+    torch.manual_seed(seed); np.random.seed(seed)
+    train_world_model(wm, buf, horizon=args.cem_horizon, epochs=args.cem_epochs,
+                      batch_size=args.batch_size, device=device, seed=seed)
+    return predictor
+
+
+def build_pretrained_policy(args, device, predictor, obs_dim, goal_dim, action_dim):
+    """CTM policy whose NLM backbone (synapse + trace_processor) is initialised
+    from the pretrained world-model predictor. Actor/critic heads train fresh."""
+    pol = build_policy("ctm", obs_dim, goal_dim, action_dim, d_model=args.d_model,
+                       memory_length=args.memory_length, state_gate=args.state_gate)
+    pol.backbone.synapse.load_state_dict(predictor.synapse.state_dict())
+    pol.backbone.trace_processor.load_state_dict(predictor.trace_processor.state_dict())
+    return pol
+
+
 def run_ppo(env, kind, seed, args, device):
-    """kind: 'mlp' or 'ctm'. Route 1: CTM as end-to-end policy."""
+    """kind: 'mlp' | 'ctm' | 'pretrain'. Route 1: CTM as end-to-end policy.
+    'pretrain' = world-model pretrain of the NLM backbone, then PPO fine-tune."""
     e = make_env(env)
     od = int(np.prod(e.observation_space.shape))
     gd = int(np.prod(e.goal_space.shape))
     ad = int(np.prod(e.action_space.shape))
-    pol = build_policy(kind, od, gd, ad, d_model=args.d_model,
-                       memory_length=args.memory_length, state_gate=args.state_gate)
+    if kind == "pretrain":
+        predictor = pretrain_ctm_predictor(env, seed, args, device)
+        pol = build_pretrained_policy(args, device, predictor, od, gd, ad)
+    else:
+        pol = build_policy(kind, od, gd, ad, d_model=args.d_model,
+                           memory_length=args.memory_length, state_gate=args.state_gate)
     t = PPOTrainer(env, pol, num_envs=args.ppo_envs, num_steps=args.ppo_steps,
                    device=device, lr=args.ppo_lr)
     torch.manual_seed(seed); np.random.seed(seed)
@@ -93,6 +131,8 @@ def run_task(env, method, seed, args, device):
             s, d = run_ppo(env, "mlp", seed, args, device)
         elif method == "ppo-ctm":
             s, d = run_ppo(env, "ctm", seed, args, device)
+        elif method == "ppo-ctm-pretrain":
+            s, d = run_ppo(env, "pretrain", seed, args, device)
         elif method == "dreamer":
             s, d = run_dreamer(env, seed, args, device)
         else:
