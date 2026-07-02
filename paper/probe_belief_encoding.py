@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--eval_episodes", type=int, default=12)
     ap.add_argument("--seeds", nargs="*", type=int, default=[0, 1, 2])
+    ap.add_argument("--backbones", nargs="*", default=BACKBONES,
+                    help="subset of backbones (for parallelising across GPUs)")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
@@ -102,10 +104,10 @@ def main():
     print(f"=== belief probe on {ENV} (occluded var = angular velocity θdot) ===")
     print(f"device={device}  train={args.total_steps} steps  probe={args.probe_steps} steps  seeds={args.seeds}\n")
 
-    results = {bb: {"thdot": [], "theta": [], "succ": []} for bb in BACKBONES}
+    results = {bb: {"thdot": [], "theta": [], "succ": []} for bb in args.backbones}
     for seed in args.seeds:
         print(f"--- seed {seed} ---")
-        for bb in BACKBONES:
+        for bb in args.backbones:
             torch.manual_seed(seed); np.random.seed(seed)
             pol = build_memory_policy(bb, od, gd, ad, latent_dim=args.latent_dim,
                                       d_model=args.d_model, memory_length=args.memory_length,
@@ -131,7 +133,7 @@ def main():
     print("=" * 70)
     print(f"{'backbone':<14}{'succ%':<10}{'R²(θdot 遮挡)':<18}{'R²(θ 可观测)':<16}")
     print("-" * 58)
-    for bb in BACKBONES:
+    for bb in args.backbones:
         s = np.nanmean(results[bb]["succ"])
         rd = np.nanmean(results[bb]["thdot"])
         rt = np.nanmean(results[bb]["theta"])
