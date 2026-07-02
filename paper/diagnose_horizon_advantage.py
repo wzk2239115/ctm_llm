@@ -152,8 +152,8 @@ def main():
     ap.add_argument("--eval_episodes", type=int, default=12)
     ap.add_argument("--num_envs", type=int, default=4)
     ap.add_argument("--nworkers", type=int, default=0)
-    ap.add_argument("--procs-per-gpu", type=int, default=4,
-                    help="每卡并发进程数 (worldmodel 任务小, 4-8 填满算力)")
+    ap.add_argument("--procs-per-gpu", type=int, default=8,
+                    help="每卡并发进程数 (worldmodel 任务小, 显存占用极低, 瓶颈是 CPU 的 CEM rollout; 按 CPU 核数定, 打满就降)")
     args = ap.parse_args()
 
     all_tasks = [(env, m[0], m[1], m[2], m[3], seed, hor)
