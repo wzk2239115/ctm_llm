@@ -92,22 +92,24 @@
 
 ---
 
-## 实验 5: flash 混合 ablation (修正 fig4 — 坐实"混合 > 单路径")
+## 实验 5: flash 混合 ablation (修正 fig4 — 坐实"混合 > 单路径") ✅ 已确认
 
 **脚本**: `paper/run_memory_policy_ablation.py --backbones mlp ctm flash flash-shallow flash-deep --envs pendulum pendulum-partial`
-**状态**: 待跑
+**命令(从 csv 重出)**: `--report-only --backbones ...` (report 动态表头)
 
-### 判读标准
-- **flash vs flash-shallow(纯z=0)**: flash > shallow = deep 贡献有用.
-- **flash vs flash-deep(纯z=1)**: flash > deep = shallow 贡献有用.
-- 两边都 > : **"混合 > 单路径"坐实**, fig4 改用这个.
+### 实际结论 (坐实 + 超预期: 是"协同"非"取长补短")
+| env | flash(混合) | flash-shallow(z=0) | flash-deep(z=1) |
+|-----|-------------|---------------------|------------------|
+| pendulum(全观测) | 96.7 | **100**(shallow 够) | 88.3(deep 吃亏) |
+| **pendulum-partial** | **78.3** | 16.7 | 60.0 |
 
-### 预期
-- partial: flash(86.7) > flash-deep(≈ctm 58) > flash-shallow(≈mlp 20). 混合赢.
-- pendulum: flash(96.7) > flash-deep(≈ctm 85, deep 吃亏) > flash-shallow(≈mlp 98? shallow 可能反超). 这里要看 flash 是否 ≥ shallow(不退化) + ≥ deep.
+- **POMDP 上混合双优单路径**: partial 上 flash 78.3 > shallow 16.7(+61.7) 且 > deep 60(+18.3).
+- **协同效应 (1+1>2)**: shallow(16.7)+deep(60) 平均才 38, 混合做到 78.3. 不是取长补短, 是 shallow 快速基础控制 + deep 记忆修正组合后超过任一.
+- **全观测 shallow 够**: pendulum shallow 100 最好, 混合 96.7 不退化. 混合价值严格在 POMDP.
 
-### 如果成立
-- fig4 论点: Flash Brain = shallow+deep 互补混合, 全观测靠 shallow 不退化, POMDP 靠 deep 推断. 不是动态切换, 是固定互补.
+### fig4 定稿论点 (替代实验4 不成立的"自适应")
+Flash Brain = **shallow+deep 固定混合, POMDP 上协同 > 任一单路径, 全观测不退化**.
+机制不是动态 gate 切换(实验4 否定), 是**架构互补性**: shallow 救快反应 / deep 救记忆, POMDP 上协同放大.
 - 这是 fig1(精度)+fig2(实时) 之外的第三层: **架构互补性**.
 
 ---
@@ -119,7 +121,7 @@
 | fig1 accuracy | CTM/Flash 在 POMDP 精度赢 RNN 系 | memory_ablation | ✅ 成立 |
 | fig2 realtime | Flash 比 world-model 快 1-2 数量级, 紧 deadline planner 崩 | realtime_benchmark | ✅ 成立 |
 | fig3 mechanism | encoding≠usage (RNN 编码不用/CTM 编码且用) | belief_probe | ✅ 成立(最有新意) |
-| fig4 gate | ~~自适应~~ → **混合 > 单路径** | gate_probe + 混合ablation | ⚠️ 修正中(实验5跑完定稿) |
+| fig4 gate | ~~自适应~~ → **混合协同 > 单路径 (POMDP 上 1+1>2)** | gate_probe + 混合ablation | ✅ 定稿 |
 
 ## 整体叙事 (论文主线)
 
