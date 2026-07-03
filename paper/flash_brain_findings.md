@@ -92,6 +92,29 @@
 
 ---
 
+## 实验 6: image POMDP 验证 (对标 stable-wm image+occlusion) ✅ 核心泛化通过
+
+**脚本**: `paper/run_memory_policy_ablation.py --backbones mlp ctm flash --envs cartpole-image{,-partial} pendulum-image{,-partial} reacher-image{,-partial}`
+**数据**: image POMDP ablation (CNN encoder + 遮挡 image)
+
+### 实际结论 (CTM 记忆泛化到 image POMDP — 解决 "env 简单" 硬伤)
+| env | mlp | ctm | flash |
+|-----|-----|-----|-------|
+| **pendulum-image-partial** | **16.7** | **75.0** | **76.7** |
+| pendulum-image(全观测) | 96.7 | 86.7 | 88.3 |
+| reacher-image-partial | 96.7 | 91.7 | 90.0(饱和) |
+| cartpole-image-partial | 3.3 | 5.0 | 3.3(太难) |
+
+- **核心**: pendulum-image-partial 上 CTM 75 ≫ mlp 16.7(+58pp). 记忆优势从 state 泛化到 image(CNN encoder + 像素遮挡). 对标 stable-wm image+occlusion 成立.
+- **诚实**: flash 在 image 上 ≈ ctm(+1.7, 持平), 不像 state 版 flash≫ctm 的混合优势. 可能 CNN encoder 主导 backbone 差异, 或 image 训练步数不够 gate 没学起来. Flash 混合优势目前主要在 state POMDP.
+- reacher 饱和, cartpole 太难, 这两个无区分度.
+
+### 对论文的意义
+- image POMDP CTM>>mlp 是 fig1(精度)的 image 版本, 解决审稿人 "env 简单" 的第一硬伤.
+- flash 在 image 没超 ctm 是诚实局限: Flash Brain 的混合优势目前限 state, image 上 CTM 本身够. 论文可表述为 "CTM 记忆在 state 和 image POMDP 都成立; Flash Brain 混合协同在 state 上更强".
+
+---
+
 ## 实验 5: flash 混合 ablation (修正 fig4 — 坐实"混合 > 单路径") ✅ 已确认
 
 **脚本**: `paper/run_memory_policy_ablation.py --backbones mlp ctm flash flash-shallow flash-deep --envs pendulum pendulum-partial`
