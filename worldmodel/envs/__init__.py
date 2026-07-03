@@ -19,6 +19,13 @@ Registry (``make_env``):
 
 from .point_reach import PointImageReach, PointStateReach
 from .bench import TwoRoomNav, CartPole, Pendulum, Reacher
+from .mountaincar import MountainCar
+from .acrobot import Acrobot
+from .swimmer import Swimmer
+from .pusht import PushT
+from .fetch_push import FetchPush
+from .cube import CubePush
+from .render import ImageObs, ImagePartial, draw_scene
 from collections import deque
 
 
@@ -73,6 +80,15 @@ def make_env(name: str, **kwargs):
         delay = int(m.group(1))
         key = key[:-len(m.group(0))]
 
+    # parse -image / -image-partial suffix (turns a state env into image obs)
+    image_mode = None
+    if key.endswith('-image-partial'):
+        image_mode = 'partial'
+        key = key[:-len('-image-partial')]
+    elif key.endswith('-image'):
+        image_mode = 'image'
+        key = key[:-len('-image')]
+
     def _split(suffix):
         partial = None
         if key.endswith('-partial'):
@@ -91,7 +107,10 @@ def make_env(name: str, **kwargs):
         sub = key.split('-')[-1]
         env = TwoRoomNav(image=(sub != 'state'), **kwargs)
     else:
-        for base, cls in (('cartpole', CartPole), ('pendulum', Pendulum), ('reacher', Reacher)):
+        for base, cls in (('cartpole', CartPole), ('pendulum', Pendulum), ('reacher', Reacher),
+                          ('mountaincar', MountainCar), ('acrobot', Acrobot),
+                          ('swimmer', Swimmer), ('pusht', PushT),
+                          ('fetch-push', FetchPush), ('cube', CubePush)):
             if key.startswith(base):
                 partial = None
                 if key.endswith('-partial'):
@@ -102,6 +121,18 @@ def make_env(name: str, **kwargs):
                 break
     if env is None:
         raise KeyError(f"Unknown env '{name}'.")
+    # wrap image obs (state env -> rendered RGB frames)
+    if image_mode is not None:
+        img_kind = None
+        for base in ('cartpole', 'pendulum', 'reacher'):
+            if key.startswith(base):
+                img_kind = base
+                break
+        if img_kind is None:
+            raise ValueError(f"-image only supported on cartpole/pendulum/reacher, got '{key}'")
+        env = ImageObs(env, img_kind, size=kwargs.get('image_size', 32))
+        if image_mode == 'partial':
+            env = ImagePartial(env, mask_frac=kwargs.get('mask_frac', 0.3))
     if delay > 0:
         env = DelayObs(env, delay)
     return env
