@@ -41,6 +41,7 @@
 
 ## Pool 并发工程准则
 - **日志路径必须 per-experiment 隔离**, 禁止多任务共享同一日志文件 (会被并发覆盖). 用 `CTM_LOG_DIR` + `{exp_name}.log` 模式.
+- **report/csv 输出必须 per-batch 独立命名**: overnight 或多批编排跑同一脚本时, 每个批次的 `--report`/`--csv` 必须带批次标识 (如 `memory_ablation_A_delay.md`), **禁止全部用同名** (`memory_ablation_report.md`) — 后批会覆盖前批、数据永久丢失 (log 虽独立, 但 report/csv 覆盖后只能 grep log 拼回, 易出错). sweep 多个超参值时同理用 `{exp}_{param}.csv`. 已踩坑: overnight 6 批 ablation 全写同名 report, F 覆盖了 A/C/D/E.
 - **失败诊断要有 fallback 链**: `.fail.json` → per-experiment `.log` → `pool_last_run.log`, `.fail.json` 中存 `log_path` 便于定位.
 - **`cluster_pool.py` 改动必须重启 server**, worker 通常 auto-pull 无需手动干预.
 - **数据路径不要硬编码** (如 MNIST 的 `"data/"`), 应通过参数/环境变量传入, 避免换环境踩坑.
