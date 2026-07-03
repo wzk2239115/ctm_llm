@@ -40,6 +40,7 @@ FIELDS = ["env", "backbone", "seed", "success_rate", "elapsed_s"]
 
 
 def run_one(env, backbone, seed, args, device):
+    t0 = time.time()
     e = make_env(env)
     od = int(np.prod(e.observation_space.shape))
     gd = int(np.prod(e.goal_space.shape))
