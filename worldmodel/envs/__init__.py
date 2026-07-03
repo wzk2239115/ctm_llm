@@ -27,6 +27,59 @@ from .fetch_push import FetchPush
 from .cube import CubePush
 from .render import ImageObs, ImagePartial, draw_scene
 from collections import deque
+import re as _re
+
+
+def _make_external_env(name: str, **kwargs):
+    """Route an external env id (dmc/ atari/ craftax/) to the right factory.
+
+    Honours ``-delayN`` and ``-partial`` / ``-image-partial`` suffixes on top of
+    the external env (DelayObs / ImagePartial stack on any env). The underlying
+    dependency is imported lazily inside the factory, so a missing dep raises a
+    clean ``ImportError`` with a ``pip install`` hint rather than crashing import.
+    """
+    from .external import make_dmc, make_atari, make_craftax
+    from .render import ImagePartial as _ImagePartial
+
+    low = name.lower()
+    rest = name.split('/', 1)[1]
+
+    # peel suffixes that apply as wrappers on top of the external env
+    delay = 0
+    m = _re.search(r'-delay(\d+)$', low)
+    if m:
+        delay = int(m.group(1))
+    partial_mask = low.endswith(('-partial', '-image-partial'))
+
+    # strip all known suffixes to recover the bare env id
+    base = _re.sub(r'-(delay\d+|image-partial|image|partial|full)$', '', rest,
+                   flags=_re.I)
+
+    # common kwargs forwarded to every factory / GymAdapter
+    common = {}
+    for k in ('seed', 'image', 'image_size', 'max_steps',
+              'goal_thresh', 'goal_noise', 'success_mode', 'reward_thresh'):
+        if k in kwargs:
+            common[k] = kwargs[k]
+
+    if low.startswith('dmc/'):
+        if ':' in base:
+            domain, task = base.split(':', 1)
+        else:
+            domain, task = base, 'run'
+        env = make_dmc(domain, task, **common)
+    elif low.startswith('atari/'):
+        env = make_atari(base, **common)
+    elif low.startswith('craftax/'):
+        env = make_craftax(base, **common)
+    else:
+        raise KeyError(f"Unknown external env '{name}'.")
+
+    if partial_mask:
+        env = _ImagePartial(env, mask_frac=kwargs.get('mask_frac', 0.3))
+    if delay > 0:
+        env = DelayObs(env, delay)
+    return env
 
 
 class DelayObs:
@@ -69,7 +122,17 @@ def make_env(name: str, **kwargs):
     """Build an env by name. Suffixes:
       ``-partial`` / ``-full``  toggles observability
       ``-delayN``               wraps in DelayObs (obs delayed N steps)
+
+    External envs (lazy deps, see ``worldmodel/envs/external.py``):
+      ``dmc/<domain>:<task>``   — dm_control.suite locomotion (e.g. dmc/cheetah:run)
+      ``atari/<game>``          — gymnasium ALE (e.g. atari/Pong)
+      ``craftax/<variant>``     — craftax (e.g. craftax/classic)
+    External ids honour ``-delayN`` and ``-partial`` / ``-image-partial`` suffixes.
     """
+    _low = name.lower()
+    if _low.startswith(('dmc/', 'atari/', 'craftax/')):
+        return _make_external_env(name, **kwargs)
+
     key = name.lower().replace('_', '-')
 
     # parse -delayN suffix
