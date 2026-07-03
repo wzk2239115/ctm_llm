@@ -240,13 +240,14 @@ class FlashBrainBackbone(MemoryBackbone):
     """
 
     def __init__(self, latent_dim, d_model=128, memory_length=8, nlm_hidden=8,
-                 state_gate="gru"):
+                 state_gate="gru", gate_mode="learn"):
         super().__init__()
         self.feat_dim = d_model
+        self.gate_mode = gate_mode  # learn | shallow (z=0) | deep (z=1)
         self.shallow = nn.Sequential(nn.Linear(latent_dim, d_model), nn.GELU())
         self.deep = CTMMemory(latent_dim, d_model, memory_length, nlm_hidden,
                               state_gate=state_gate)
-        self.gate = GRUGate(d_model, d_model)
+        self.gate = GRUGate(d_model, d_model) if gate_mode == "learn" else None
         self.last_gate_z = 0.0  # diagnostics: mean gate opening (0=shallow, 1=deep)
 
     def zero_state(self, batch, device):
@@ -258,6 +259,12 @@ class FlashBrainBackbone(MemoryBackbone):
     def step_stateless(self, z, state):
         shallow_feat = self.shallow(z)
         deep_feat, new_state = self.deep.step_stateless(z, state)
+        if self.gate_mode == "shallow":
+            self.last_gate_z = 0.0
+            return shallow_feat, new_state
+        if self.gate_mode == "deep":
+            self.last_gate_z = 1.0
+            return deep_feat, new_state
         feat, gz = self.gate(deep_feat, shallow_feat, return_gate=True)
         self.last_gate_z = float(gz.mean().detach().item())
         return feat, new_state
@@ -287,7 +294,13 @@ def build_backbone(kind, latent_dim, d_model=128, memory_length=8, state_gate="g
         return TransformerMemory(latent_dim, d_model, nhead, layers, max_hist)
     if kind == "flash":
         return FlashBrainBackbone(latent_dim, d_model, memory_length=memory_length,
-                                  state_gate=state_gate)
+                                  state_gate=state_gate, gate_mode="learn")
+    if kind == "flash-shallow":
+        return FlashBrainBackbone(latent_dim, d_model, memory_length=memory_length,
+                                  state_gate=state_gate, gate_mode="shallow")
+    if kind == "flash-deep":
+        return FlashBrainBackbone(latent_dim, d_model, memory_length=memory_length,
+                                  state_gate=state_gate, gate_mode="deep")
     raise KeyError(kind)
 
 
