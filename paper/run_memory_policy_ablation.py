@@ -52,6 +52,8 @@ def run_one(env, backbone, seed, args, device):
     t = PPOTrainer(env, pol, num_envs=args.ppo_envs, num_steps=args.ppo_steps,
                    device=device, lr=args.lr)
     if args.bc_steps > 0:
+        if not hasattr(args, 'num_envs'):
+            args.num_envs = args.ppo_envs
         buf, _ = _collect_env(env, args)
         t.bc_pretrain(buf, bc_steps=args.bc_steps)
     torch.manual_seed(seed); np.random.seed(seed)
