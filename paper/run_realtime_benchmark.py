@@ -90,6 +90,40 @@ def eval_deadlines(obj, kind, episodes, seed=100):
     return out
 
 
+def _worker(rank, args, nworkers, all_tasks):
+    """One worker per GPU: trains its task slice + runs timing eval in-process.
+    Each worker owns a GPU + a disjoint CPU group, so per-step latency is not
+    polluted by other workers (timing stays accurate)."""
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    my = all_tasks[rank::nworkers]
+    rows = []
+    for (env, method, seed) in my:
+        t0 = time.time()
+        if method in args.ppo_methods:
+            obj = train_ppo(env, method, seed, args, device)
+            kind, eps = "ppo", args.episodes
+        else:
+            wm_kind = "jepa" if "jepa" in method else "stream"
+            obj = train_cem(env, wm_kind, seed, args, device)
+            kind, eps = "cem", args.episodes_cem
+        res = eval_deadlines(obj, kind, eps)
+        for dl, r in res.items():
+            rows.append({"env": env, "method": method, "seed": seed,
+                         "deadline_ms": _dl_str(dl), **r})
+        base = res[None]
+        print(f"[gpu{rank}] {env}/{method}/s{seed} {time.time()-t0:.0f}s | "
+              f"succ={base['success_rate']:.1f}% lat={base['mean_latency_ms']:.3f}ms "
+              f"thr={base['throughput_hz']:.0f}Hz", flush=True)
+    Path("csv_data").mkdir(exist_ok=True)
+    with open(f"csv_data/realtime_shard{rank}.csv", "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=FIELDS); wr.writeheader()
+        for r in rows:
+            wr.writerow(r)
+    print(f"[gpu{rank}] done {len(rows)} rows", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--envs", nargs="*", default=ENVS)
@@ -126,34 +160,35 @@ def main():
     print(f"CEM methods (slow): {args.cem_methods}")
     print(f"deadlines (ms): {[('none' if d is None else d) for d in DEADLINES]}\n")
 
+    all_methods = args.ppo_methods + args.cem_methods
+    all_tasks = [(env, m, seed) for env in args.envs for m in all_methods for seed in args.seeds]
+    n_gpu = torch.cuda.device_count()
+    # 1 worker per GPU (NOT procs_per_gpu): timing accuracy requires each worker
+    # own a disjoint CPU group, so multi-proc per GPU would pollute latency.
+    nw = min(n_gpu, len(all_tasks)) if n_gpu >= 1 else 1
+    for p in Path("csv_data").glob("realtime_shard*.csv"):
+        p.unlink()
+    print(f"GPU={n_gpu} workers={nw} (1/GPU, 独占 CPU 保 timing 准)  tasks={len(all_tasks)}\n")
+
+    if nw <= 1 or n_gpu < 1:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _worker(0, args, 1, all_tasks)
+    else:
+        torch.multiprocessing.spawn(_worker, args=(args, nw, all_tasks), nprocs=nw, join=True)
+
     rows = []
-    for env in args.envs:
-        for seed in args.seeds:
-            for m in args.ppo_methods:
-                t0 = time.time()
-                trainer = train_ppo(env, m, seed, args, device)
-                res = eval_deadlines(trainer, "ppo", args.episodes)
-                for dl, r in res.items():
-                    rows.append({"env": env, "method": m, "seed": seed,
-                                 "deadline_ms": _dl_str(dl), **r})
-                base = res[None]
-                print(f"[{env}/{m}/s{seed}] train+eval {time.time()-t0:.0f}s | "
-                      f"unconstrained succ={base['success_rate']:.1f}% "
-                      f"latency={base['mean_latency_ms']:.3f}ms "
-                      f"thr={base['throughput_hz']:.0f}Hz", flush=True)
-            for m in args.cem_methods:
-                t0 = time.time()
-                wm_kind = "jepa" if "jepa" in m else "stream"
-                ew = train_cem(env, wm_kind, seed, args, device)
-                res = eval_deadlines(ew, "cem", args.episodes_cem)
-                for dl, r in res.items():
-                    rows.append({"env": env, "method": m, "seed": seed,
-                                 "deadline_ms": _dl_str(dl), **r})
-                base = res[None]
-                print(f"[{env}/{m}/s{seed}] train+eval {time.time()-t0:.0f}s | "
-                      f"unconstrained succ={base['success_rate']:.1f}% "
-                      f"latency={base['mean_latency_ms']:.2f}ms "
-                      f"thr={base['throughput_hz']:.0f}Hz", flush=True)
+    for p in sorted(Path("csv_data").glob("realtime_shard*.csv")):
+        with open(p) as f:
+            for r in csv.DictReader(f):
+                for k in ("success_rate", "mean_latency_ms", "p99_latency_ms",
+                          "throughput_hz", "timeout_rate", "seed"):
+                    try:
+                        r[k] = float(r[k])
+                        if k == "seed":
+                            r[k] = int(r[k])
+                    except (ValueError, TypeError):
+                        pass
+                rows.append(r)
 
     with open(args.csv, "w", newline="") as f:
         wr = csv.DictWriter(f, fieldnames=FIELDS); wr.writeheader()
