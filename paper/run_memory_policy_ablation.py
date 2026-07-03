@@ -33,7 +33,7 @@ from worldmodel.rl.memory_policy import build_memory_policy
 
 ENVS = ["pendulum", "pendulum-partial", "pendulum-delay3", "pendulum-partial-delay3",
         "cartpole-partial", "tworoom-state", "point-state"]
-BACKBONES = ["mlp", "ctm", "lstm", "gru", "transformer"]
+BACKBONES = ["mlp", "ctm", "lstm", "gru", "transformer", "flash"]
 SEEDS = [0, 1, 2, 3, 4]
 FIELDS = ["env", "backbone", "seed", "success_rate", "elapsed_s"]
 

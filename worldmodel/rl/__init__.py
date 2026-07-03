@@ -16,5 +16,6 @@ from .dreamer import DreamerTrainer, DreamerWorldModel, Actor as DreamerActor, C
 from .memory_policy import (
     build_memory_policy, MemoryPolicyNetwork,
     CTMMemory, LSTMMemory, GRUMemory, TransformerMemory, MLPMemory,
+    FlashBrainBackbone, GRUGate,
     build_backbone, build_encoder,
 )

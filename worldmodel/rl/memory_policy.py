@@ -191,7 +191,6 @@ class TransformerMemory(MemoryBackbone):
         self.pos = nn.Parameter(torch.zeros(1, max_hist + 1, d_model))
 
     def zero_state(self, batch, device):
-        # fixed-length history buffer (pre-filled zeros) so all snapshots stack
         return (torch.zeros(batch, self.max_hist, self.d_model, device=device),)
 
     def mask_state(self, state, done_mask):
@@ -200,7 +199,7 @@ class TransformerMemory(MemoryBackbone):
 
     def step_stateless(self, z, state):
         (hist,) = state
-        e = self.in_proj(z).unsqueeze(1)  # (B,1,D)
+        e = self.in_proj(z).unsqueeze(1)
         hist2 = torch.cat([hist, e], dim=1)[:, -self.max_hist:, :]
         T = hist2.shape[1]
         seq = hist2 + self.pos[:, -T:]
@@ -208,6 +207,57 @@ class TransformerMemory(MemoryBackbone):
         out = self.encoder(seq, mask=mask)
         feat = self.feat(out[:, -1, :])
         return feat, (hist2,)
+
+
+class GRUGate(nn.Module):
+    """HRM-style gate (from baseline/utils/hrm_ideas.py): a 'deep' signal modulates a
+    'shallow' state non-blockingly. bias init -2 => gate starts ~0.12, so shallow
+    dominates first and deep enters gradually — exactly the multi-timescale behavior."""
+
+    def __init__(self, d_model, d_input):
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model + d_input, d_model)
+        self.value_proj = nn.Linear(d_input, d_model)
+        nn.init.zeros_(self.gate_proj.weight)
+        self.gate_proj.bias.data.fill_(-2.0)
+
+    def forward(self, deep, shallow):
+        z = torch.sigmoid(self.gate_proj(torch.cat([deep, shallow], dim=-1)))
+        candidate = torch.relu(self.value_proj(deep))
+        return (1.0 - z) * shallow + z * candidate
+
+
+class FlashBrainBackbone(MemoryBackbone):
+    """Multi-timescale 'Flash Brain': a shallow-fast path + a deep-slow CTM,
+    fused by a GRUGate so deep thought never blocks shallow reflex.
+
+      shallow (Linear, every step, low-latency)  -> fast feat
+      deep    (CTM memory, accumulates belief)    -> deep feat
+      gate    (GRUGate): feat = gate(deep, shallow)  # deep modulates shallow
+
+    JEPA/encoder feeds z_t (perception); CTM is the memory-control component.
+    """
+
+    def __init__(self, latent_dim, d_model=128, memory_length=8, nlm_hidden=8,
+                 state_gate="gru"):
+        super().__init__()
+        self.feat_dim = d_model
+        self.shallow = nn.Sequential(nn.Linear(latent_dim, d_model), nn.GELU())
+        self.deep = CTMMemory(latent_dim, d_model, memory_length, nlm_hidden,
+                              state_gate=state_gate)
+        self.gate = GRUGate(d_model, d_model)
+
+    def zero_state(self, batch, device):
+        return self.deep.zero_state(batch, device)
+
+    def mask_state(self, state, done_mask):
+        return self.deep.mask_state(state, done_mask)
+
+    def step_stateless(self, z, state):
+        shallow_feat = self.shallow(z)
+        deep_feat, new_state = self.deep.step_stateless(z, state)
+        feat = self.gate(deep_feat, shallow_feat)
+        return feat, new_state
 
 
 def build_encoder(obs_dim, goal_dim, latent_dim, image=False):
@@ -232,6 +282,9 @@ def build_backbone(kind, latent_dim, d_model=128, memory_length=8, state_gate="g
         return GRUMemory(latent_dim, d_model)
     if kind == "transformer":
         return TransformerMemory(latent_dim, d_model, nhead, layers, max_hist)
+    if kind == "flash":
+        return FlashBrainBackbone(latent_dim, d_model, memory_length=memory_length,
+                                  state_gate=state_gate)
     raise KeyError(kind)
 
 
