@@ -41,7 +41,7 @@ PPO_METHODS = ["flash", "ctm", "lstm"]          # fast reactive (μs-ms)
 CEM_METHODS = ["cem-jepa", "cem-ctm"]           # slow model-based planners (ms-s)
 DEADLINES = [None, 50.0, 20.0, 5.0, 1.0]         # ms; None = unconstrained
 FIELDS = ["env", "method", "seed", "deadline_ms", "success_rate",
-          "mean_latency_ms", "p99_latency_ms", "throughput_hz", "timeout_rate"]
+          "mean_latency_ms", "p99_latency_ms", "throughput_hz", "timeout_rate", "n_steps"]
 
 
 def _dl_str(dl):
