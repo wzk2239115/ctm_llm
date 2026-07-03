@@ -30,6 +30,7 @@ import torch
 from worldmodel.envs import make_env
 from worldmodel.rl.ppo import PPOTrainer
 from worldmodel.rl.memory_policy import build_memory_policy
+from stream_ctm_deep_eval import _collect_env
 
 ENVS = ["pendulum", "pendulum-partial", "pendulum-delay3", "pendulum-partial-delay3",
         "cartpole-partial", "tworoom-state", "point-state"]
