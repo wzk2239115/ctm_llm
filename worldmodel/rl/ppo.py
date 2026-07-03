@@ -369,3 +369,44 @@ class PPOTrainer:
                     succ += 1
             obs = env.reset(seed=seed + k + 1)
         return 100.0 * succ / episodes
+
+    @torch.no_grad()
+    def evaluate_timed(self, episodes=12, seed=100, deadline_ms=None):
+        """evaluate + per-step latency/throughput/deadline-constrained success.
+        Same real-time metrics as World.evaluate_timed, for the nn.Module policy
+        (Flash Brain / RNN). If deadline_ms is set, a step whose forward exceeds
+        it is a timeout (zero action used), so success drops under tight budgets."""
+        import time as _time
+        self.policy.init_state(1, self.device)
+        env = make_env(self.env_name, **self.env_kw)
+        obs = env.reset(seed=seed)
+        succ = 0
+        lats = []; timeouts = 0; total = 0
+        for k in range(episodes):
+            done = False
+            while not done:
+                infos = {k2: np.asarray(v)[None] for k2, v in obs.items()}
+                x = _obs_goal_tensor(infos, self.device)
+                t0 = _time.perf_counter()
+                dist, _ = self.policy(x)
+                a = dist.mean.cpu().numpy()[0]
+                lat = (_time.perf_counter() - t0) * 1000.0
+                lats.append(lat); total += 1
+                if deadline_ms is not None and lat > deadline_ms:
+                    timeouts += 1
+                    a = np.zeros_like(a)
+                obs, r, term, trunc, info = env.step(np.clip(a, env.action_space.low, env.action_space.high))
+                done = bool(term or trunc)
+                self.policy.mask_reset(torch.tensor([done], device=self.device))
+                if term:
+                    succ += 1
+            obs = env.reset(seed=seed + k + 1)
+        la = np.asarray(lats) if lats else np.asarray([1e-6])
+        ml = float(la.mean())
+        return {
+            'success_rate': 100.0 * succ / episodes,
+            'mean_latency_ms': ml,
+            'p99_latency_ms': float(np.percentile(la, 99)),
+            'throughput_hz': float(1000.0 / max(ml, 1e-6)),
+            'timeout_rate': float(timeouts / max(total, 1)),
+        }

@@ -171,3 +171,62 @@ class World:
             'episode_successes': successes[:ep_idx],
             'seeds': seeds_used[:ep_idx],
         }
+
+    def evaluate_timed(self, episodes: int, seed: int | None = None,
+                       deadline_ms: float | None = None) -> dict:
+        """Evaluate with per-step real-time metrics: latency, throughput, and
+        deadline-constrained success.
+
+        The new dimension for comparing a fast reactive policy (Flash Brain,
+        microsecond get_action) against a slow model-based planner (CEM/MPC,
+        millisecond-to-second rollouts per step). If ``deadline_ms`` is set,
+        any step whose ``get_action`` exceeds it is a *timeout*: a zero action
+        is used instead, so success collapses under tight deadlines for slow
+        planners while fast policies keep theirs. This is the "real-time
+        control ability" axis stable-wm benchmarks lack.
+        """
+        import time
+        if self._policy is None:
+            raise RuntimeError('Call set_policy(...) before evaluate_timed().')
+        self.reset(seed=seed)
+        successes = np.zeros(episodes, dtype=bool)
+        per_env_success = np.zeros(self.num_envs, dtype=bool)
+        latencies = []
+        timeouts = 0
+        total_steps = 0
+        ep_idx = 0
+        next_seed = (seed + self.num_envs) if seed is not None else None
+        while ep_idx < episodes:
+            t0 = time.perf_counter()
+            actions = self._policy.get_action(self.infos)
+            lat = (time.perf_counter() - t0) * 1000.0  # ms
+            latencies.append(lat)
+            total_steps += 1
+            if deadline_ms is not None and lat > deadline_ms:
+                timeouts += 1
+                actions = np.zeros_like(np.asarray(actions, dtype=np.float32))
+            self.step(actions)
+            for i in range(self.num_envs):
+                if self.terminateds[i]:
+                    per_env_success[i] = True
+                if self.terminateds[i] or self.truncateds[i]:
+                    if ep_idx < episodes:
+                        successes[ep_idx] = per_env_success[i]
+                        ep_idx += 1
+                    per_env_success[i] = False
+                    s = None if next_seed is None else next_seed + ep_idx
+                    obs = self._reset_env(i, s)
+                    for k, v in obs.items():
+                        self.infos[k][i] = v
+                    self.terminateds[i] = False
+                    self.truncateds[i] = False
+        lat = np.asarray(latencies) if latencies else np.asarray([1e-6])
+        mean_lat = float(lat.mean())
+        return {
+            'success_rate': float(successes[:ep_idx].mean()) * 100.0,
+            'mean_latency_ms': mean_lat,
+            'p99_latency_ms': float(np.percentile(lat, 99)),
+            'throughput_hz': float(1000.0 / max(mean_lat, 1e-6)),
+            'timeout_rate': float(timeouts / max(total_steps, 1)),
+            'n_steps': total_steps,
+        }
