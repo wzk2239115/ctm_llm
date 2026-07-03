@@ -88,75 +88,56 @@ def _ms(xs):
     return float(np.mean(xs)), (float(np.std(xs)) if len(xs) > 1 else 0.0)
 
 
-def report(rows, envs, path):
+def report(rows, envs, path, backbones):
     by = defaultdict(list)
     for r in rows:
         by[(r["env"], r["backbone"])].append(r["success_rate"])
     L = ["# Memory-policy ablation: CTM vs RNN/Transformer memory policies\n",
-         f"生成: {time.strftime('%Y-%m-%d %H:%M:%S')} | runs: {len(rows)}\n"]
+         f"生成: {time.strftime('%Y-%m-%d %H:%M:%S')} | runs: {len(rows)} | backbones: {backbones}\n"]
     L.append("\n## success_rate mean+-std\n")
-    L.append("| env | " + " | ".join(BACKBONES) + " |")
-    L.append("|" + "---|" * (len(BACKBONES) + 1))
+    L.append("| env | " + " | ".join(backbones) + " |")
+    L.append("|" + "---|" * (len(backbones) + 1))
     stats = {}
     for env in envs:
         cells = [env]
-        for bb in BACKBONES:
+        for bb in backbones:
             mn, sd = _ms(by.get((env, bb), []))
             stats[(env, bb)] = mn
             cells.append(f"{mn:.1f}+-{sd:.1f}" if mn == mn else "-")
         L.append("| " + " | ".join(cells) + " |")
 
-    # 每 env 最佳
-    L.append("\n## 每 env 最佳 backbone\n")
-    L.append("| env | 最佳 | succ | ctm | lstm | gru | transformer |")
-    L.append("|---|---|---|---|---|---|---|")
-    for env in envs:
-        best_bb, best_s = None, -1
-        for bb in BACKBONES:
-            s = stats.get((env, bb), float("nan"))
-            if s == s and s > best_s:
-                best_s, best_bb = s, bb
-        ctm = stats.get((env, "ctm"), float("nan"))
-        lstm = stats.get((env, "lstm"), float("nan"))
-        gru = stats.get((env, "gru"), float("nan"))
-        tr = stats.get((env, "transformer"), float("nan"))
-        L.append(f"| {env} | {best_bb} | {best_s:.1f} | {ctm:.1f} | {lstm:.1f} | {gru:.1f} | {tr:.1f} |")
+    # Flash 混合 vs 单路径 (flash vs flash-shallow vs flash-deep)
+    if "flash" in backbones:
+        L.append("\n## Flash 混合 vs 单路径 (混合>单路径 坐实 fig4 修正版)\n")
+        L.append("| env | flash(混合) | flash-shallow(z=0) | flash-deep(z=1) | 混合-shallow | 混合-deep |")
+        L.append("|---|---|---|---|---|---|")
+        for env in envs:
+            f = stats.get((env, "flash"), float("nan"))
+            fs = stats.get((env, "flash-shallow"), float("nan"))
+            fd = stats.get((env, "flash-deep"), float("nan"))
+            d_s = (f - fs) if (f == f and fs == fs) else float("nan")
+            d_d = (f - fd) if (f == f and fd == fd) else float("nan")
+            L.append(f"| {env} | {f:.1f} | {fs if fs!=fs else f'{fs:.1f}'} | "
+                     f"{fd if fd!=fd else f'{fd:.1f}'} | {d_s if d_s!=d_s else f'{d_s:+.1f}'} | "
+                     f"{d_d if d_d!=d_d else f'{d_d:+.1f}'} |")
 
-    # 核心对比: CTM vs RNN 系 (这是 GPT 指出的真正对标)
-    L.append("\n## CTM vs RNN 系记忆策略 (核心对标)\n")
-    L.append("| env | CTM | RNN 均值(lstm/gru/tr) | CTM-RNN | 判定 |")
-    L.append("|---|---|---|---|---|")
-    ctm_wins = []
-    for env in envs:
-        ctm = stats.get((env, "ctm"), float("nan"))
-        rnns = [stats.get((env, b), float("nan")) for b in ("lstm", "gru", "transformer")]
-        rnns = [x for x in rnns if x == x]
-        rnn_mean = float(np.mean(rnns)) if rnns else float("nan")
-        delta = ctm - rnn_mean if (ctm == ctm and rnn_mean == rnn_mean) else float("nan")
-        flag = "CTM 赢" if delta > 2 else ("CTM 输" if delta < -2 else "持平")
-        if delta > 2:
-            ctm_wins.append(env)
-        L.append(f"| {env} | {ctm:.1f} | {rnn_mean:.1f} | {delta:+.1f} | {flag} |")
+    # CTM vs RNN 系 (若有 lstm/gru/transformer)
+    rnn_bbs = [b for b in ("lstm", "gru", "transformer") if b in backbones]
+    if "ctm" in backbones and rnn_bbs:
+        L.append("\n## CTM vs RNN 系记忆策略\n")
+        L.append("| env | CTM | RNN 均值 | CTM-RNN | 判定 |")
+        L.append("|---|---|---|---|---|")
+        ctm_wins = []
+        for env in envs:
+            ctm = stats.get((env, "ctm"), float("nan"))
+            rnns = [x for x in (stats.get((env, b), float("nan")) for b in rnn_bbs) if x == x]
+            rnn_mean = float(np.mean(rnns)) if rnns else float("nan")
+            delta = ctm - rnn_mean if (ctm == ctm and rnn_mean == rnn_mean) else float("nan")
+            flag = "CTM 赢" if delta > 2 else ("CTM 输" if delta < -2 else "持平")
+            if delta == delta and delta > 2:
+                ctm_wins.append(env)
+            L.append(f"| {env} | {ctm:.1f} | {rnn_mean:.1f} | {delta:+.1f} | {flag} |")
 
-    # 记忆 vs Markov (记忆是否有用)
-    L.append("\n## 记忆 policy vs Markov(mlp) — 记忆机制是否帮上\n")
-    L.append("| env | mlp | 记忆均值 | 记忆-mlp |")
-    L.append("|---|---|---|---|")
-    for env in envs:
-        mlp = stats.get((env, "mlp"), float("nan"))
-        mems = [stats.get((env, b), float("nan")) for b in ("ctm", "lstm", "gru", "transformer")]
-        mems = [x for x in mems if x == x]
-        mem_mean = float(np.mean(mems)) if mems else float("nan")
-        delta = mem_mean - mlp if (mem_mean == mem_mean and mlp == mlp) else float("nan")
-        L.append(f"| {env} | {mlp:.1f} | {mem_mean:.1f} | {delta:+.1f} |")
-
-    L.append("\n## 结论\n")
-    if ctm_wins:
-        L.append(f"CTM 在 {ctm_wins} 上显著优于 RNN 系记忆策略 —— CTM 持续思考作为 "
-                 "memory policy 有真实价值 (尤其这些任务). 论文可立.")
-    else:
-        L.append("CTM 未显著优于 RNN 系 —— 说明标准循环记忆已够, CTM 无额外价值 "
-                 "(或需调参/换更难记忆任务).")
     txt = "\n".join(L)
     Path(path).write_text(txt)
     print("\n" + "=" * 78)
@@ -179,7 +160,27 @@ def main():
     ap.add_argument("--nworkers", type=int, default=0)
     ap.add_argument("--procs-per-gpu", type=int, default=8)
     ap.add_argument("--report", default="csv_data/memory_ablation_report.md")
+    ap.add_argument("--report-only", action="store_true",
+                    help="跳过训练, 从 csv 重新出 report (report 列不全/想换 backbones 显示时用)")
+    ap.add_argument("--csv", default="csv_data/memory_ablation_results.csv")
     args = ap.parse_args()
+
+    if args.report_only:
+        rows = []
+        if Path(args.csv).exists():
+            with open(args.csv) as f:
+                for r in csv.DictReader(f):
+                    for k in ("success_rate", "seed"):
+                        try:
+                            r[k] = float(r[k])
+                            if k == "seed":
+                                r[k] = int(r[k])
+                        except (ValueError, KeyError, TypeError):
+                            pass
+                    rows.append(r)
+        envs = sorted({r["env"] for r in rows}) or args.envs
+        report(rows, envs, args.report, args.backbones)
+        return
 
     all_tasks = [(e, b, s) for e in args.envs for b in args.backbones for s in args.seeds]
     n_gpu = torch.cuda.device_count()
@@ -216,7 +217,7 @@ def main():
         for r in rows:
             wr.writerow({k: r.get(k, "") for k in FIELDS})
     print(f"\n[total] {len(rows)}/{len(all_tasks)} runs, {(time.time()-t0)/60:.0f}min")
-    report(rows, args.envs, args.report)
+    report(rows, args.envs, args.report, args.backbones)
 
 
 if __name__ == "__main__":
