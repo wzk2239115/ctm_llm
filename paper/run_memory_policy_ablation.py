@@ -49,8 +49,10 @@ def run_one(env, backbone, seed, args, device):
                               state_gate="gru", image=is_image)
     t = PPOTrainer(env, pol, num_envs=args.ppo_envs, num_steps=args.ppo_steps,
                    device=device, lr=args.lr)
+    if args.bc_steps > 0:
+        buf, _ = _collect_env(env, args)
+        t.bc_pretrain(buf, bc_steps=args.bc_steps)
     torch.manual_seed(seed); np.random.seed(seed)
-    t0 = time.time()
     hist = t.train(args.total_steps, log_iters=8, eval_episodes=args.eval_episodes, seed=seed)
     succ = 0.0
     for h in reversed(hist):
@@ -158,6 +160,9 @@ def main():
     ap.add_argument("--latent_dim", type=int, default=64)
     ap.add_argument("--memory_length", type=int, default=8)
     ap.add_argument("--eval_episodes", type=int, default=12)
+    ap.add_argument("--bc-steps", type=int, default=0,
+                    help="behaviour-cloning warm start on collected data (>0 = fair vs world-model pretrain)")
+    ap.add_argument("--episodes", type=int, default=60, help="collect episodes for BC/world-model data")
     ap.add_argument("--nworkers", type=int, default=0)
     ap.add_argument("--procs-per-gpu", type=int, default=8)
     ap.add_argument("--report", default="csv_data/memory_ablation_report.md")

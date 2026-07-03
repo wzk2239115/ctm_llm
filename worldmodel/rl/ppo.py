@@ -374,6 +374,43 @@ class PPOTrainer:
             obs = env.reset(seed=seed + k + 1)
         return 100.0 * succ / episodes
 
+    def bc_pretrain(self, buffer, bc_steps=5000, batch_size=64, lr=1e-3):
+        """Behaviour-cloning warm start on the SAME collected data the world-model
+        uses for pretrain. Levels the playing field: PPO is not from-scratch, it
+        sees the dataset before online fine-tuning. Matches stable-wm's
+        "collect data → train" paradigm for policy baselines too."""
+        samples = []
+        for ep in buffer.episodes:
+            states = ep.get('state', ep.get('pixels', None))
+            goals = ep['goal']; acts = ep['action']
+            if states is None:
+                continue
+            for tt in range(len(acts)):
+                g = goals[tt] if hasattr(goals, '__len__') and goals.ndim > 1 else goals
+                samples.append((np.asarray(states[tt]), np.asarray(g), np.asarray(acts[tt])))
+        if not samples:
+            return
+        n = len(samples)
+        opt = torch.optim.AdamW(self.policy.parameters(), lr=lr)
+        losses = []
+        for step in range(bc_steps):
+            idx = np.random.randint(0, n, batch_size)
+            batch = [samples[i] for i in idx]
+            self.policy.init_state(batch_size, self.device)
+            states = np.stack([b[0] for b in batch])
+            goals = np.stack([b[1] for b in batch])
+            key = 'pixels' if states.ndim == 4 else 'state'
+            x = _obs_goal_tensor({key: states, 'goal': goals}, self.device)
+            a_true = torch.as_tensor(np.stack([b[2] for b in batch]), dtype=torch.float32, device=self.device)
+            dist, _ = self.policy(x)
+            loss = -dist.log_prob(a_true).sum(-1).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            opt.step()
+            losses.append(float(loss.item()))
+        print(f"  [bc] {bc_steps} steps on {n} samples, final loss={np.mean(losses[-50:]):.4f}", flush=True)
+
     @torch.no_grad()
     def evaluate_timed(self, episodes=12, seed=100, deadline_ms=None):
         """evaluate + per-step latency/throughput/deadline-constrained success.
