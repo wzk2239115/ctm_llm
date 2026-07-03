@@ -169,6 +169,10 @@ def build_policy(kind, obs_dim, goal_dim, action_dim, d_model=128,
 
 
 def _obs_goal_tensor(infos, device):
+    if "pixels" in infos:
+        p = torch.as_tensor(np.asarray(infos["pixels"]), dtype=torch.float32, device=device)
+        g = torch.as_tensor(np.asarray(infos["goal"]), dtype=torch.float32, device=device)
+        return torch.cat([p, g], dim=1)  # (B, 6, H, W): stacked obs+goal frames
     state = torch.as_tensor(np.asarray(infos["state"]), dtype=torch.float32, device=device)
     goal = torch.as_tensor(np.asarray(infos["goal"]), dtype=torch.float32, device=device)
     return torch.cat([state, goal], dim=-1)

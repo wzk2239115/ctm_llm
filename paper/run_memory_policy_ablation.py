@@ -43,9 +43,10 @@ def run_one(env, backbone, seed, args, device):
     od = int(np.prod(e.observation_space.shape))
     gd = int(np.prod(e.goal_space.shape))
     ad = int(np.prod(e.action_space.shape))
+    is_image = len(e.observation_space.shape) == 3
     pol = build_memory_policy(backbone, od, gd, ad, latent_dim=args.latent_dim,
                               d_model=args.d_model, memory_length=args.memory_length,
-                              state_gate="gru")
+                              state_gate="gru", image=is_image)
     t = PPOTrainer(env, pol, num_envs=args.ppo_envs, num_steps=args.ppo_steps,
                    device=device, lr=args.lr)
     torch.manual_seed(seed); np.random.seed(seed)

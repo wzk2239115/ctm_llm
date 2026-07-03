@@ -270,12 +270,24 @@ class FlashBrainBackbone(MemoryBackbone):
         return feat, new_state
 
 
+class _CNNImageEncoder(nn.Module):
+    """Small CNN for image POMDP: input (B, 6, H, W) = stacked obs+goal frames."""
+    def __init__(self, in_ch=6, latent_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 3, 2), nn.GELU(),
+            nn.Conv2d(32, 32, 3, 2), nn.GELU(),
+            nn.Conv2d(32, 32, 3, 2), nn.GELU(),
+            nn.Flatten(), nn.Linear(32 * 3 * 3, latent_dim), nn.GELU())
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def build_encoder(obs_dim, goal_dim, latent_dim, image=False):
-    inp = obs_dim + goal_dim
     if image:
-        # small CNN for image obs (assumes flat-ish or patch); here a fall-back MLP
-        return nn.Sequential(nn.Linear(inp, latent_dim * 2), nn.GELU(),
-                             nn.Linear(latent_dim * 2, latent_dim))
+        return _CNNImageEncoder(in_ch=6, latent_dim=latent_dim)
+    inp = obs_dim + goal_dim
     return nn.Sequential(nn.Linear(inp, latent_dim), nn.GELU(),
                          nn.Linear(latent_dim, latent_dim))
 
