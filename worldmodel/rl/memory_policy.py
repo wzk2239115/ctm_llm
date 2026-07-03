@@ -221,10 +221,11 @@ class GRUGate(nn.Module):
         nn.init.zeros_(self.gate_proj.weight)
         self.gate_proj.bias.data.fill_(-2.0)
 
-    def forward(self, deep, shallow):
+    def forward(self, deep, shallow, return_gate=False):
         z = torch.sigmoid(self.gate_proj(torch.cat([deep, shallow], dim=-1)))
         candidate = torch.relu(self.value_proj(deep))
-        return (1.0 - z) * shallow + z * candidate
+        out = (1.0 - z) * shallow + z * candidate
+        return (out, z) if return_gate else out
 
 
 class FlashBrainBackbone(MemoryBackbone):
@@ -246,6 +247,7 @@ class FlashBrainBackbone(MemoryBackbone):
         self.deep = CTMMemory(latent_dim, d_model, memory_length, nlm_hidden,
                               state_gate=state_gate)
         self.gate = GRUGate(d_model, d_model)
+        self.last_gate_z = 0.0  # diagnostics: mean gate opening (0=shallow, 1=deep)
 
     def zero_state(self, batch, device):
         return self.deep.zero_state(batch, device)
@@ -256,7 +258,8 @@ class FlashBrainBackbone(MemoryBackbone):
     def step_stateless(self, z, state):
         shallow_feat = self.shallow(z)
         deep_feat, new_state = self.deep.step_stateless(z, state)
-        feat = self.gate(deep_feat, shallow_feat)
+        feat, gz = self.gate(deep_feat, shallow_feat, return_gate=True)
+        self.last_gate_z = float(gz.mean().detach().item())
         return feat, new_state
 
 
