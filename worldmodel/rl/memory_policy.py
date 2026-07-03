@@ -249,6 +249,8 @@ class FlashBrainBackbone(MemoryBackbone):
                               state_gate=state_gate)
         self.gate = GRUGate(d_model, d_model) if gate_mode == "learn" else None
         self.last_gate_z = 0.0  # diagnostics: mean gate opening (0=shallow, 1=deep)
+        self.last_shallow_norm = 0.0  # diagnostics: shallow path output norm
+        self.last_deep_norm = 0.0     # diagnostics: deep path output norm
 
     def zero_state(self, batch, device):
         return self.deep.zero_state(batch, device)
@@ -259,6 +261,8 @@ class FlashBrainBackbone(MemoryBackbone):
     def step_stateless(self, z, state):
         shallow_feat = self.shallow(z)
         deep_feat, new_state = self.deep.step_stateless(z, state)
+        self.last_shallow_norm = float(shallow_feat.norm(dim=-1).mean().detach().item())
+        self.last_deep_norm = float(deep_feat.norm(dim=-1).mean().detach().item())
         if self.gate_mode == "shallow":
             self.last_gate_z = 0.0
             return shallow_feat, new_state
