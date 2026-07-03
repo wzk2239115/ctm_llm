@@ -229,9 +229,9 @@ class PPOTrainer:
     def collect_rollout(self):
         n, s, dev = self.num_envs, self.num_steps, self.device
         self.policy.init_state(n, dev)
-        ob_dim = self.obs_dim + self.goal_dim
+        x_probe = _obs_goal_tensor(self._infos, dev)  # probe shape: image (n,6,H,W), state (n,ob_dim)
         buf = {
-            "x": torch.zeros(s, n, ob_dim, device=dev),
+            "x": torch.zeros((s,) + x_probe.shape, device=dev),
             "action": torch.zeros(s, n, self.action_dim, device=dev),
             "logprob": torch.zeros(s, n, device=dev),
             "reward": torch.zeros(s, n, device=dev),
