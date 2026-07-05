@@ -1,0 +1,213 @@
+=== A delay matrix ===
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum | 100.0+-0.0 | 88.3+-14.5 | 78.3+-6.6 | 83.3+-14.0 | 65.0+-14.3 |
+| pendulum-partial | 15.0+-3.4 | 78.4+-11.3 | 31.7+-17.8 | 20.0+-18.0 | 50.0+-14.0 |
+| pendulum-delay3 | 95.0+-6.7 | 73.3+-9.7 | 75.0+-13.9 | 65.0+-6.3 | 61.7+-8.5 |
+| pendulum-partial-delay3 | 13.3+-6.7 | 61.7+-14.5 | 20.0+-11.3 | 23.3+-6.2 | 55.0+-16.3 |
+| cartpole-partial | 5.0+-4.1 | 5.0+-6.7 | 3.3+-4.1 | 5.0+-4.1 | 3.3+-4.1 |
+| tworoom-state | 16.7+-9.1 | 56.7+-9.7 | 48.3+-3.3 | 40.0+-3.4 | 68.3+-8.2 |
+| point-state | 100.0+-0.0 | 100.0+-0.0 | 100.0+-0.0 | 100.0+-0.0 | 98.3+-3.3 |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum | mlp | 100.0 | 88.3 | 78.3 | 83.3 | 65.0 |
+| pendulum-partial | ctm | 78.4 | 78.4 | 31.7 | 20.0 | 50.0 |
+| pendulum-delay3 | mlp | 95.0 | 73.3 | 75.0 | 65.0 | 61.7 |
+| pendulum-partial-delay3 | ctm | 61.7 | 61.7 | 20.0 | 23.3 | 55.0 |
+| cartpole-partial | ctm | 5.0 | 5.0 | 3.3 | 5.0 | 3.3 |
+| tworoom-state | transformer | 68.3 | 56.7 | 48.3 | 40.0 | 68.3 |
+| point-state | mlp | 100.0 | 100.0 | 100.0 | 100.0 | 98.3 |
+=== B probe ===
+-- logs/overnight_B_probe_ctm.log
+=== belief probe on pendulum-partial (occluded var = angular velocity θdot) ===
+device=cuda  train=80000 steps  probe=3000 steps  seeds=[0, 1, 2, 3, 4]
+
+--- seed 0 ---
+[ppo] pendulum-partial it0/39 step=2048 ep_ret=4.0 pg=-0.001 v=0.011 ent=1.423 eval_succ=16.7%
+[ppo] pendulum-partial it7/39 step=16384 ep_ret=7.0 pg=-0.003 v=0.018 ent=1.490 eval_succ=41.7%
+[ppo] pendulum-partial it14/39 step=30720 ep_ret=6.0 pg=-0.003 v=0.015 ent=1.566 eval_succ=41.7%
+[ppo] pendulum-partial it21/39 step=45056 ep_ret=18.0 pg=-0.005 v=0.028 ent=1.616 eval_succ=41.7%
+[ppo] pendulum-partial it28/39 step=59392 ep_ret=20.0 pg=-0.006 v=0.026 ent=1.693 eval_succ=83.3%
+--
+belief probe 结果 (pendulum-partial, mean over seeds)
+======================================================================
+backbone      succ%     R²(θdot 遮挡)       R²(θ 可观测)       
+----------------------------------------------------------
+ctm           75.0      +0.945            +0.682          
+
+判读:
+  R²(θdot) 高 = backbone 内部推断出了被遮挡的角速度 (belief encoding)
+  R²(θ)    高 = sanity (θ 从 cos/sin 可算, 所有 backbone 都该高)
+-- logs/overnight_B_probe_gru.log
+=== belief probe on pendulum-partial (occluded var = angular velocity θdot) ===
+device=cuda  train=80000 steps  probe=3000 steps  seeds=[0, 1, 2, 3, 4]
+
+--- seed 0 ---
+[ppo] pendulum-partial it0/39 step=2048 ep_ret=4.0 pg=-0.000 v=0.011 ent=1.423 eval_succ=25.0%
+[ppo] pendulum-partial it7/39 step=16384 ep_ret=5.0 pg=-0.001 v=0.009 ent=1.488 eval_succ=0.0%
+[ppo] pendulum-partial it14/39 step=30720 ep_ret=4.0 pg=-0.002 v=0.011 ent=1.563 eval_succ=25.0%
+[ppo] pendulum-partial it21/39 step=45056 ep_ret=9.0 pg=-0.001 v=0.021 ent=1.647 eval_succ=8.3%
+[ppo] pendulum-partial it28/39 step=59392 ep_ret=8.0 pg=-0.001 v=0.019 ent=1.702 eval_succ=8.3%
+--
+belief probe 结果 (pendulum-partial, mean over seeds)
+======================================================================
+backbone      succ%     R²(θdot 遮挡)       R²(θ 可观测)       
+----------------------------------------------------------
+gru           15.0      +0.991            +0.737          
+
+判读:
+  R²(θdot) 高 = backbone 内部推断出了被遮挡的角速度 (belief encoding)
+  R²(θ)    高 = sanity (θ 从 cos/sin 可算, 所有 backbone 都该高)
+-- logs/overnight_B_probe_lstm.log
+=== belief probe on pendulum-partial (occluded var = angular velocity θdot) ===
+device=cuda  train=80000 steps  probe=3000 steps  seeds=[0, 1, 2, 3, 4]
+
+--- seed 0 ---
+[ppo] pendulum-partial it0/39 step=2048 ep_ret=4.0 pg=-0.000 v=0.011 ent=1.423 eval_succ=16.7%
+[ppo] pendulum-partial it7/39 step=16384 ep_ret=5.0 pg=-0.001 v=0.010 ent=1.492 eval_succ=8.3%
+[ppo] pendulum-partial it14/39 step=30720 ep_ret=4.0 pg=-0.002 v=0.012 ent=1.554 eval_succ=8.3%
+[ppo] pendulum-partial it21/39 step=45056 ep_ret=9.0 pg=-0.001 v=0.022 ent=1.621 eval_succ=16.7%
+[ppo] pendulum-partial it28/39 step=59392 ep_ret=12.0 pg=-0.002 v=0.036 ent=1.684 eval_succ=16.7%
+--
+belief probe 结果 (pendulum-partial, mean over seeds)
+======================================================================
+backbone      succ%     R²(θdot 遮挡)       R²(θ 可观测)       
+----------------------------------------------------------
+lstm          23.3      +0.960            +0.661          
+
+判读:
+  R²(θdot) 高 = backbone 内部推断出了被遮挡的角速度 (belief encoding)
+  R²(θ)    高 = sanity (θ 从 cos/sin 可算, 所有 backbone 都该高)
+-- logs/overnight_B_probe_mlp.log
+=== belief probe on pendulum-partial (occluded var = angular velocity θdot) ===
+device=cuda  train=80000 steps  probe=3000 steps  seeds=[0, 1, 2, 3, 4]
+
+--- seed 0 ---
+[ppo] pendulum-partial it0/39 step=2048 ep_ret=4.0 pg=-0.001 v=0.011 ent=1.423 eval_succ=16.7%
+[ppo] pendulum-partial it7/39 step=16384 ep_ret=3.0 pg=-0.000 v=0.006 ent=1.497 eval_succ=16.7%
+[ppo] pendulum-partial it14/39 step=30720 ep_ret=7.0 pg=-0.001 v=0.018 ent=1.556 eval_succ=0.0%
+[ppo] pendulum-partial it21/39 step=45056 ep_ret=7.0 pg=-0.001 v=0.014 ent=1.627 eval_succ=8.3%
+[ppo] pendulum-partial it28/39 step=59392 ep_ret=6.0 pg=-0.000 v=0.012 ent=1.701 eval_succ=16.7%
+--
+belief probe 结果 (pendulum-partial, mean over seeds)
+======================================================================
+backbone      succ%     R²(θdot 遮挡)       R²(θ 可观测)       
+----------------------------------------------------------
+mlp           15.0      +0.054            +0.473          
+
+判读:
+  R²(θdot) 高 = backbone 内部推断出了被遮挡的角速度 (belief encoding)
+  R²(θ)    高 = sanity (θ 从 cos/sin 可算, 所有 backbone 都该高)
+-- logs/overnight_B_probe_transformer.log
+=== belief probe on pendulum-partial (occluded var = angular velocity θdot) ===
+device=cuda  train=80000 steps  probe=3000 steps  seeds=[0, 1, 2, 3, 4]
+
+--- seed 0 ---
+[ppo] pendulum-partial it0/39 step=2048 ep_ret=3.0 pg=0.003 v=0.016 ent=1.424 eval_succ=25.0%
+[ppo] pendulum-partial it7/39 step=16384 ep_ret=4.0 pg=-0.001 v=0.008 ent=1.493 eval_succ=16.7%
+[ppo] pendulum-partial it14/39 step=30720 ep_ret=3.0 pg=-0.005 v=0.005 ent=1.569 eval_succ=16.7%
+[ppo] pendulum-partial it21/39 step=45056 ep_ret=9.0 pg=-0.003 v=0.012 ent=1.633 eval_succ=41.7%
+[ppo] pendulum-partial it28/39 step=59392 ep_ret=10.0 pg=-0.004 v=0.016 ent=1.703 eval_succ=75.0%
+--
+belief probe 结果 (pendulum-partial, mean over seeds)
+======================================================================
+backbone      succ%     R²(θdot 遮挡)       R²(θ 可观测)       
+----------------------------------------------------------
+transformer   56.7      +0.558            +0.496          
+
+判读:
+  R²(θdot) 高 = backbone 内部推断出了被遮挡的角速度 (belief encoding)
+  R²(θ)    高 = sanity (θ 从 cos/sin 可算, 所有 backbone 都该高)
+=== C core 10seed ===
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum-partial | 13.3+-9.3 | 70.0+-21.1 | 30.0+-18.7 | 18.3+-14.3 | 54.2+-12.5 |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum-partial | ctm | 70.0 | 70.0 | 30.0 | 18.3 | 54.2 |
+
+## CTM vs RNN 系记忆策略 (核心对标)
+=== D d_model ===
+-- dm64
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum-partial | - | 48.3+-19.3 | 21.7+-6.6 | 23.3+-13.4 | - |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum-partial | ctm | 48.3 | 48.3 | 21.7 | 23.3 | nan |
+-- dm128
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum-partial | - | 60.0+-20.7 | 20.0+-25.1 | 11.7+-8.5 | - |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum-partial | ctm | 60.0 | 60.0 | 20.0 | 11.7 | nan |
+-- dm256
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum-partial | - | 66.7+-14.0 | 20.0+-14.5 | 16.7+-11.8 | - |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum-partial | ctm | 66.7 | 66.7 | 20.0 | 16.7 | nan |
+=== E memory_length ===
+-- ml4
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum-partial | - | 60.0+-22.6 | 23.3+-19.3 | 8.3+-9.1 | - |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum-partial | ctm | 60.0 | 60.0 | 23.3 | 8.3 | nan |
+-- ml8
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum-partial | - | 73.3+-13.4 | 15.0+-12.2 | 25.0+-10.5 | - |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum-partial | ctm | 73.3 | 73.3 | 15.0 | 25.0 | nan |
+-- ml16
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|
+| pendulum-partial | - | 60.0+-13.3 | 11.7+-11.3 | 25.0+-13.9 | - |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum-partial | ctm | 60.0 | 60.0 | 11.7 | 25.0 | nan |

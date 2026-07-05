@@ -286,7 +286,18 @@ def main():
     report = build_report(results, args)
     with open(args.report, 'w') as f:
         f.write(report)
-    print(f"\n[total] {len(results)} runs -> {args.report}")
+
+    # write CSV (for multi-GPU merge)
+    csv_path = args.report.replace('.md', '.csv')
+    with open(csv_path, 'w') as f:
+        f.write('env,backbone,seed,success_rate,expert_success,n_episodes,n_steps,elapsed_s\n')
+        for r in results:
+            f.write(f"{r['env']},{r['backbone']},{r['seed']},"
+                    f"{r['success_rate']},{r.get('expert_success',0)},"
+                    f"{r.get('n_episodes',0)},{r.get('n_steps',0)},"
+                    f"{r.get('elapsed_s',0)}\n")
+
+    print(f"\n[total] {len(results)} runs -> {args.report} + {csv_path}")
     print(report)
 
 

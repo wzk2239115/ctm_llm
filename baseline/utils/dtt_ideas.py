@@ -379,17 +379,18 @@ def per_tick_sinkhorn_sort_loss(
     T = predictions.size(-1)
     N = N_to_sort if N_to_sort is not None else targets.size(-1)
 
-    pred = predictions.reshape(B, N, N, T)
-    tgt = targets.long()
+    # Vectorized: move tick dim next to batch so Sinkhorn runs on all (B*T)
+    # matrices at once (last two dims = position x element). No Python loop →
+    # far fewer kernel launches → much higher GPU util on small models.
+    pred = predictions.reshape(B, N, N, T).permute(0, 3, 1, 2).contiguous()  # (B, T, N, N)
+    tgt = targets.long()                                                     # (B, N)
 
     tau = _current_tau(sinkhorn_tau, sinkhorn_tau_min, cur_step, total_steps, anneal)
 
-    per_tick_losses = torch.empty(B, T, device=predictions.device, dtype=torch.float32)
-    for t in range(T):
-        pred_t = pred[..., t]
-        P = sinkhorn_normalize(pred_t, sinkhorn_iters, tau)
-        p_correct = P.gather(2, tgt.unsqueeze(-1)).squeeze(-1)
-        per_tick_losses[:, t] = -torch.log(p_correct + 1e-9).mean(dim=1)
+    P = sinkhorn_normalize(pred, sinkhorn_iters, tau)                        # (B, T, N, N)
+    tgt_exp = tgt.unsqueeze(1).unsqueeze(-1).expand(B, T, N, 1)              # (B, T, N, 1)
+    p_correct = P.gather(3, tgt_exp).squeeze(-1)                             # (B, T, N)
+    per_tick_losses = -torch.log(p_correct + 1e-9).mean(dim=-1)              # (B, T)
 
     if reduction == "none":
         return per_tick_losses

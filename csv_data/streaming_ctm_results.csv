@@ -1,0 +1,5 @@
+variant,env,predictor,seed,horizon,success_rate,random_rate,final_loss,dynamics_err,latent_var,elapsed_s
+jepa-mlp,point-state,mlp,0,6,100.0,25.0,3.59275,0.06583,0.01828,12.5
+stream-ctm,point-state,stream,0,6,100.0,31.2,4.05636,0.52944,0.01828,18.5
+jepa-mlp,point-state,mlp,0,4,100.0,25.0,3.60823,0.01813,0.01379,1.4
+stream-ctm,point-state,stream,0,4,100.0,12.5,3.98232,0.39222,0.01379,0.9

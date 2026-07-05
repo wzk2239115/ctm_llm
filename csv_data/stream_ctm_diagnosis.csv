@@ -1,0 +1,7 @@
+env,variant,memory_length,state_gate,success_rate,random_rate,dynamics_err,latent_var,elapsed_s
+point-state,stream-base,8,none,0.0,0.0,0.55444,0.01614,3.3
+point-state,stream-mem16,16,none,0.0,25.0,0.44818,0.01614,1.2
+point-state,stream-mem32,32,none,0.0,0.0,0.38365,0.01614,0.9
+point-state,stream-gate,8,gru,0.0,100.0,0.48558,0.01614,1.0
+point-state,stream-gate-mem32,32,gru,0.0,25.0,0.35305,0.01614,1.3
+point-state,jepa-mlp,8,none,75.0,25.0,0.02153,0.01614,0.8

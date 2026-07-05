@@ -1,5 +1,26 @@
 # TODO
 
+## CTM memory-policy — 收口分析任务
+
+### 现状结论 (overnight 6 批已跑完)
+- CTM 在 POMDP (pendulum-partial 70-78%, partial-delay3 61.7%, delay8 +18.9 vs RNN) 显著赢 RNN 系; 全观测/短延迟 mlp 够 (记忆是负担)
+- robustness 通过: CTM 赢跨 d_model (48/60/67 随容量升) 和 memory_length (60/73/60), RNN 系不动
+- **probe 反直觉 (最有价值)**: LSTM/GRU 的 R²(θdot) 最高 (0.96/0.99) 但 success 最低 (23/15); CTM R² 0.945 + success 75. 说明 **belief encoding ≠ belief usage** — RNN 编码了 belief 但 actor 用不上, CTM 既编码又利用
+
+### 待办
+- [ ] **编码-利用耦合度 ablation** (核心): 量化 actor 对 hidden 的梯度贡献/依赖, 坐实"CTM 利用 belief, RNN 利用失败". 比 linear probe 更直接证明利用 (probe 只证编码)
+- [ ] **出三张论文 figure** (从 csv_data 现有结果): ① success×env 性能图 (CTM 在 POMDP 赢) ② R²-vs-success 散点 (RNN 编码不用, CTM 编码且用) ③ d_model scaling 曲线 (CTM 受益 RNN 不动)
+- [ ] **CTM 高方差处理**: 10 seed pendulum-partial std=21 (有些 seed 差), 考虑加 seed 到 20 或调 lr/entropy 稳定; vs transformer 的差 ~1std 不极显著需收紧
+- [ ] **叙事精修**: 主线改成 "CTM 优势不在编码 belief (RNN 也编码), 而在有效利用 belief 做决策" — encoding-vs-usage 解耦是核心新意
+
+### 相关文件
+- 实验: `paper/run_memory_policy_ablation.py` / `paper/probe_belief_encoding.py` / `scripts/overnight_memory.sh`
+- 结果: `csv_data/memory_ablation_results.csv` / `logs/overnight_{A..F}_*.log`
+- backbone: `worldmodel/rl/memory_policy.py` / `worldmodel/rl/ppo.py`
+- env: `worldmodel/envs/__init__.py` (DelayObs + make_env -delayN)
+
+---
+
 ## JEPA 在 sort 任务上效果不佳 — 排查计划
 
 ### 现象

@@ -1,0 +1,19 @@
+# Memory-policy ablation: CTM vs RNN/Transformer memory policies
+
+生成: 2026-07-03 14:08:26 | runs: 50 | backbones: ['mlp', 'ctm', 'flash', 'flash-shallow', 'flash-deep']
+
+
+## success_rate mean+-std
+
+| env | mlp | ctm | flash | flash-shallow | flash-deep |
+|---|---|---|---|---|---|
+| pendulum | 100.0+-0.0 | 98.3+-3.3 | 96.7+-6.7 | 100.0+-0.0 | 88.3+-8.5 |
+| pendulum-partial | 10.0+-9.7 | 65.0+-20.7 | 78.3+-14.5 | 16.7+-7.5 | 60.0+-12.2 |
+
+## Flash 混合 vs 单路径 (混合>单路径 坐实 fig4 修正版)
+
+| env | flash(混合) | flash-shallow(z=0) | flash-deep(z=1) | 混合-shallow | 混合-deep |
+|---|---|---|---|---|---|
+| pendulum | 96.7 | 100.0 | 88.3 | -3.3 | +8.3 |
+| pendulum-partial | 78.3 | 16.7 | 60.0 | +61.7 | +18.3 |
+root@nb-wangzekai-ctm-3-0:/home/jovyan/h800fast/wangzekai/ctm_llm#

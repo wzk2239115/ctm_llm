@@ -1,0 +1,38 @@
+==============================================================================
+# Memory-policy ablation: CTM vs RNN/Transformer memory policies
+
+生成: 2026-07-03 13:58:22 | runs: 50
+
+
+## success_rate mean+-std
+
+| env | mlp | ctm | lstm | gru | transformer | flash |
+|---|---|---|---|---|---|---|
+| pendulum | 100.0+-0.0 | 98.3+-3.3 | - | - | - | 96.7+-6.7 |
+| pendulum-partial | 10.0+-9.7 | 65.0+-20.7 | - | - | - | 78.3+-14.5 |
+
+## 每 env 最佳 backbone
+
+| env | 最佳 | succ | ctm | lstm | gru | transformer |
+|---|---|---|---|---|---|---|
+| pendulum | mlp | 100.0 | 98.3 | nan | nan | nan |
+| pendulum-partial | flash | 78.3 | 65.0 | nan | nan | nan |
+
+## CTM vs RNN 系记忆策略 (核心对标)
+
+| env | CTM | RNN 均值(lstm/gru/tr) | CTM-RNN | 判定 |
+|---|---|---|---|---|
+| pendulum | 98.3 | nan | +nan | 持平 |
+| pendulum-partial | 65.0 | nan | +nan | 持平 |
+
+## 记忆 policy vs Markov(mlp) — 记忆机制是否帮上
+
+| env | mlp | 记忆均值 | 记忆-mlp |
+|---|---|---|---|
+| pendulum | 100.0 | 98.3 | -1.7 |
+| pendulum-partial | 10.0 | 65.0 | +55.0 |
+
+## 结论
+
+CTM 未显著优于 RNN 系 —— 说明标准循环记忆已够, CTM 无额外价值 (或需调参/换更难记忆任务).
+root@nb-wangzekai-ctm-3-0:/home/jovyan/h800fast/wangzekai/ctm_llm#
