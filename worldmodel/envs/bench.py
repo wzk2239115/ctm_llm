@@ -327,7 +327,9 @@ class Reacher:
 
     @property
     def observation_space(self):
-        return Box(low=-1.1, high=1.1, shape=(2,))
+        if self.partial:
+            return Box(low=-1.1, high=1.1, shape=(2,))  # ee xy only (joints hidden)
+        return Box(low=-3.2, high=3.2, shape=(4,))  # ee xy + joint angles (full)
 
     @property
     def goal_space(self):
@@ -362,7 +364,10 @@ class Reacher:
         return self._obs(), float(terminated), terminated, truncated, {'distance': dist}
 
     def _state_obs(self):
-        return self._ee(self._a1, self._a2).copy()  # ee xy (joint angles hidden)
+        ee = self._ee(self._a1, self._a2)
+        if self.partial:
+            return ee.copy()  # ee xy only (joint angles hidden -> POMDP)
+        return np.array([ee[0], ee[1], self._a1, self._a2], dtype=np.float32)
 
     def _obs(self):
         return {'state': self._state_obs(), 'goal': self._goal.copy()}
