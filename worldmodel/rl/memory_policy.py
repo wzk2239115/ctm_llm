@@ -229,14 +229,17 @@ class GRUGate(nn.Module):
 
 
 class FlashBrainBackbone(MemoryBackbone):
-    """Multi-timescale 'Flash Brain': a shallow-fast path + a deep-slow CTM,
+    """Multi-timescale 'Flash Brain': shallow-fast (short GRU) + deep-slow (CTM),
     fused by a GRUGate so deep thought never blocks shallow reflex.
 
-      shallow (Linear, every step, low-latency)  -> fast feat
-      deep    (CTM memory, accumulates belief)    -> deep feat
-      gate    (GRUGate): feat = gate(deep, shallow)  # deep modulates shallow
+      shallow (GRUCell, 1-step recurrence, low-latency) -> fast feat + short context
+      deep    (CTM memory, accumulates belief)           -> deep feat + long context
+      gate    (GRUGate): feat = gate(deep, shallow)       # dynamic mix
 
-    JEPA/encoder feeds z_t (perception); CTM is the memory-control component.
+    The shallow path has 1-step GRU recurrence (not pure Linear), so it can
+    handle mild POMDP (e.g. velocity inference from position delta) while
+    staying cheaper than the full CTM. This gives the gate a real choice:
+    simple/mild-POMDP steps can rely on shallow, hard-POMDP steps lean on deep.
     """
 
     def __init__(self, latent_dim, d_model=128, memory_length=8, nlm_hidden=8,
@@ -244,34 +247,45 @@ class FlashBrainBackbone(MemoryBackbone):
         super().__init__()
         self.feat_dim = d_model
         self.gate_mode = gate_mode  # learn | shallow (z=0) | deep (z=1)
-        self.shallow = nn.Sequential(nn.Linear(latent_dim, d_model), nn.GELU())
+        self.shallow_gru = nn.GRUCell(latent_dim, d_model)
+        self.shallow_norm = nn.LayerNorm(d_model)
         self.deep = CTMMemory(latent_dim, d_model, memory_length, nlm_hidden,
                               state_gate=state_gate)
         self.gate = GRUGate(d_model, d_model) if gate_mode == "learn" else None
-        self.last_gate_z = 0.0  # diagnostics: mean gate opening (0=shallow, 1=deep)
-        self.last_shallow_norm = 0.0  # diagnostics: shallow path output norm
-        self.last_deep_norm = 0.0     # diagnostics: deep path output norm
+        self.last_gate_z = 0.0
+        self.last_shallow_norm = 0.0
+        self.last_deep_norm = 0.0
 
     def zero_state(self, batch, device):
-        return self.deep.zero_state(batch, device)
+        deep_state = self.deep.zero_state(batch, device)
+        shallow_h = torch.zeros(batch, self.feat_dim, device=device)
+        return (deep_state, shallow_h)
 
     def mask_state(self, state, done_mask):
-        return self.deep.mask_state(state, done_mask)
+        deep_state, shallow_h = state
+        deep_state = self.deep.mask_state(deep_state, done_mask)
+        m = done_mask
+        view = [1] * shallow_h.dim()
+        view[0] = -1
+        shallow_h = shallow_h * (1.0 - m.to(shallow_h).view(view))
+        return (deep_state, shallow_h)
 
     def step_stateless(self, z, state):
-        shallow_feat = self.shallow(z)
-        deep_feat, new_state = self.deep.step_stateless(z, state)
+        deep_state, shallow_h = state
+        shallow_h_new = self.shallow_gru(z, shallow_h)
+        shallow_feat = self.shallow_norm(shallow_h_new)
+        deep_feat, new_deep_state = self.deep.step_stateless(z, deep_state)
         self.last_shallow_norm = float(shallow_feat.norm(dim=-1).mean().detach().item())
         self.last_deep_norm = float(deep_feat.norm(dim=-1).mean().detach().item())
         if self.gate_mode == "shallow":
             self.last_gate_z = 0.0
-            return shallow_feat, new_state
+            return shallow_feat, (new_deep_state, shallow_h_new)
         if self.gate_mode == "deep":
             self.last_gate_z = 1.0
-            return deep_feat, new_state
+            return deep_feat, (new_deep_state, shallow_h_new)
         feat, gz = self.gate(deep_feat, shallow_feat, return_gate=True)
         self.last_gate_z = float(gz.mean().detach().item())
-        return feat, new_state
+        return feat, (new_deep_state, shallow_h_new)
 
 
 class _CNNImageEncoder(nn.Module):

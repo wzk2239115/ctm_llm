@@ -131,6 +131,17 @@ def run_wm_cem(env_name, buf, seed, args, device='cpu'):
     obs_shape = env.observation_space.shape
     action_dim = env.action_space.shape[0]
     obs_key = 'pixels' if len(obs_shape) == 3 else 'state'
+    goal_dim = int(np.prod(env.goal_space.shape))
+    obs_dim = int(np.prod(obs_shape))
+
+    # CEM-WM requires goal_encoder to be trained via JEPA loss, but jepa_loss
+    # only encodes obs frames (not goals). When goal_dim == obs_dim, we reuse
+    # the obs encoder (trained). When goal_dim != obs_dim, goal_encoder is
+    # randomly initialised -> cost is meaningless -> CEM fails. Skip those envs.
+    if goal_dim != obs_dim:
+        print(f"  [cem-wm] skip {env_name}: goal_dim={goal_dim} != obs_dim={obs_dim} "
+              f"(goal_encoder untrained; only same-dim goals supported)", flush=True)
+        return None
 
     model = build_jepa_wm(
         obs_key=obs_key, obs_shape=obs_shape, action_dim=action_dim,

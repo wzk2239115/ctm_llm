@@ -270,7 +270,7 @@ class Pendulum:
             self.rng = np.random.default_rng(seed)
         self._th = float(self.rng.uniform(-np.pi, np.pi))
         self._thd = float(self.rng.uniform(-1.0, 1.0))
-        self._goal_th = float(self.rng.uniform(-np.pi, np.pi))
+        self._goal_th = float(self.rng.uniform(-np.pi / 2, np.pi / 2))
         self._step = 0
         return self._obs()
 
