@@ -32,6 +32,7 @@ class WorldModel(nn.Module):
         ema_decay: float = 0.0,
         var_weight: float = 0.0,
         var_gamma: float = 1.0,
+        goal_encoder: nn.Module | None = None,
     ):
         super().__init__()
         self.encoder = encoder
@@ -44,6 +45,7 @@ class WorldModel(nn.Module):
         self.ema_decay = float(ema_decay)
         self.var_weight = float(var_weight)   # VICReg-style anti-collapse
         self.var_gamma = float(var_gamma)
+        self.goal_encoder = goal_encoder  # separate encoder if goal dim != obs dim
         if self.ema_decay > 0:
             import copy
             self.target_encoder = copy.deepcopy(encoder)
@@ -108,7 +110,10 @@ class WorldModel(nn.Module):
         pred_latents = self.rollout(init_latent, action_candidates)  # (nE, nS, H, D)
 
         goal_flat = goal.reshape(nE * nS, *goal.shape[2:])
-        goal_latent = self._encode_target(goal_flat).reshape(nE, nS, D)
+        if self.goal_encoder is not None:
+            goal_latent = self.goal_encoder(goal_flat).reshape(nE, nS, D)
+        else:
+            goal_latent = self._encode_target(goal_flat).reshape(nE, nS, D)
 
         if self.cost_mode == 'mean':
             diff = pred_latents - goal_latent.unsqueeze(-2)

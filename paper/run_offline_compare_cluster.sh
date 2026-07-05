@@ -50,6 +50,7 @@ for ((g=0; g<N_GPU; g++)); do
         --collect-episodes $COLLECT_EPS \
         --gcbc-steps $GCBC_STEPS \
         --eval-episodes $EVAL_EPS \
+        --with-wm-cem \
         --device cuda \
         --report "$OUT_DIR/offline_compare_gpu${g}.md" \
         > "logs/offline_compare_gpu${g}.log" 2>&1 &

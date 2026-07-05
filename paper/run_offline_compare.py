@@ -79,18 +79,12 @@ def get_dims(env_name):
     return int(np.prod(obs_shape)), int(np.prod(goal_shape)), action_dim, image
 
 
-def run_one(env_name, backbone, seed, args, device='cpu'):
+def run_one(env_name, backbone, seed, buf, expert_succ, args, device='cpu'):
+    """GCBC train + eval on an already-collected expert buffer."""
     t0 = time.time()
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # 1) collect expert buffer (shared data source)
-    buf, expert_succ = collect_expert_buffer(
-        env_name, args.collect_episodes, seed=seed,
-        num_envs=args.num_envs, noise=args.expert_noise,
-    )
-
-    # 2) build memory policy
     obs_dim, goal_dim, action_dim, image = get_dims(env_name)
     policy = build_memory_policy(
         backbone, obs_dim, goal_dim, action_dim,
@@ -98,25 +92,18 @@ def run_one(env_name, backbone, seed, args, device='cpu'):
         image=image, memory_length=args.memory_length,
     ).to(device)
 
-    # 3) GCBC train on expert buffer
     trainer = GCBCTrainer(
         policy, env_name, device=device, lr=args.lr, max_grad_norm=0.5)
     trainer.train(buf, args.gcbc_steps, batch_eps=args.batch_eps)
 
-    # 4) evaluate (direct rollout, no training)
     succ = trainer.evaluate(episodes=args.eval_episodes, seed=1000 + seed)
 
     elapsed = time.time() - t0
     result = {
-        'env': env_name,
-        'backbone': backbone,
-        'seed': seed,
-        'success_rate': succ,
-        'expert_success': expert_succ,
-        'n_episodes': len(buf.episodes),
-        'n_steps': buf.total_steps,
-        'elapsed_s': round(elapsed, 1),
-        'device': device,
+        'env': env_name, 'backbone': backbone, 'seed': seed,
+        'success_rate': succ, 'expert_success': expert_succ,
+        'n_episodes': len(buf.episodes), 'n_steps': buf.total_steps,
+        'elapsed_s': round(elapsed, 1), 'device': device,
     }
     print(f"  [done] {env_name}/{backbone}/seed{seed}: "
           f"succ={succ:.1f}% (expert={expert_succ:.1f}%) "
@@ -124,20 +111,54 @@ def run_one(env_name, backbone, seed, args, device='cpu'):
     return result
 
 
-def run_random_baseline(env_name, seed, args, device='cpu'):
-    """GCBC on RANDOM data (should fail / low — proves expert data matters)."""
-    buf = collect_random_buffer(
-        env_name, args.collect_episodes, seed=seed, num_envs=args.num_envs)
-    obs_dim, goal_dim, action_dim, image = get_dims(env_name)
-    policy = build_memory_policy(
-        'mlp', obs_dim, goal_dim, action_dim,
-        latent_dim=args.latent_dim, d_model=args.d_model, image=image,
-    ).to(device)
-    trainer = GCBCTrainer(policy, env_name, device=device, lr=args.lr)
-    trainer.train(buf, args.gcbc_steps, batch_eps=args.batch_eps)
-    succ = trainer.evaluate(episodes=args.eval_episodes, seed=1000 + seed)
-    return {'env': env_name, 'backbone': 'mlp-random', 'seed': seed,
-            'success_rate': succ, 'expert_success': 0.0}
+def run_wm_cem(env_name, buf, seed, args, device='cpu'):
+    """World-model + CEM baseline: same expert data -> learn dynamics -> plan.
+
+    Mirrors stable-wm: JEPA world model on expert buffer, then CEM zero-shot
+    planning. This is the 'model-based planning' baseline that GCBC policies
+    compete against — on the SAME data.
+    """
+    from worldmodel.wm import build_jepa_wm
+    from worldmodel.train import train_world_model
+    from worldmodel.solver import CEMSolver
+    from worldmodel.policy import WorldModelPolicy, PlanConfig
+
+    t0 = time.time()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    env = make_env(env_name)
+    obs_shape = env.observation_space.shape
+    action_dim = env.action_space.shape[0]
+    obs_key = 'pixels' if len(obs_shape) == 3 else 'state'
+
+    model = build_jepa_wm(
+        obs_key=obs_key, obs_shape=obs_shape, action_dim=action_dim,
+        latent_dim=args.wm_latent_dim, var_weight=1.0,
+        goal_shape=env.goal_space.shape,
+    )
+    train_world_model(
+        model, buf, horizon=args.wm_horizon, epochs=args.wm_epochs,
+        batch_size=64, device=device,
+        log_every=max(1, args.wm_epochs // 4), seed=seed)
+
+    model = model.to(device).eval()
+    solver = CEMSolver(
+        model=model, num_samples=args.cem_samples, n_steps=args.cem_steps,
+        topk=max(4, args.cem_samples // 8), device=device)
+    eval_world = World(lambda: make_env(env_name), num_envs=4)
+    eval_world.set_policy(WorldModelPolicy(solver=solver,
+                                           config=PlanConfig(horizon=args.wm_horizon)))
+    res = eval_world.evaluate(episodes=args.eval_episodes, seed=1000 + seed)
+    elapsed = time.time() - t0
+    print(f"  [cem-wm] {env_name}/seed{seed}: succ={res['success_rate']:.1f}% "
+          f"{elapsed:.0f}s", flush=True)
+    return {
+        'env': env_name, 'backbone': 'cem-wm', 'seed': seed,
+        'success_rate': res['success_rate'], 'expert_success': 0,
+        'n_episodes': len(buf.episodes), 'n_steps': buf.total_steps,
+        'elapsed_s': round(elapsed, 1), 'device': device,
+    }
 
 
 def build_report(results, args):
@@ -242,7 +263,14 @@ def main():
     ap.add_argument('--device', default='auto')
     ap.add_argument('--report', default='csv_data/offline_compare.md')
     ap.add_argument('--with-random-baseline', action='store_true',
-                    help='also run GCBC on random data (should fail → proves expert data matters)')
+                    help='also run GCBC on random data (should fail -> proves expert data matters)')
+    ap.add_argument('--with-wm-cem', action='store_true',
+                    help='also run world-model + CEM planning on same expert data')
+    ap.add_argument('--wm-horizon', type=int, default=5)
+    ap.add_argument('--wm-epochs', type=int, default=50)
+    ap.add_argument('--wm-latent-dim', type=int, default=64)
+    ap.add_argument('--cem-samples', type=int, default=128)
+    ap.add_argument('--cem-steps', type=int, default=8)
     ap.add_argument('--local', action='store_true', help='shrink for fast local check')
     args = ap.parse_args()
 
@@ -261,9 +289,20 @@ def main():
     results = []
     for env_name in args.envs:
         for seed in args.seeds:
+            # collect expert buffer ONCE, shared by all backbones + WM-CEM
+            try:
+                buf, expert_succ = collect_expert_buffer(
+                    env_name, args.collect_episodes, seed=seed,
+                    num_envs=args.num_envs, noise=args.expert_noise)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"  [FAIL] collect {env_name}/seed{seed}: {e}", flush=True)
+                continue
+
             for backbone in args.backbones:
                 try:
-                    r = run_one(env_name, backbone, seed, args, device=device)
+                    r = run_one(env_name, backbone, seed, buf, expert_succ, args, device=device)
                     results.append(r)
                 except Exception as e:
                     import traceback
@@ -271,12 +310,26 @@ def main():
                     print(f"  [FAIL] {env_name}/{backbone}/seed{seed}: {e}", flush=True)
                     results.append({
                         'env': env_name, 'backbone': backbone, 'seed': seed,
-                        'success_rate': -1.0, 'expert_success': -1.0,
-                        'n_episodes': 0, 'n_steps': 0, 'elapsed_s': 0,
+                        'success_rate': -1.0, 'expert_success': expert_succ,
+                        'n_episodes': len(buf.episodes), 'n_steps': buf.total_steps,
+                        'elapsed_s': 0,
                     })
+
+            if args.with_wm_cem:
+                try:
+                    r = run_wm_cem(env_name, buf, seed, args, device=device)
+                    results.append(r)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"  [FAIL] cem-wm {env_name}/seed{seed}: {e}", flush=True)
+
             if args.with_random_baseline:
                 try:
-                    r = run_random_baseline(env_name, seed, args, device=device)
+                    rbuf = collect_random_buffer(
+                        env_name, args.collect_episodes, seed=seed,
+                        num_envs=args.num_envs)
+                    r = run_one(env_name, 'mlp-random', seed, rbuf, 0.0, args, device=device)
                     results.append(r)
                 except Exception as e:
                     print(f"  [FAIL] random baseline {env_name}: {e}", flush=True)

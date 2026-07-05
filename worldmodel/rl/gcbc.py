@@ -52,15 +52,24 @@ class GCBCTrainer:
         self.opt = torch.optim.AdamW(policy.parameters(), lr=lr)
 
     def train(self, buffer, steps, batch_eps=4, max_seq_len=32, log_every=200):
+        """TBPTT training: forward entire episode (state carries full history),
+        backward every ``max_seq_len`` steps with gradient truncation.
+
+        This fixes the long-episode problem (e.g. mountaincar 121 steps): the
+        old code only learned the first ``max_seq_len`` steps, missing the
+        crucial swing-up phase at the end. Now state accumulates the full
+        episode context while gradients stay bounded.
+        """
         episodes = buffer.episodes
         obs_key = 'pixels' if 'pixels' in episodes[0] else 'state'
         losses = []
         for step in range(steps):
             batch = [episodes[i] for i in np.random.randint(0, len(episodes), batch_eps)]
-            T_full = min(len(ep['action']) for ep in batch)
-            T = min(T_full, max_seq_len)
+            T = min(len(ep['action']) for ep in batch)
             self.policy.init_state(batch_eps, self.device)
-            total_loss = torch.tensor(0.0, device=self.device)
+            self.opt.zero_grad()
+            total_loss_val = 0.0
+            chunk_loss = torch.tensor(0.0, device=self.device)
             for t in range(T):
                 obs = np.stack([b[obs_key][t] for b in batch])
                 goal = np.stack([b['goal'][t] for b in batch])
@@ -69,13 +78,17 @@ class GCBCTrainer:
                 a_true = torch.as_tensor(
                     np.stack([b['action'][t] for b in batch]),
                     dtype=torch.float32, device=self.device)
-                total_loss = total_loss - dist.log_prob(a_true).sum(-1).mean()
-            total_loss = total_loss / T
-            self.opt.zero_grad(set_to_none=True)
-            total_loss.backward()
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.opt.step()
-            losses.append(float(total_loss.item()))
+                loss = -dist.log_prob(a_true).sum(-1).mean() / T
+                chunk_loss = chunk_loss + loss
+                total_loss_val += float(loss.item())
+                if (t + 1) % max_seq_len == 0 or t == T - 1:
+                    chunk_loss.backward()
+                    nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    self.opt.step()
+                    self.opt.zero_grad()
+                    self.policy.detach_state()  # TBPTT: truncate grad, keep state
+                    chunk_loss = torch.tensor(0.0, device=self.device)
+            losses.append(total_loss_val)
             if step % log_every == 0 or step == steps - 1:
                 print(f"  [gcbc] step {step}/{steps} loss {np.mean(losses[-log_every:]):.4f}",
                       flush=True)

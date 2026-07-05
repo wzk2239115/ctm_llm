@@ -1,0 +1,7 @@
+env,backbone,seed,success_rate,expert_success,n_episodes,n_steps,elapsed_s
+mountaincar,flash,0,100.0,100.0,80,9931,168.5
+mountaincar,mlp,0,100.0,100.0,80,9931,82.5
+mountaincar,ctm,0,100.0,100.0,80,9931,131.2
+acrobot-partial,flash,0,80.0,100.0,80,8267,106.5
+acrobot-partial,mlp,0,0.0,100.0,80,8267,57.3
+acrobot-partial,ctm,0,100.0,100.0,80,8267,86.6
