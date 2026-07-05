@@ -82,6 +82,41 @@ def _make_external_env(name: str, **kwargs):
     return env
 
 
+class DenseReward:
+    """Wrap env: dense reward = -distance + success_bonus, so PPO gets a continuous
+    gradient signal toward the goal (fixes sparse-reward exploration failure on
+    hard tasks like manipulation/locomotion). All backbones get the same dense
+    reward, so the comparison stays fair."""
+
+    def __init__(self, env, success_bonus=10.0):
+        self.env = env
+        self.success_bonus = float(success_bonus)
+
+    @property
+    def observation_space(self):
+        return self.env.observation_space
+
+    @property
+    def action_space(self):
+        return self.env.action_space
+
+    @property
+    def goal_space(self):
+        return self.env.goal_space
+
+    def reset(self, seed=None, goal=None):
+        return self.env.reset(seed=seed, goal=goal)
+
+    def step(self, action):
+        obs, _, term, trunc, info = self.env.step(action)
+        dist = info.get('distance', info.get('angle_err', None))
+        if dist is None:
+            reward = float(term)
+        else:
+            reward = -float(dist) + (self.success_bonus if term else 0.0)
+        return obs, reward, term, trunc, info
+
+
 class DelayObs:
     """POMDP wrapper: the agent sees the observation from `delay` steps ago.
 
@@ -134,6 +169,11 @@ def make_env(name: str, **kwargs):
         return _make_external_env(name, **kwargs)
 
     key = name.lower().replace('_', '-')
+
+    # parse -dense suffix (dense reward shaping for hard exploration tasks)
+    dense = key.endswith('-dense')
+    if dense:
+        key = key[:-len('-dense')]
 
     # parse -delayN suffix
     import re

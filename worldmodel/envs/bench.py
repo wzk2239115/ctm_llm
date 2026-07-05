@@ -190,7 +190,7 @@ class CartPole:
             self.rng.uniform(-0.5, 0.5), 0.0,
             self.rng.uniform(-0.05, 0.05), 0.0
         ], dtype=np.float32)
-        self._goal_x = float(self.rng.uniform(-1.5, 1.5))
+        self._goal_x = float(self.rng.uniform(-0.5, 0.5))
         self._step = 0
         return self._obs()
 
