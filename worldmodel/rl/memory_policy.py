@@ -229,6 +229,8 @@ class GRUGate(nn.Module):
         self.value_proj = nn.Linear(d_input, d_model)
         nn.init.zeros_(self.gate_proj.weight)
         self.gate_proj.bias.data.fill_(-2.0)
+        nn.init.zeros_(self.value_proj.weight)   # candidate starts at 0 -> flash=shallow initially
+        nn.init.zeros_(self.value_proj.bias)
 
     def forward(self, deep, shallow, return_gate=False):
         z = torch.sigmoid(self.gate_proj(torch.cat([deep, shallow], dim=-1)))
