@@ -45,10 +45,19 @@ class MemoryBackbone(nn.Module):
         self._state = self.zero_state(batch, device)
 
     def detach_state(self):
-        self._state = tuple(s.detach() for s in self._state)
+        self._state = self._detach_nested(self._state)
 
     def snapshot(self):
-        return tuple(s.detach() for s in self._state)
+        return self._detach_nested(self._state)
+
+    @staticmethod
+    def _detach_nested(state):
+        """Recursively detach tensors in a possibly-nested state structure."""
+        if isinstance(state, torch.Tensor):
+            return state.detach()
+        if isinstance(state, (tuple, list)):
+            return tuple(MemoryBackbone._detach_nested(s) for s in state)
+        return state
 
     def mask_reset(self, done_mask):
         self._state = self.mask_state(self._state, done_mask)
