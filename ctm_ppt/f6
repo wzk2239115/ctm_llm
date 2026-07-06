@@ -1,0 +1,8 @@
+\[
+\mathbf{y}^{t}
+=
+\mathbf{W}_{\mathrm{out}}
+\cdot
+\mathbf{S}^{t}_{\mathrm{out}}
+\tag{6}
+\]

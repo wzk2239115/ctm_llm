@@ -1,0 +1,4 @@
+\[
+z_{d}^{t+1} = g_{\theta_d}\left(A_{d}^{t}\right)
+\tag{3}
+\]

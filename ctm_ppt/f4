@@ -1,0 +1,15 @@
+\[
+\mathbf{Z}^{t}
+=
+\left[
+\mathbf{z}^{1}
+\quad
+\mathbf{z}^{2}
+\quad
+\cdots
+\quad
+\mathbf{z}^{t}
+\right]
+\in \mathbb{R}^{D \times t}
+\tag{4}
+\]

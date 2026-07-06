@@ -1,0 +1,9 @@
+\[
+\mathbf{S}^{t}
+=
+\mathbf{Z}^{t}
+\cdot
+\left(\mathbf{Z}^{t}\right)^{\top}
+\in \mathbb{R}^{D \times D}
+\tag{5}
+\]

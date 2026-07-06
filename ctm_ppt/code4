@@ -1,0 +1,23 @@
+def ctm_loss(logits, targets):
+    B, C, T = logits.shape
+    # B=minibatch size, C=classes, T=thought steps
+    # Targets shape: [B]
+    # Compute certainties as 1 - normalised entropy
+    p = F.softmax(logits, 1)
+    log_p = torch.log_softmax(logits, 1)
+    entropy = -torch.sum(p * log_p, dim=1)
+    max_entropy = torch.log(C)
+    certainties = 1 - (entropy / max_entropy)
+    # Certainties shape: [B, T]
+    # Expand targets over thought steps
+    targets_exp = torch.repeat_interleave(targets.unsqueeze(-1), T, -1)
+    # Loss function could be other things, but we use cross entropy without reduction
+    loss_fn = nn.CrossEntropyLoss(reduction='none')
+    # Losses are of shape [B, T]
+    losses = loss_fn(predictions, targets_exp)
+    # Get indices of lowest loss thought steps for each item in the minibatch
+    lowest_idx = losses.argmin(-1)
+    # Get indices of most certain steps for each item in the minibatch
+    certain_idx = certainties.argmax(-1)
+    loss = (losses[:, lowest_idx] + losses[:, certain_idx])/2
+    return loss.mean()

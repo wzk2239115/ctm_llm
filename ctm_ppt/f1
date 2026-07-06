@@ -1,0 +1,6 @@
+\[
+\mathbf{a}^{t} = f_{\theta_{\mathrm{syn}}}
+\left(\operatorname{concat}\left(\mathbf{z}^{t}, \mathbf{o}^{t}\right)\right)
+\in \mathbb{R}^{D}
+\tag{1}
+\]

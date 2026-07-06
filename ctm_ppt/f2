@@ -1,0 +1,15 @@
+\[
+\mathbf{A}^{t}
+=
+\left[
+\mathbf{a}^{t-M+1}
+\quad
+\mathbf{a}^{t-M+2}
+\quad
+\cdots
+\quad
+\mathbf{a}^{t}
+\right]
+\in \mathbb{R}^{D \times M}
+\tag{2}
+\]

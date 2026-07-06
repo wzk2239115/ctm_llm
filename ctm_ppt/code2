@@ -1,0 +1,12 @@
+# Initialisations
+weights_1 = Parameter(shape=(M, d_hidden, d_model))
+bias_1 = zeros(shape=(1, d_hidden, d_model))
+weights_2 = Parameter(shape(d_hidden, d_model))
+bias_2 = zeros(shape=(1, d_model))
+# Forward pass
+# b=batch, M=memory, d=d_model  h=d_hidden
+
+# inputs are shape (b, d, M)
+inputs = pre_acts_history[-M:]
+out = einsum('bdM,Mhd->bdh', inputs, weights_1) + bias_1
+out = einsum('bdh,hd->bd', out, weights_2) + bias_2

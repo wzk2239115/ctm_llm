@@ -1,0 +1,10 @@
+\[
+\mathbf{o}^{t}
+=
+\operatorname{Attention}
+\left(
+Q=\mathbf{q}^{t},
+KV=\operatorname{FeatureExtractor}(\mathrm{data})
+\right)
+\tag{8}
+\]

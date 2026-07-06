@@ -1,0 +1,15 @@
+\[
+\mathbf{R}^{t}_{ij}
+=
+\left[
+\exp\left(-r_{ij}(t-1)\right)
+\quad
+\exp\left(-r_{ij}(t-2)\right)
+\quad
+\cdots
+\quad
+\exp(0)
+\right]^{\top}
+\in \mathbb{R}^{t}
+\tag{9}
+\]

@@ -1,0 +1,47 @@
+############### DEFINITIONS (hyper parameters not shown for simplicity) ###############
+# Backbone can be, e.g., a ResNet for images
+backbone = FeatureEncoder()
+# Q and KV projectors, and standard attention module
+q_projector, kv_projector = Linear(), Linear()
+attn = MultiHeadAttention()
+# Synapse model can be linear or MLP or U-NET
+synapses = MLP()
+# Neuron level models (see Listing 2)
+neuron_level_models = NLMs()
+# Output projector from synchronisation (see Listing 3)
+output_proj = Linear()
+# Initialise pre-activations and z as learnable parameters
+# D is the model width
+z_init = Parameter(size=(D))
+# M is the neuron memory length
+pre_acts_history_init = Parameter(size=(D, M))
+
+################################ MODEL LOGIC ################################
+# Featurise inputs with backbone and compute KV tokens
+kv = kv_projector(backbone(inputs))
+# In each minibatch, initialise the learnable pre_act_history
+pre_acts_history = pre_acts_history_init.unsqueeze(0).repeat(B, dim=0)  # (B, D, M)
+# And start the post acts history with the learnable z_init
+post_acts_history = [z_init.unsqueeze(0).repeat(B, dim=0)]
+outputs_history = []
+# Get initial action synchronisation to query data
+synch_a = compute_synch(post_acts_history, type="action")
+# Other initialisations, including learnable start histories and first pre-attn round
+for step in range(n_thought_steps):
+    # Project attention query off synchronisation
+    q = q_projector(synch_a)
+    attn_out = attn(q, kv, kv)
+    # Concatenate attention output and process via synapses
+    pre_acts = synapses(concat((attn_out, z)))
+    # Keep history of pre-activations. This is a FIFO structure:
+    pre_acts_history = concat((pre_acts_history[:, :, :-1], pre_acts), dim=-1)
+    # Compute post-activations using histories (see Listing 2)
+    z = neuron_level_models(pre_acts_history)
+    post_acts_history.append(z)
+    # Compute synchronisations (see Listing 3)
+    synch_a = compute_synch(post_acts_history, type="action")
+    synch_o = compute_synch(post_acts_history, type="output")
+    # Projecte prediction/output off synchronisation
+    outputs_history.append(output_proj(synch_o))
+# Return outputs per thought step for loss function
+return outputs_history

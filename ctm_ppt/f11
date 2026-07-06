@@ -1,0 +1,10 @@
+\[
+\mathcal{L}^{t}
+=
+\operatorname{CrossEntropy}
+\left(
+\mathbf{y}^{t},
+y_{\mathrm{true}}
+\right)
+\tag{11}
+\]
