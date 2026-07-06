@@ -39,9 +39,9 @@ TOTAL_PROCS=$((N_GPU * PROCS_PER_GPU))
 
 # 自动调高 PROCS_PER_GPU 如果进程数 > env 数 (每进程至少 1 个 env)
 if [ "$TOTAL_PROCS" -gt "$N_ENV" ]; then
-    PROCS_PER_GPU=$(( (N_ENV + N_GPU - 1) / N_GPU ))
-    TOTAL_PROCS=$((N_GPU * PROCS_PER_GPU))
-    echo "[cluster] WARNING: too many procs, reduced to PROCS_PER_GPU=$PROCS_PER_GPU"
+    TOTAL_PROCS=$N_ENV
+    PROCS_PER_GPU=$(( (TOTAL_PROCS + N_GPU - 1) / N_GPU ))
+    echo "[cluster] capped to TOTAL_PROCS=$TOTAL_PROCS (PROCS_PER_GPU=$PROCS_PER_GPU)"
 fi
 
 echo "[cluster] $N_GPU GPUs x $PROCS_PER_GPU procs = $TOTAL_PROCS workers"
