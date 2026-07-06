@@ -7,6 +7,29 @@
 
 ---
 
+## 2026-07-06 — 论文三块(JEPA / Draft-Revise / Sparsity)重复实验
+
+- **思路(用户提供)**: work_ideas.md 前三块(Cross-Tick JEPA、Draft-Revise、Sparsity)定稿, 要作为一篇论文发布, 需要把这三方面的实验**重新跑一遍**(重复实验), 新建专门文件夹保存结果。
+- **范围**: 仅核心 headline 配置(非完整 deep sweep), **全部 5 seed**(比原来 main=5/sweep=3 更统一), 加 **5-seed baselines** 保证 delta 是 paired mc-vs-mc / final-vs-final(不用过时常量)。
+- **配置** (`paper_repro/run_repro.py`, 复用 `paper/exp_runner.py` 的 builder + `run_all`):
+  - **baseline**: cifar10/mazes/parity/qamnist/sort 各 5 seed = 25 runs(st00 paper config, 无 idea; 同时充当 sparsity r=1.0 稠密参考)
+  - **jepa**: cifar10 w=0.1(final +7.5pp) + mazes w=0.1(中性) + qamnist w=0.5(final +17pp) = 15 runs
+  - **revise**: parity w=0.1/cp=0.15(mc +10pp headline) + cifar10 w=0.2/cp=0.3(final +9.9pp) + mazes w=0.1/cp=0.15(中性) = 15 runs
+  - **sparsity**: mazes r∈{0.1,0.25,0.5,0.75}(Pareto, r=1.0=baseline) + sort r=0.5(任务坑 -12pp) = 25 runs
+  - **合计 80 runs**。log 写 `paper_repro/logs/<group>/<exp>/`(两级目录, 供 `extract_ctm_paper_results.py` 直读)。
+- **预期**: 复现三大 claim —— (1) JEPA 抬 cifar10/qamnist final-tick, 不抬 mc 天花板; (2) revise 抬 parity mc(+10pp); (3) sparsity mazes r=0.1 省 90% NLM 算力仅 -0.9pp(Pareto 甜点), sort r=0.5 大掉点。
+- **算力机跑法**:
+  ```bash
+  export http_proxy="http://public-proxy.qihoo.net:3128"; export https_proxy="http://public-proxy.qihoo.net:3128"
+  nohup python paper_repro/run_repro.py --gpus 8 > paper_repro/logs/run.log 2>&1 &
+  # smoke 先过: python paper_repro/run_repro.py --seeds 1 --only jepa
+  ```
+- **收菜**: `python scripts/extract_ctm_paper_results.py --logs paper_repro/logs --csv paper_repro/csv_data/repro_summary.csv --md paper_repro/csv_data/repro_summary.md --curves`(同时出 mc 与 final-tick acc)。
+- **结果**: 待算力机跑完回填。
+- **下一步**: 跑完用 `paper/analyze_deep.py` 改读 `paper_repro/csv_data/repro_summary.csv` 出论文图(配对 delta + Pareto)。
+
+---
+
 ## 2026-07-05 — GCBC 离线范式 (对齐 stable-wm) + ExpertPolicy
 
 - **思路(用户提供)**: 之前用 PPO-from-scratch + random-BC 收集训练 policy, 数据和 world-model 不一致(不公平) + random action 是噪声(BC 学随机行为=毒, pendulum-partial ctm 从 75→27.8)。用户指出: 应该参考 stable-wm——expert/oracle 数据收集一次, world-model 和 policy baseline **共享同一批数据**。学完 stable-wm + lewm 确认: 数据是 **expert 预收集**(非 random), 所有方法(world-model GCBC/GCIQL)读同一份。
