@@ -7,6 +7,67 @@
 
 ---
 
+## 2026-07-07 — 大规模 GCBC offline 对比 (9 envs × 8 backbones × 5 seeds)
+
+- **思路(用户提供)**: 2026-07-05 GCBC 离线范式定稿后, 在算力机做**全量对比**: 扩到 9 个 env (point-state / tworoom-state / reacher-partial / mountaincar / mountaincar-partial / pendulum / pendulum-partial / cartpole / cartpole-partial), 8 backbone (mlp/ctm/lstm/gru/transformer/flash/flash-shallow/flash-deep) + cem-wm baseline, 5 seeds. 目的: (1) 验证 0705 的 CTM-POMDP 优势在更大样本下是否稳定; (2) 把 transformer/gru 加进来补全 backbone 谱; (3) 看 cem-wm (model-based) vs 学习型 (model-free GCBC) 的相对位置.
+- **配置**: `PROCS_PER_GPU=2 bash paper/run_offline_compare_cluster.sh` (8 × H100, 16 procs capped to 12 env-shards). `GCBC_STEPS=2000, COLLECT_EPS=200, EVAL_EPS=24, SEEDS="0 1 2 3 4"`. 输出 `csv_data/offline_compare_full_0707.csv`.
+- **预期**: recurrent backbone (lstm/gru/ctm) 在 `*-partial` 上稳定优于 mlp; cem-wm 因用同一 expert data + 模型预测, 应介于 expert 和 BC 之间.
+- **数据 bug + 修复**: `run_offline_compare_cluster.sh` 的 merge 步骤用 `glob('offline_compare_proc*.csv')` 收集, **不清理上次残留**. 跑了两遍 (一遍 5 seeds, 一遍 3 seeds) 后, 第二遍部分 proc 失败没覆写, 导致 (env, backbone, seed=0/1/2) 在 6 个 env 上重复出现, 共 **162/562 行重复 (28.8%)**, 会把 seed 0-2 双倍加权.
+  - 修复 1 (数据): `scripts/dedupe_offline_compare.py` 按 `(env,backbone,seed)` 去重, deterministic 字段冲突时报警不静默丢. 跑完 → **562 → 400 rows, 零冲突**, 还原出完整 9 envs × 5 seeds 网格.
+  - 修复 2 (脚本): `run_offline_compare_cluster.sh:52` 加 `rm -f "$OUT_DIR"/offline_compare_proc*.{csv,md}` 防再污染.
+- **结果** (mean success_rate%, 5 seeds; cem-wm 的 expert_success=0 字段异常见结论 4):
+  | env | mlp | ctm | lstm | gru | tf | flash | flash-s | flash-d | cem-wm |
+  |---|---|---|---|---|---|---|---|---|---|
+  | point-state | 100 | 100 | 100 | 100 | 100 | 100 | 100 | 100 | — |
+  | tworoom-state | 41 | 70 | 72 | 76 | 65 | 61 | 55 | 60 | 58 |
+  | reacher-partial | 53 | 61 | 60 | 64 | 57 | 63 | 67 | 67 | **76** |
+  | mountaincar | 100 | 80 | 100 | 100 | 100 | 100 | 99 | 58 | 0 |
+  | mountaincar-partial | **0** | 57 | 100 | 99 | 98 | 100 | 94 | 80 | 0 |
+  | pendulum | 49 | 54 | 52 | 51 | 48 | 58 | 48 | 56 | 59 |
+  | pendulum-partial | **9** | 49 | 52 | 48 | 46 | 49 | 48 | 50 | 10 |
+  | cartpole | 39 | 39 | 39 | 39 | 39 | 39 | 39 | 39 | **70** |
+  | cartpole-partial | 42 | 40 | 39 | 39 | 44 | 41 | 39 | 41 | 39 |
+- **结论**:
+  1. **point-state 饱和** (全 100%) — 无区分度, 后续对比应剔除.
+  2. **POMDP 是 CTM/recurrent 的真实 win**: mlp 在 partial-obs 上系统性崩溃 (mountaincar-partial 全 0%, pendulum-partial 9%), 而 lstm/gru/ctm 显著更好 (50-100%). 印证 0705 的 CTM-POMDP 优势, 且在更大 backbone 谱 (含 gru/transformer) 下仍成立. **ctm 在 pendulum-partial 上 49% vs mlp 9% = +40pp**.
+  3. **cartpole 天花板 (最重要 anomaly)**: 8 个学习型 backbone **全部**卡在 37.5% (seed 0-2) / 41.67% (seed 3-4), 而 cem-wm 拿 66-87%. `expert_success=50` 说明 expert 本身只有 50% 上限, BC 学不上去而 CEM 能 — **这是离线 IL 的瓶颈, 不是 backbone 问题**. 需排查 expert 质量 / DAgger / 增大 GCBC_STEPS.
+  4. **cem-wm anomaly**: `expert_success=0` (其他学习型 = 50/75/100) 但在 cartpole (70 vs 全 39) 和 reacher-partial (76 vs ≤67) **大幅反超所有 BC**; pendulum 上持平 (59 vs flash 58); cartpole-partial 不赢 (39 vs BC 39-44). 两种解释: (a) 这些 env 动力学简单, CEM 随机搜索 latent 不需要好 policy prior 就能解; (b) expert_success 字段在 cem-wm 路径上有 bug. 需看 `paper/run_offline_compare.py` 的 cem-wm cost 定义和 expert_success 赋值.
+  5. **ctm/flash-deep 不稳定**: ctm 在 mountaincar seed 0 = 0% (其他 seed 100%), flash-deep 在 mountaincar seed 1/2 = 0%. 是 seed-sensitivity 还是真 catastrophic forgetting, 需多 seed 复跑确认.
+  6. **Backbone 整体排名**: `lstm ≈ gru > ctm ≈ flash-shallow > flash > transformer > flash-deep > mlp`. lstm/gru 最稳; transformer 在 pendulum 上意外差 (小数据过拟合?).
+- **下一步**:
+  - 排查 cartpole 天花板 (expert 数据 + BC loop, 考虑加 DAgger 或加 GCBC_STEPS 到 5000+)
+  - 排查 cem-wm 的 `expert_success=0` anomaly
+  - 出 per-env backbone 对比图 (误差棒 + paired delta vs lstm/gru baseline)
+  - ctm 在 mountaincar seed 0 的 catastrophic failure 复跑确认
+
+---
+
+## 2026-07-07 — CTM Scaling Law (cells × ticks 双轴算力曲线)
+
+- **思路(用户提供)**: 之前四块 idea (JEPA/revise/sparsity/gate-JEPA) 太离散, 想找一个核心抓手把论文凝聚起来. 方向是**从"算力成本"角度切入**, 围绕 CTM 的两个核心参数 —— **细胞数 (d_model / NLM)** 和 **内部时钟数 (iterations / thought ticks)** —— 画出整个 scale-up 曲线. 用户直觉: 增大这两个参数应该需要更多训练轮; 想知道这个关系是**线性还是指数**. 这能把四个 idea 串成"在 CTM 双轴算力曲线上的优化手段" (sparsity=cells 轴 Pareto, halt=ticks 轴 Pareto, JEPA=cells 质量, revise=ticks 质量), 论文叙事就凝聚了.
+- **已有数据 (prior)**: `csv_data/ctm_paper_curves.json` 里 **st01 (d_model sweep) 174 run + st02 (tick sweep) 82 run**, 都有完整训练曲线 (每 1-2k 步一点). 这些是**单 seed + 固定训练步数 (cifar10/parity 200k, mazes 100k)** 的 paper-config sweep, 不是为 scaling law 设计的; 但已能出 prototype. 关键发现 (反直觉): **d_model 翻倍, steps-to-target 几乎不变** (mazes 2048→4096: 54229→54746 步; sort 512→1024: 73891→67088 步) —— 暗示 cells 轴的 sample-complexity scaling 接近"免费", 与 Transformer scaling laws 不同.
+- **配置** (`paper_scaling/run_scaling.py`, 复用 `paper/exp_runner.py` 的 `Experiment`/`run_all`):
+  - **cells 轴** (d_model sweep @ fixed iterations): cifar10 [64,128,256,512] @tick50 | parity [256,512,1024,2048] @tick75 | mazes [512,1024,2048,4096] @tick75. 共 3×4×3=36 runs.
+  - **ticks 轴** (iterations sweep @ fixed d_model): cifar10 [2,5,10,25,50] @d256 | parity [5,10,25,50,75] @d1024 | mazes [5,10,25,50,75] @d2048. 共 3×5×3=45 runs.
+  - **控制变量**: 每 task **固定 batch_size** (cifar10=512, parity=64, mazes=64) 和 **固定 LR** (1e-4), 继承 paper baseline —— 只变 architectural scale, 隔离 sample-efficiency. (muP-style LR scaling 明确 out of scope, 写 limitations.)
+  - **训练延长**: cifar10/parity 300k (st01 是 200k), mazes 200k (st01 是 100k), 保证大模型真收敛. `track_every=1000` (曲线分辨率高, steps-to-target 插值精确), `save_every=10000` (省盘).
+  - **3 seeds** [0,1,2]. **总计 81 runs**.
+  - **排除 sort** (tick<50 全崩, 参数 inert) **和 qamnist** (数据缺).
+- **预期**: 
+  1. **cells 轴 exponent b ≈ 0** (免费, prior 暗示) —— 若成立, 是论文 headline: "wider CTM is sample-efficient, unlike Transformers".
+  2. **ticks 轴 b > 0** (有成本, 可能线性甚至超线性) —— 梯度穿过更多 tick, 优化变难; st02 parity tick50 比 tick25 方差大已现端倪.
+  3. 两轴差异 → "think longer is costlier than think wider" 这个张力是论文核心.
+- **结果**: 待算力机跑完回填.
+- **结论**: 待分析.
+- **下一步**: 
+  1. 算力机 smoke (`--seeds 1 --only cells --dry-run` → `--seeds 1 --only cells`) 必过, 再 `nohup python paper_scaling/run_scaling.py --gpus 8 &` 全量.
+  2. 收菜: `python scripts/extract_ctm_paper_results.py --logs paper_scaling/logs --csv paper_scaling/csv_data/scaling_summary.csv --md paper_scaling/csv_data/scaling_summary.md --curves`.
+  3. 分析: `python paper_scaling/run_scaling.py analyze` → 出 `paper_scaling/figures/{cells,ticks}_scaling.png` (log-log + power-law 拟合, 报 b / R²).
+  4. 根据 b 值判断: 若 cells b≈0, 论文主叙事成立; 若 ticks b 显著 >0, "双轴不对称"成立. 若两者都 b≈0 或都 b≈1, 需重新定位叙事.
+  5. **诚实风险**: fixed LR 是 confound (大 d_model 可能只是 LR 不对), 论文需补至少一个点的 LR 调研; steps-to-target vs FLOPs-to-target 需换算 (per-step FLOPs 随 scale 变).
+
+---
+
 ## 2026-07-06 — 论文三块(JEPA / Draft-Revise / Sparsity)重复实验
 
 - **思路(用户提供)**: work_ideas.md 前三块(Cross-Tick JEPA、Draft-Revise、Sparsity)定稿, 要作为一篇论文发布, 需要把这三方面的实验**重新跑一遍**(重复实验), 新建专门文件夹保存结果。
