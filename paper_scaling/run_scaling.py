@@ -192,6 +192,93 @@ def _fit_power_law(xs, ys):
     return float(np.exp(a)), float(b), float(r2)
 
 
+# Approximate forward FLOPs for common backbones (per sample, FLOPs = 2*MACs).
+# Standard resnet refs; "-N" is a width multiplier variant used in CTM configs.
+# These are constants — the backbone runs ONCE per forward (perception), so it
+# is the same for every (d_model, iterations) at a given task.
+BACKBONE_FLOPS = {
+    "resnet18-1": 1.12e9,
+    "resnet18-2": 2.24e9,
+    "resnet34-1": 2.4e9,
+    "resnet34-2": 4.8e9,
+    "parity_backbone": 1e8,
+}
+
+
+def _estimate_flops_per_step(config):
+    """Approximate FLOPs (not MACs) per training step: forward + backward ~ 3x forward.
+
+    CTM anatomy (per sample, per layer):
+      - backbone (resnet/parity): runs ONCE (perception), NOT per tick
+      - per tick: synapse (dominant on the cells axis, ~ d_model^2)
+                  + NLM (~ d_model * mem * mem_hidden)
+                  + q_proj + output_proj
+    Dominant-term model: precise enough for relative scaling (power-law slope b),
+    not for absolute FLOP counts. Backbone constants are approximate; CTM-internal
+    is computed from config shapes (SuperLinear / SynapseUNET / Linear).
+
+    Why this matters: on the cells axis, d_model x2 -> per-step FLOPs ~ x4 (synapse
+    is quadratic). So "steps-to-target ~ constant" does NOT mean "free" — the model
+    just does 4x more work per step. FLOPs-to-target = steps * per-step-FLOPs is the
+    fair cost metric. On the ticks axis, iterations x2 -> per-step FLOPs ~ x2 (each
+    tick is one pass), so steps and FLOPs scale roughly together.
+    """
+    d_model = config["d_model"]
+    d_input = config.get("d_input", 64)
+    iterations = config["iterations"]
+    synapse_depth = config.get("synapse_depth", 1)
+    memory_length = config.get("memory_length", 10)
+    memory_hidden_dims = config.get("memory_hidden_dims", 4)
+    batch_size = config["batch_size"]
+    self_cond = config.get("self_cond", True)
+    n_synch_out = config.get("n_synch_out", 256)
+    n_synch_action = config.get("n_synch_action", 512)
+    hidden_size = config.get("hidden_size", 768)
+    deep_nlms = config.get("deep_nlms", True)
+    nst = config.get("neuron_select_type", "random-pairing")
+
+    # Synchronisation pair counts (mirrors model._calc_sizes)
+    if nst == "random-pairing":
+        synch_action = n_synch_action
+        synch_out = n_synch_out
+    else:  # random / first-last -> n*(n+1)/2 pairs
+        synch_action = n_synch_action * (n_synch_action + 1) // 2
+        synch_out = n_synch_out * (n_synch_out + 1) // 2
+
+    backbone = BACKBONE_FLOPS.get(config.get("backbone_type", "resnet18-1"), 1e9)
+
+    # Per-tick CTM-internal (per sample)
+    synapse_in = d_input + d_model + (d_model if self_cond else 0)
+    if synapse_depth == 1:
+        synapse = synapse_in * (2 * d_model) * 2          # Linear(in, 2d) + GLU
+    else:
+        synapse = synapse_in * d_model * synapse_depth * 2 * 2  # SynapseUNET down+up
+
+    if deep_nlms:
+        nlm = (d_model * memory_length * (2 * memory_hidden_dims) * 2
+               + d_model * memory_hidden_dims * 2 * 2)
+    else:
+        nlm = d_model * memory_length * 2 * 2
+
+    # q_proj (sync_action -> d_input); attention itself is small for T=1 CTM inputs;
+    # output_proj (sync_out -> hidden_size)
+    q_proj = synch_action * d_input * 2
+    output_proj = synch_out * hidden_size * 2
+
+    per_tick = synapse + nlm + q_proj + output_proj
+    forward_per_sample = backbone + iterations * per_tick
+    return batch_size * forward_per_sample * 3.0  # forward + backward ~= 3x
+
+
+def _config_for_meta(task, meta):
+    """Reconstruct full config from curves meta + task BASE (for FLOPs estimate)."""
+    _, base = BASE_CONFIGS[task]
+    cfg = dict(base)
+    cfg["d_model"] = meta.get("d_model", base["d_model"])
+    cfg["batch_size"] = meta.get("batch_size", base["batch_size"])
+    return cfg
+
+
 def analyze():
     """Read collected curves, compute steps-to-target, fit power law, plot."""
     import json
@@ -216,9 +303,11 @@ def analyze():
     curves = json.load(open(curve_files[-1]))
     print(f"  {len(curves)} runs loaded")
 
-    # Bucket runs by (axis, task, scale_value) -> list[steps_to_target per seed]
-    # axis = "cells" | "ticks"; scale_value = d_model or iterations
-    bucket = {}  # (axis, task, scale, target) -> [steps, ...]
+    # Bucket runs by (axis, task, scale, target) -> [steps_to_target per seed].
+    # Also cache per-step FLOPs per (axis, task, scale): config-driven, identical
+    # across seeds at the same scale, so computed once.
+    bucket = {}
+    flops_per_step = {}
     for key, v in curves.items():
         meta = v.get("meta", {})
         task = meta.get("task")
@@ -226,13 +315,11 @@ def analyze():
             continue
         d_model = meta.get("d_model")
         ticks = meta.get("iterations") or meta.get("n_ticks")
-        # identify axis by exp name
         is_cells = "_cells_d" in key
         is_ticks = "_ticks_t" in key
         if is_cells:
             axis, scale = "cells", d_model
         elif is_ticks:
-            # iterations may not be in meta; parse from name
             import re
             m = re.search(r"_ticks_t(\d+)_", key)
             axis, scale = "ticks", int(m.group(1)) if m else ticks
@@ -240,62 +327,83 @@ def analyze():
             continue
         if scale is None:
             continue
+        ck = (axis, task, int(scale))
+        if ck not in flops_per_step:
+            cfg = _config_for_meta(task, meta)
+            if axis == "ticks":
+                cfg["iterations"] = scale
+            flops_per_step[ck] = _estimate_flops_per_step(cfg)
         iters, accs = v.get("iters", []), v.get("test_acc", [])
         for tgt in TARGETS[task]:
             s = _steps_to_target(iters, accs, tgt)
             if s is not None:
                 bucket.setdefault((axis, task, int(scale), tgt), []).append(s)
 
-    # Report + plot per axis
-    TASK_COLORS = {"cifar10": "#1f77b4", "parity": "#2ca02c", "mazes": "#ff7f0e"}
+    # Plot per axis: row 0 = steps-to-target, row 1 = FLOPs-to-target.
+    # FLOPs-to-target = mean(steps) * per-step-FLOPs; error bar scales the same way.
     for axis in ("cells", "ticks"):
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharey=False)
-        print(f"\n{'='*72}\n  {axis.upper()} axis: steps-to-target vs scale\n{'='*72}")
-        for col, task in enumerate(["cifar10", "parity", "mazes"]):
-            ax = axes[col]
-            scales = sorted({k[2] for k in bucket if k[0] == axis and k[1] == task})
-            for tgt in TARGETS[task]:
-                xs, ys, es = [], [], []
-                for sc in scales:
-                    arr = bucket.get((axis, task, sc, tgt), [])
-                    if arr:
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8.5), sharey="row")
+        xname = {"cells": "d_model (cells)", "ticks": "iterations (ticks)"}[axis]
+        for metric, row in (("steps", 0), ("flops", 1)):
+            ylabel = {"steps": "steps to target",
+                      "flops": "FLOPs to target"}[metric]
+            print(f"\n{'='*72}\n  {axis.upper()} axis / {metric}: {ylabel} vs {axis}\n{'='*72}")
+            for col, task in enumerate(["cifar10", "parity", "mazes"]):
+                ax = axes[row][col]
+                scales = sorted({k[2] for k in bucket
+                                 if k[0] == axis and k[1] == task})
+                for tgt in TARGETS[task]:
+                    xs, ys, es = [], [], []
+                    for sc in scales:
+                        arr = bucket.get((axis, task, sc, tgt), [])
+                        if not arr:
+                            continue
+                        fps = flops_per_step.get((axis, task, sc), 0.0)
+                        m_val = float(np.mean(arr))
+                        if metric == "flops":
+                            m_val *= fps
                         xs.append(sc)
-                        ys.append(float(np.mean(arr)))
-                        es.append(float(np.std(arr)))
-                if not xs:
-                    continue
-                xs, ys, es = map(np.array, (xs, ys, es))
-                ax.errorbar(xs, ys, yerr=es, fmt="o-", capsize=4,
-                            label=f"target={tgt} (n={len([s for s in xs])})")
-                fit = _fit_power_law(xs, ys)
-                if fit and len(xs) >= 3:
-                    a, b, r2 = fit
-                    xfit = np.logspace(np.log10(xs.min() * 0.9), np.log10(xs.max() * 1.1), 50)
-                    ax.plot(xfit, a * xfit ** b, "--", alpha=0.5,
-                            label=f"fit: y={a:.1f}*x^{b:.2f} (R2={r2:.2f})")
-                    print(f"  {task:8s} tgt={tgt:.2f}  b={b:+.3f}  R2={r2:.3f}  "
-                          f"({len(xs)} pts, scales={xs.tolist()})")
-                else:
-                    print(f"  {task:8s} tgt={tgt:.2f}  (insufficient pts for fit, "
-                          f"{len(xs)} pts)")
-            ax.set_xscale("log")
-            ax.set_yscale("log")
-            ax.set_xlabel({"cells": "d_model (cells)", "ticks": "iterations (ticks)"}[axis])
-            ax.set_ylabel("steps to target")
-            ax.set_title(task)
-            ax.legend(fontsize=7)
-            ax.grid(True, which="both", alpha=0.3)
-        fig.suptitle(f"CTM {axis} scaling law — steps-to-target vs {axis}", fontsize=13)
+                        ys.append(m_val)
+                        s_val = float(np.std(arr)) * (fps if metric == "flops" else 1.0)
+                        es.append(s_val)
+                    if not xs:
+                        continue
+                    xs, ys, es = map(np.array, (xs, ys, es))
+                    ax.errorbar(xs, ys, yerr=es, fmt="o-", capsize=4,
+                                label=f"target={tgt} (n={len(xs)})")
+                    fit = _fit_power_law(xs, ys)
+                    if fit and len(xs) >= 3:
+                        a, b, r2 = fit
+                        xfit = np.logspace(np.log10(xs.min() * 0.9),
+                                           np.log10(xs.max() * 1.1), 50)
+                        ax.plot(xfit, a * xfit ** b, "--", alpha=0.5,
+                                label=f"fit y={a:.1g}*x^{b:.2f} (R2={r2:.2f})")
+                        print(f"  {task:8s} tgt={tgt:.2f}  b={b:+.3f}  R2={r2:.3f}  "
+                              f"({len(xs)} pts)")
+                    else:
+                        print(f"  {task:8s} tgt={tgt:.2f}  (insufficient pts for fit, "
+                              f"{len(xs)} pts)")
+                ax.set_xscale("log")
+                ax.set_yscale("log")
+                ax.set_xlabel(xname)
+                ax.set_ylabel(ylabel)
+                if row == 0:
+                    ax.set_title(task)
+                ax.legend(fontsize=7)
+                ax.grid(True, which="both", alpha=0.3)
+        fig.suptitle(
+            f"CTM {axis} scaling law — steps (top) & FLOPs (bottom) vs {axis}",
+            fontsize=13)
         fig.tight_layout()
         out = FIG_ROOT / f"{axis}_scaling.png"
         fig.savefig(out, dpi=130)
         print(f"  -> {out}")
 
-    print("\nInterpretation:")
-    print("  b ~ 0    : scaling is FREE (more capacity/thinking costs no extra steps)")
-    print("  b ~ 1    : LINEAR (each 2x scale needs 2x more steps)")
-    print("  b > 1    : SUPER-LINEAR (worse than linear)")
-    print("  b < 0    : LARGER is FASTER to converge (per-capita sample efficiency up)")
+    print("\nInterpretation (b = power-law exponent of [steps|FLOPs] vs scale):")
+    print("  STEPS axis:  b~0 free sample-efficiency | b~1 linear | b>1 super-linear")
+    print("  FLOPs axis:  compares TOTAL compute; on cells axis, per-step FLOPs ~ d_model^2")
+    print("               so a 'free' steps-fit (b~0) becomes b~2 in FLOPs -> NOT free.")
+    print("               The fair headline is the FLOPs row.")
     return 0
 
 
