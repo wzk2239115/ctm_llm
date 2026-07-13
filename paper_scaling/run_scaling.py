@@ -525,6 +525,9 @@ def main():
             exps = GROUPS[g](seeds)
             if args.resume:
                 _, exps = _split_done_todo(exps, LOG_ROOT / g)
+            if not exps:
+                print(f"\n--- {g}: nothing to run (all done) ---")
+                continue
             print(f"\n--- {g} ({len(exps)} runs to run) ---")
             run_all(exps, gpus=args.gpus, log_root=str(LOG_ROOT / g),
                     dry_run=True, mem_util=args.mem_util)
