@@ -158,6 +158,43 @@ GROUPS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# RESUME (skip experiments that already reached final_iter)
+# ─────────────────────────────────────────────────────────────────────────
+def _is_done(exp, log_root):
+    """True if exp already reached final_iter (has a near-final checkpoint).
+
+    Uses the highest checkpoint_*.pt iter vs training_iterations. Some tasks
+    also save a plain checkpoint.pt as final — accept that too, but verify
+    against the log so a mid-training checkpoint.pt isn't misread.
+    """
+    import re
+    import glob
+    edir = Path(log_root) / exp.name
+    final = int(exp.config.get("training_iterations", 0))
+    if final <= 0:
+        return False
+    cks = glob.glob(str(edir / "checkpoint_*.pt"))
+    if cks:
+        iters = [int(m.group(1)) for c in cks
+                 if (m := re.search(r"checkpoint_(\d+)\.pt", c))]
+        if iters and max(iters) >= final * 0.99:
+            return True
+    if (edir / "checkpoint.pt").exists():
+        log = edir / "train.log"
+        if log.exists():
+            tail = log.read_text(errors="replace")[-800:]
+            return str(final) in tail or str(final - 1) in tail
+    return False
+
+
+def _split_done_todo(exps, log_root):
+    done, todo = [], []
+    for e in exps:
+        (done if _is_done(e, log_root) else todo).append(e)
+    return done, todo
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # ANALYZE (run after collect)
 # ─────────────────────────────────────────────────────────────────────────
 def _steps_to_target(iters, accs, target):
@@ -441,6 +478,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="print plan + GPU estimate only, do not launch")
     ap.add_argument("--mem-util", type=float, default=0.80)
+    ap.add_argument("--resume", action="store_true",
+                    help="skip experiments that already reached final_iter "
+                         "(checked via checkpoint_*.pt). Use after a crash/SIGHUP "
+                         "to avoid re-running completed experiments.")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("status", help="progress snapshot of paper_scaling/logs")
     sub.add_parser("analyze", help="fit scaling law from collected curves -> PNG")
@@ -461,11 +502,30 @@ def main():
 
     _print_overview(names, seeds)
 
+    if args.resume:
+        print("\n[--resume] scanning completed experiments by checkpoint...")
+        total_done = total_todo = 0
+        for g in names:
+            all_exps = GROUPS[g](seeds)
+            done, todo = _split_done_todo(all_exps, LOG_ROOT / g)
+            total_done += len(done)
+            total_todo += len(todo)
+            print(f"  {g}: {len(done)} done / {len(todo)} todo / {len(all_exps)} total")
+        print(f"  TOTAL: {total_done} done, {total_todo} to run")
+        if total_todo == 0:
+            print("\nAll experiments already done. Collect with:")
+            print("  python scripts/extract_ctm_paper_results.py --logs paper_scaling/logs "
+                  "--csv paper_scaling/csv_data/scaling_summary.csv "
+                  "--md paper_scaling/csv_data/scaling_summary.md --curves")
+            return
+
     if args.dry_run:
         print("\n(dry-run: showing GPU packing estimate per group)")
         for g in names:
             exps = GROUPS[g](seeds)
-            print(f"\n--- {g} ({len(exps)} runs) ---")
+            if args.resume:
+                _, exps = _split_done_todo(exps, LOG_ROOT / g)
+            print(f"\n--- {g} ({len(exps)} runs to run) ---")
             run_all(exps, gpus=args.gpus, log_root=str(LOG_ROOT / g),
                     dry_run=True, mem_util=args.mem_util)
         print("\n(dry-run; not launching)")
@@ -473,7 +533,12 @@ def main():
 
     for g in names:
         exps = GROUPS[g](seeds)
+        if args.resume:
+            _, exps = _split_done_todo(exps, LOG_ROOT / g)
         gdir = LOG_ROOT / g
+        if not exps:
+            print(f"\n>>> {g}: all done, skipping")
+            continue
         print(f"\n>>> launching {g} ({len(exps)} runs) -> {gdir}")
         run_all(exps, gpus=args.gpus, log_root=str(gdir),
                 dry_run=False, mem_util=args.mem_util)
