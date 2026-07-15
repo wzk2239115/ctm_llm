@@ -67,9 +67,15 @@ FIELDS = [
 
 
 def build_model(model_name, obs_key, obs_shape, action_dim, latent_dim, var_weight, device, goal_shape=None):
+    # goal_encoder only for state envs: image envs render the goal as an image
+    # with the SAME shape as obs, but their goal_space metadata reports the raw
+    # 2D target coordinate — trusting it would build a mis-sized goal_encoder
+    # that chokes on the image goal. State envs (e.g. reacher obs=4, goal=2)
+    # have reliable goal_space metadata, so only they get a separate encoder.
+    eff_goal_shape = goal_shape if obs_key == "state" else None
     if model_name == "jepa-mlp":
         m = build_jepa_wm(obs_key, obs_shape, action_dim, latent_dim=latent_dim,
-                          var_weight=var_weight, goal_shape=goal_shape)
+                          var_weight=var_weight, goal_shape=eff_goal_shape)
     elif model_name == "stream-ctm":
         encoder = (CNNEncoder(latent_dim=latent_dim, channels=int(obs_shape[0]))
                    if obs_key == "pixels" else MLPEncoder(obs_dim=int(obs_shape[0]), latent_dim=latent_dim))
@@ -79,8 +85,8 @@ def build_model(model_name, obs_key, obs_shape, action_dim, latent_dim, var_weig
         )
         # Separate goal encoder when goal dim != obs dim (e.g. reacher: obs=4, goal=2).
         goal_encoder = None
-        if goal_shape is not None and int(np.prod(goal_shape)) != int(np.prod(obs_shape)):
-            goal_encoder = MLPEncoder(obs_dim=int(np.prod(goal_shape)), latent_dim=latent_dim)
+        if eff_goal_shape is not None and int(np.prod(eff_goal_shape)) != int(np.prod(obs_shape)):
+            goal_encoder = MLPEncoder(obs_dim=int(np.prod(eff_goal_shape)), latent_dim=latent_dim)
         m = WorldModel(encoder=encoder, predictor=predictor, obs_key=obs_key,
                        action_dim=action_dim, cost_mode="last", var_weight=var_weight,
                        goal_encoder=goal_encoder)
