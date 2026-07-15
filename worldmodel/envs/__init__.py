@@ -183,12 +183,15 @@ def make_env(name: str, **kwargs):
         delay = int(m.group(1))
         key = key[:-len(m.group(0))]
 
-    # parse -image / -image-partial suffix (turns a state env into image obs)
+    # parse -image / -image-partial suffix (turns a state env into image obs).
+    # NB: skip the canonical 'point-image' env — its name ends in '-image' but
+    # it is a native image env, not a state env being promoted; stripping the
+    # suffix would turn it into the unknown base 'point'.
     image_mode = None
-    if key.endswith('-image-partial'):
+    if key.endswith('-image-partial') and key != 'point-image':
         image_mode = 'partial'
         key = key[:-len('-image-partial')]
-    elif key.endswith('-image'):
+    elif key.endswith('-image') and key != 'point-image':
         image_mode = 'image'
         key = key[:-len('-image')]
 
