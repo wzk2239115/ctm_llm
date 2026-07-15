@@ -330,6 +330,7 @@ def write_csv(cli, rows):
         for k in r.keys():
             if k not in keys:
                 keys.append(k)
+    Path(cli.csv).parent.mkdir(parents=True, exist_ok=True)
     with open(cli.csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
@@ -364,6 +365,7 @@ def write_markdown(cli, rows):
         lines.append(f"| {task} | {sweep} | {len(rs)} | {fmt_mean_std(bts)} | "
                      f"{fmt_mean_std(fts)} | {fmt_mean_std(bms)} | {iter_str} |")
 
+    Path(cli.md).parent.mkdir(parents=True, exist_ok=True)
     with open(cli.md, "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -382,7 +384,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="0 = no limit (smoke test: --limit 5)")
     ap.add_argument("--no-args", action="store_true", help="skip args dump (faster)")
     ap.add_argument("--curves", action="store_true",
-                    help="also dump full test_acc curves to runs/metrics/<logs_name>_curves.json")
+                    help="also dump full test_acc curves next to the CSV (<csv_dir>/<logs_name>_curves.json)")
     ap.add_argument("--workers", type=int, default=0,
                     help="parallel checkpoint loaders (0 = min(cpu_count, 16); 1 = serial)")
     cli = ap.parse_args()
@@ -410,7 +412,7 @@ def main():
     print(f"=== MD   -> {cli.md}")
 
     if cli.curves and curves:
-        curves_path = OUT_DIR / f"{logs_name}_curves.json"
+        curves_path = Path(cli.csv).parent / f"{logs_name}_curves.json"
         with open(curves_path, "w") as f:
             json.dump(curves, f)
         print(f"=== curves -> {curves_path} ({len(curves)} runs)")
