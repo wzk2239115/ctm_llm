@@ -166,7 +166,9 @@ def main():
 
         for env_name, model_name, seed in shard_tasks:
             buf, env_kw = buffers[env_name]
-            obs_key = "pixels" if env_name == "point-image" else "state"
+            base = env_name.lower().replace("_", "-")
+            is_image = base in IMAGE_ENVS or (base.startswith("tworoom") and not base.endswith("state"))
+            obs_key = "pixels" if is_image else "state"
             if env_name not in buffers:
                 continue
             env = make_env(env_name, **env_kw)
