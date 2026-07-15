@@ -66,9 +66,10 @@ FIELDS = [
 ]
 
 
-def build_model(model_name, obs_key, obs_shape, action_dim, latent_dim, var_weight, device):
+def build_model(model_name, obs_key, obs_shape, action_dim, latent_dim, var_weight, device, goal_shape=None):
     if model_name == "jepa-mlp":
-        m = build_jepa_wm(obs_key, obs_shape, action_dim, latent_dim=latent_dim, var_weight=var_weight)
+        m = build_jepa_wm(obs_key, obs_shape, action_dim, latent_dim=latent_dim,
+                          var_weight=var_weight, goal_shape=goal_shape)
     elif model_name == "stream-ctm":
         encoder = (CNNEncoder(latent_dim=latent_dim, channels=int(obs_shape[0]))
                    if obs_key == "pixels" else MLPEncoder(obs_dim=int(obs_shape[0]), latent_dim=latent_dim))
@@ -76,8 +77,13 @@ def build_model(model_name, obs_key, obs_shape, action_dim, latent_dim, var_weig
             latent_dim=latent_dim, action_dim=action_dim,
             d_model=max(64, latent_dim * 2), memory_length=8, nlm_hidden=8,
         )
+        # Separate goal encoder when goal dim != obs dim (e.g. reacher: obs=4, goal=2).
+        goal_encoder = None
+        if goal_shape is not None and int(np.prod(goal_shape)) != int(np.prod(obs_shape)):
+            goal_encoder = MLPEncoder(obs_dim=int(np.prod(goal_shape)), latent_dim=latent_dim)
         m = WorldModel(encoder=encoder, predictor=predictor, obs_key=obs_key,
-                       action_dim=action_dim, cost_mode="last", var_weight=var_weight)
+                       action_dim=action_dim, cost_mode="last", var_weight=var_weight,
+                       goal_encoder=goal_encoder)
     elif model_name == "ctm-encoder":
         if obs_key != "pixels":
             raise ValueError("ctm-encoder is image-only")
@@ -173,10 +179,12 @@ def main():
                 continue
             env = make_env(env_name, **env_kw)
             obs_shape, action_dim = env.observation_space.shape, env.action_space.shape[0]
+            gs = getattr(env, "goal_space", None)
+            goal_shape = tuple(gs.shape) if gs is not None else None
             t0 = time.time()
             torch.manual_seed(seed); np.random.seed(seed)
             model = build_model(model_name, obs_key, obs_shape, action_dim,
-                                args.latent_dim, args.var_weight, device)
+                                args.latent_dim, args.var_weight, device, goal_shape=goal_shape)
             hist = train_world_model(model, buf, horizon=args.horizon, epochs=args.epochs,
                                      batch_size=args.batch_size, device=device,
                                      log_every=10**9, seed=seed)
