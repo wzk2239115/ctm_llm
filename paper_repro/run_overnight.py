@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--gpus", type=int, default=8)
     ap.add_argument("--mem-util", type=float, default=0.80)
+    ap.add_argument("--max-per-gpu", type=int, default=0,
+                    help="cap concurrent runs per GPU (0=unlimited/VRAM-est; cifar10 needs ~31GB, set 2)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -87,7 +89,7 @@ def main():
     gdir = LOG_ROOT / group
     print(f"\n>>> launching {len(exps)} runs -> {gdir}")
     run_all(exps, gpus=args.gpus, log_root=str(gdir),
-            dry_run=False, mem_util=args.mem_util)
+            dry_run=False, mem_util=args.mem_util, max_per_gpu=args.max_per_gpu)
 
 
 if __name__ == "__main__":

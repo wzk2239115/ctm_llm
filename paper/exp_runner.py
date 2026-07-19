@@ -309,7 +309,7 @@ def _gpu_free_map():
 
 
 def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0.80,
-            max_retries=2, poll_interval=3):
+            max_retries=2, poll_interval=3, max_per_gpu=0):
     """Run experiments in parallel on N GPUs, multiple per GPU based on VRAM.
 
     Automatically packs experiments onto GPUs by estimated memory usage.
@@ -324,8 +324,11 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
         max_gb = max(_est_gb(e) for e in experiments)
         min_gb = min(_est_gb(e) for e in experiments)
         per_gpu_max = max(1, int(cap_gb / max_gb))
+        if max_per_gpu > 0:
+            per_gpu_max = min(per_gpu_max, max_per_gpu)
         total_parallel = gpus * per_gpu_max
-        print(f"GPUs: {gpus} x {total_gb:.0f}GB (cap {cap_gb:.0f}GB/GPU)")
+        print(f"GPUs: {gpus} x {total_gb:.0f}GB (cap {cap_gb:.0f}GB/GPU)"
+              f"{f', max_per_gpu={max_per_gpu}' if max_per_gpu > 0 else ''}")
         print(f"Task est: {min_gb:.1f}~{max_gb:.1f} GB  =>  ~{per_gpu_max} per GPU = {total_parallel} parallel")
         print(f"Total experiments: {len(experiments)}  =>  ~{len(experiments)/total_parallel:.1f} rounds")
         print()
@@ -339,7 +342,7 @@ def run_all(experiments, gpus=8, log_root="logs/deep", dry_run=False, mem_util=0
 
     running = {}
     gpu_n = {g: 0 for g in range(gpus)}
-    gpu_max_slots = {g: 999 for g in range(gpus)}
+    gpu_max_slots = {g: (max_per_gpu if max_per_gpu > 0 else 999) for g in range(gpus)}
     retry_count = {}
     pending = list(experiments)
     done, failed = [], []
