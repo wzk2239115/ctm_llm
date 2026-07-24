@@ -7,6 +7,64 @@
 
 ---
 
+## 2026-07-24 — paper_repro 5-seed 三支柱复现 + sparsity gap-fill (cifar10/parity r-sweep)
+
+- **思路(用户提供)**: VERIFIED_CONCLUSIONS 第三块(sparsity)原写着"cifar10/parity 缺完整 r sweep, 暂不判" —— 这是论文三支柱里唯一的明确数据缺口。用 `paper_repro/run_overnight.py --stream sparsity-gap` 在算力机(ctm-2-0, 共享 fs)补跑 cifar10 + parity 的 r∈{0.1,0.25,0.5,0.75} × 5 seed。同时, paper_repro 本身已是 80-run 5-seed 三支柱复现(baseline/jepa/revise 全任务)—— 借这次收菜**一并核验三支柱头条是否在 matched 5-seed baseline 下复现**(AGENTS.md 口径: 不能拿旧单 seed 常量当 baseline)。
+- **配置**: `run_overnight.py --tasks cifar10 --gpus 7 --max-per-gpu 2`(cifar10 sparsity 20 run, 4 ratio × 5 seed); parity sparsity 早先已跑(18/20 ok, 2 个 CUDA 失败)。全量 `extract_ctm_paper_results.py --logs paper_repro/logs` → `paper_repro/csv_data/repro_summary_0724.csv` (118 run)。分析 `paper/analyze_repro_0724.py`。途中修了一个工程 bug: `run_all` 显存估算严重偏低(est 2.6GB vs cifar10 实际 ~31GB)致 OOM 连锁 → 加 `--max-per-gpu` 硬约束(`801d5f0`)。
+- **预期**: (1) sparsity 在 cifar10/parity 上也"低 r 近乎免费"(推广 mazes 结论); (2) 三支柱头条复现。
+- **结果** (mc-vs-mc, matched 5-seed baseline):
+  - **JEPA**: cifar10 final +4.5pp(73.6 vs 69.0), mc +0.2; qamnist final +9.0pp, mc 平。✅ 复现(抬 final 不抬 mc)。
+  - **revise**: parity mc **+0.9pp**(was 头条 +10pp)。❌ **头条不复现** —— 旧 baseline 0.882 是单颗坏种(s0), matched baseline=0.970。parity final +2.5pp(弱正)。
+  - **sparsity**: mazes 全 r(0.1–0.75)±0.6pp(免费); cifar10 r≤0.5 ±0.4pp(免费, 0.75 欠训剔除); **parity r=0.1 崩 -7pp**(边界!), r≥0.25 平。✅ 强化。
+- **结论**:
+  1. **sparsity 支柱大幅强化**: 从"仅 mazes"扩到三任务(mazes/cifar10/parity), 并发现清晰边界 —— 感知任务稀疏廉价, 算法任务(parity XOR 累加)激进稀疏会崩。擦掉了 VERIFIED_CONCLUSIONS 的"cifar10/parity 暂不判"。
+  2. **revise mc +10pp 头条是口径假象**: 已在 VERIFIED_CONCLUSIONS 第二块更正为"parity final-tick +2.5pp(抬 final 不抬 mc)"。教训重申: baseline 必须用 matched multi-seed, 旧 st00 单 seed 常量会造假 delta。
+  3. **JEPA 是复现后最干净的支柱**: final-tick 机制(cifar10/qamnist 显著正、mc 平)稳健。
+  4. **sort sparsity 旧"-12pp 大坑"不复现**(-0.3pp), 但 sort 仅 1 r + inert 嫌疑, 不作前沿点。
+- **下一步**:
+  - cifar10 sparsity r=0.75 可补跑(5 seed 全欠训到 36%)补全前沿右端; 非阻塞(趋势已由 r≤0.5 确定)。
+  - revise 若想救回更强信号: 跑 corrupt_prob sweep(cp∈{0.05,0.3,0.5}, `run_overnight --stream revise-robust`)看 final-tick 能否稳定 >+2.5pp。
+  - 出图: figE_sparsity_pareto_0724.png 已出; JEPA/revise 的 final-vs-mc 对照图待补。
+
+---
+
+## 2026-07-15 — worldmodel_compare 首个完整数据 (CTM-encoder vs CNN, 9 envs × 3 seeds)
+
+- **思路(用户提供)**: 起因是排查"算力机刚跑完什么", 发现 `paper/run_worldmodel_compare.py` 多 shard 崩溃、从没跑出完整数据。连修 4 个 bug 后拿到首个完整 60 行结果。核心研究问题(worldmodel/ 框架的定位): **CTM-as-encoder vs from-scratch CNN encoder** 在 world-model 图像任务上的对比 —— 两者共用同一 predictor/CEM/数据, 只换 encoder, 保证公平。AGENTS.md 里已有假设: image env 上 from-scratch CNN encoder 易 JEPA 崩塌, 而 CTM encoder(深递归+同步表示)抗崩。本次目的: 拿到完整数据验证这个假设, 并看 stream-ctm(持续思考)vs jepa-mlp(Markov)在状态 env 上的差异。
+- **Bug 修复(4 个 commit, 都阻塞了完整跑通)**:
+  1. `1d63308` — `run_worldmodel_compare.py` obs_key 只特判 `point-image`, 导致 `tworoom`(也是 image)被判成 'state' → `jepa_loss` 里 `KeyError: 'state'`。
+  2. `cdb5769` — `worldmodel/envs/__init__.py` 的 `-image` 后缀解析器(给状态 env 升图像用)误吃 canonical 的 `point-image`, 剥成未知 base `'point'` → `Unknown env 'point-image'`。
+  3. `f8b5375` — Reacher(full) `obs=4` 但 `goal=2`, `build_model` 没传 `goal_shape` → CEM 评估时用 obs encoder 编 2D goal → 形状崩 `(512x2 and 4x128)`。
+  4. `2ba7ca4` — 上一 fix 的副作用: 图像 env 的 `goal_space` 元数据报 2D 坐标但**实际 goal 是图像**, 误建 `MLPEncoder(obs_dim=2)` goal_encoder → 图像 goal(末维 32)喂进 `Linear(2,128)` 崩 `(49152x32 and 2x128)`。修正: goal_encoder **只对 `obs_key=='state'` 启用**(图像 env 的 goal 和 obs 同形, 走主 CNN encoder)。
+- **配置**: `paper/run_worldmodel_compare.py` via `scripts/run_worldmodel_compare.sh`。9 envs(cartpole / cartpole-partial / pendulum / pendulum-partial / reacher / tworoom-state / tworoom / point-state / point-image) × {jepa-mlp, stream-ctm} + image env(point-image, tworoom)再加 ctm-encoder × 3 seeds = **60 runs**。`epochs=60, var_weight=4.0(VICReg 防崩塌), latent_dim=32, horizon=6, cem_samples=128, batch_size=64`。7×H100, `PROCS_PER_GPU=2` = 14 shards。输出 `csv_data/worldmodel_compare_results.csv`(60 行, 零缺失)。
+- **预期**: (1) image env 上 ctm-encoder 抗崩、优于 CNN; (2) stream-ctm 在状态 env 上 ≥ Markov jepa-mlp; (3) collapse 检查(var_weight=4.0)应空。
+- **结果** (success_rate mean±sd%, n=3; ctm-encoder 仅 image env):
+  | env | jepa-mlp | stream-ctm | ctm-encoder |
+  |---|---|---|---|
+  | point-state | 100.0±0.0 | 95.8±7.2 | — |
+  | point-image | 39.6±7.3 | 27.1±26.0 | **97.9±3.6** |
+  | tworoom-state | 58.3±3.6 | 60.4±3.6 | — |
+  | tworoom | 62.5±10.9 | 52.1±18.1 | 12.5±6.3 |
+  | reacher | 54.1±3.6 | 54.1±3.6 | — |
+  | cartpole | 22.9±3.6 | 31.3±12.5 | — |
+  | cartpole-partial | 37.5±0.0 | 39.6±3.6 | — |
+  | pendulum | 27.1±9.5 | 33.3±7.2 | — |
+  | pendulum-partial | 12.5±0.0 | 12.5±0.0 | — |
+  - collapse 检查(latent_var<1e-3)**为空** —— var_weight=4.0 把崩塌压住了(但 point-image stream-ctm sd=26 提示 CNN+图像那条仍双峰不稳)。
+- **结论**:
+  1. **CTM encoder 在 point-image 上碾压(可写论文的 win)**: `97.9±3.6` ≫ jepa-mlp 39.6 / stream-ctm 27.1, +58~70pp, n=3 紧方差。验证了"CTM 迭代式感知抗崩、优于 from-scratch CNN"的假设 —— CNN 那两条在图像上基本没比 CEM 随机搜好多少。
+  2. **边界最重要 —— tworoom 上结论反转**: 同样是 image env, tworoom(墙+门, 结构化渲染)上 ctm-encoder 反而崩(12.5, 近随机), CNN jepa-mlp 最好(62.5)。CTM encoder 的优势**不普适**: point-image(高斯点+空白背景)它赢麻; tworoom(resnet18-1 + 5 iterations 欠拟合结构化场景)它输。**写 97.9% 必须带 tworoom 边界, 否则 cherry-pick**。
+  3. **杠杆是 encoder, 不是 predictor**: stream-ctm(持续思考)vs jepa-mlp(Markov)在状态 env 上只 marginal —— cartpole/pendulum 略优, reacher/tworoom-state/cartpole-partial 打平, pendulum-partial 完全 tie。point-state 两模型都近 100(饱和)。真正的差异来自 encoder(CTM vs CNN), 不是 predictor(流式 vs Markov)。
+  4. **point-image stream-ctm sd=26.0** —— CNN+图像那条固有不稳定(双峰), 即便没跌破 1e-3 阈值。stream-ctm 配 CNN encoder 在图像上不可靠。
+- **口径提醒**: summary 没打印 `random_rate`, 在 CSV 里 —— 出图/报数必须带同 env 的 random baseline 当参照(point-image smoke rand 25-50%, 不能裸看 39.6%)。
+- **下一步**:
+  - 排查 tworoom 上 ctm-encoder 崩的根因(backbone resnet18-1 / iterations=5 是否欠拟合; 试加大 iterations 或换 backbone)—— 这是 97.9% 结论能否推广的关键。
+  - 出图: per-env 三模型柱状图 + point-image/tworoom 对照(突出边界), 带 random_rate 基线。
+  - point-image stream-ctm 多 seed 看双峰是 collapse 还是 CEM 噪声(看 latent_var 分布)。
+  - 考虑加 reacher-partial(obs=2=goal, 排除 goal_encoder 干扰)补全 reacher 谱。
+
+---
+
 ## 2026-07-07 — 大规模 GCBC offline 对比 (9 envs × 8 backbones × 5 seeds)
 
 - **思路(用户提供)**: 2026-07-05 GCBC 离线范式定稿后, 在算力机做**全量对比**: 扩到 9 个 env (point-state / tworoom-state / reacher-partial / mountaincar / mountaincar-partial / pendulum / pendulum-partial / cartpole / cartpole-partial), 8 backbone (mlp/ctm/lstm/gru/transformer/flash/flash-shallow/flash-deep) + cem-wm baseline, 5 seeds. 目的: (1) 验证 0705 的 CTM-POMDP 优势在更大样本下是否稳定; (2) 把 transformer/gru 加进来补全 backbone 谱; (3) 看 cem-wm (model-based) vs 学习型 (model-free GCBC) 的相对位置.
