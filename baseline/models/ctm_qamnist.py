@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from baseline.models.ctm import ContinuousThoughtMachine
 from baseline.models.modules import MNISTBackbone, QAMNISTIndexEmbeddings, QAMNISTOperatorEmbeddings
-from baseline.utils.ctm_model_ideas import apply_topk_sparsity, get_async_tick_mask, should_halt
+from baseline.utils.ctm_model_ideas import apply_topk_sparsity, get_async_tick_mask, should_halt, apply_sparse_nlm
 
 class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
     def __init__(self,
@@ -133,6 +133,7 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
         device = x.device
 
         topk = getattr(self, 'topk_neurons', 1.0)
+        sparse_nlm = getattr(self, 'sparse_nlm_compute', False)
         async_mode = getattr(self, 'async_tick_mode', 'none')
         async_periods = getattr(self, 'async_tick_periods', None)
         async_phases = getattr(self, 'async_tick_phases', None)
@@ -235,14 +236,16 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
                 # --- Apply NLMs ---
                 if nlm_diff is not None:
                     activated_state = nlm_diff(state_trace)
+                    if topk < 1.0:
+                        activated_state = apply_topk_sparsity(activated_state, topk, stepi)
+                elif sparse_nlm and topk < 1.0:
+                    activated_state = apply_sparse_nlm(self.trace_processor, state_trace, state, topk)
                 else:
                     activated_state = self.trace_processor(state_trace)
+                    if topk < 1.0:
+                        activated_state = apply_topk_sparsity(activated_state, topk, stepi)
                 if async_mask is not None:
                     activated_state = activated_state * async_mask.unsqueeze(0).float()
-
-                # --- Top-k Sparsity ---
-                if topk < 1.0:
-                    activated_state = apply_topk_sparsity(activated_state, topk, stepi)
 
                 # --- Calculate Synchronisation for Output Predictions ---
                 synchronization_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
