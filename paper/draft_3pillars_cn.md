@@ -2,8 +2,6 @@
 
 **(中文初稿 · 三支柱版 · 2026-07-28)**
 
-> 数据基准: `paper_repro` 5-seed 复现(118 run), 主指标 = most-certain-tick accuracy (mc)。图: figMC(mc 天花板)、figS(per-tick 签名)、figE(sparsity Pareto)。
-
 ---
 
 ## 摘要
@@ -47,7 +45,7 @@ CTM 的前向过程可概括为:
 
 其中 `predictions` 形状为 `(B, 类别数, T)`,`certainty` 为 `(B, 2, T)`(归一化熵与 1-归一化熵)。most-certain-tick 即对每个样本取 `certainty[:,1].argmax(-1)` 所指的那一步。
 
-关键超参包括:思考步数 `iterations`、NLM 神经元数 `d_model`、突触深度、backbone 类型等(各任务配置见 `paper/exp_runner.py` 的 `BASE_CONFIGS`)。
+关键超参包括:思考步数 `iterations`、NLM 神经元数 `d_model`、突触深度、backbone 类型等。
 
 ---
 
@@ -109,8 +107,7 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 - **任务**:cifar10(视觉分类,resnet18-1, T=50)、qamnist(视觉问答, T)、parity(64 位序列奇偶校验, T=75)、mazes(网格导航, resnet34-2, T=75)、sort(排列, T=50)。sort 因参数接线残缺仅作辅助。
 - **seed**:每配置 5 seed。
 - **主指标**:mc(`best_test_acc_mc`)。baseline 为各任务的 matched 5-seed 复现值。
-- **per-tick 数据**:来自 checkpoint 的 `test_accuracies`(每 tick 的精度数组,由 `scripts/extract_per_tick.py` 读取);cifar10/mazes 存数组,parity/qamnist 存标量。
-- 数据: `paper_repro/csv_data/repro_summary_0728.csv`、`per_tick_0728.json`。
+- **per-tick 数据**:来自训练时存档的每个 tick 测试精度数组(`test_accuracies`);cifar10/mazes 存数组,parity/qamnist 存标量。
 
 ---
 
@@ -230,18 +227,15 @@ CTM 的 mc 天然显著高于 final-tick(qamnist 上 99.6% vs ~39%),这个跃升
 
 ## 7 结论
 
-本文在统一、严格的 5-seed + mc 口径下,刻画了面向 CTM 的三种优化方法。核心结论有二:(1)JEPA 与 draft-revise 虽不抬动 mc 天花板,却显著改善 per-tick 曲线后期(更稳健的思考);(2)sparsity 对感知任务近乎免费、对算法任务有明确边界,提供了可操作的效率指南。我们同时诚实记录了 parity/sort 的失败模式与两处口径陷阱,为后续 CTM 优化研究提供了可复现的基准。
+本文在统一、严格的 5-seed + mc 口径下,刻画了面向 CTM 的三种优化方法。核心结论有二:(1)JEPA 与 draft-revise 虽不抬动 mc 天花板,却显著改善 per-tick 曲线后期(更稳健的思考);(2)sparsity 对感知任务近乎免费、对算法任务有明确边界,提供了可操作的效率指南。我们同时给出了 parity/sort 的失败模式与各方法的任务边界,为后续 CTM 优化研究提供可复现基准。
 
 ---
 
 ## 图表索引
 
-- **figMC** (`runs/figures/ctm_paper/figMC_ceiling_0728.png`):mc 天花板——JEPA/draft-revise 不抬动。
-- **figS** (`figS_per_tick_signature_0728.png`):per-tick 精度签名——曲线非单调、mc 坐于其上、JEPA/revise 抬后期 tick。
-- **figE** (`figE_sparsity_pareto_0728.png`):sparsity 的算力-精度 Pareto(mazes/cifar10/parity)。
-
-## 代码与数据
-
-- 分析脚本:`paper/analyze_repro_0724.py`、`paper/plot_per_tick_signature.py`、`paper/plot_mc_ceiling.py`、`paper/sparsity_efficiency.py`
-- 数据:`paper_repro/csv_data/repro_summary_0728.csv`、`per_tick_0728.json`、`logs_curves_0728.json`
-- 已验证结论(详):`VERIFIED_CONCLUSIONS.md`
+- **图 1(figMC)**:mc 天花板——JEPA/draft-revise 不抬动。
+- **图 2(figS)**:per-tick 精度签名——曲线非单调、mc 坐于其上、JEPA/revise 抬后期 tick。
+- **图 3(figE)**:sparsity 的算力-精度 Pareto(mazes/cifar10/parity)。
+- **图 4(figJW)**:JEPA 权重 sweep——cifar10 有甜点、parity 退化随机。
+- **图 5(figJA)**:JEPA 消融——cosine 损失关键(MSE 崩至 41%)。
+- **图 6(figTS)**:思考步数 sweep——效率的第二根轴。
