@@ -50,6 +50,10 @@ echo "[cluster] each proc gets ~$((N_ENV / TOTAL_PROCS)) envs"
 
 mkdir -p "$OUT_DIR" logs
 
+# 清掉上次跑残留的 proc*.csv / proc*.md, 否则 merge glob 会把旧文件一起收,
+# 导致 (env, backbone, seed) 重复 (上次某些 proc 失败没覆写时尤其严重).
+rm -f "$OUT_DIR"/offline_compare_proc*.csv "$OUT_DIR"/offline_compare_proc*.md
+
 # 分片: env 均匀分配到 TOTAL_PROCS 个进程, 每进程绑定到 gpu = proc % N_GPU
 pids=()
 for ((p=0; p<TOTAL_PROCS; p++)); do

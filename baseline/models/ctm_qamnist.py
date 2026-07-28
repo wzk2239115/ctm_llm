@@ -262,7 +262,7 @@ class ContinuousThoughtMachineQAMNIST(ContinuousThoughtMachine):
                     _saved, activated_state = apply_draft_revise_corruption(
                         stepi, draft_block_size, activated_state, corrupt_prob)
                     if _saved:
-                        draft_pred = current_prediction.detach()
+                        draft_pred = current_prediction
 
                 # --- Per-tick synch tracking ---
                 if return_per_tick_synch:
