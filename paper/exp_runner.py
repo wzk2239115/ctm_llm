@@ -218,12 +218,14 @@ def make_jepa(tasks, seeds, weights=(0.1,), loss="cosine", stop_grad=True):
     return exps
 
 
-def make_sparsity(tasks, seeds, ratios=(0.5,)):
+def make_sparsity(tasks, seeds, ratios=(0.5,), sparse_nlm=True):
     exps = []
     for task in tasks:
         for r in ratios:
             for s in seeds:
                 extra = dict(seed=s, topk_neurons=r)
+                if sparse_nlm:
+                    extra["sparse_nlm_compute"] = True   # real gather/scatter NLM (saves FLOPs)
                 rstr = str(r).replace(".", "p")
                 exps.append(_exp(task, f"sparsity{rstr}_s{s}", extra, ["sparsity"]))
     return exps
