@@ -22,9 +22,9 @@
   3. **JEPA 是复现后最干净的支柱**: final-tick 机制(cifar10/qamnist 显著正、mc 平)稳健。
   4. **sort sparsity 旧"-12pp 大坑"不复现**(-0.3pp), 但 sort 仅 1 r + inert 嫌疑, 不作前沿点。
 - **下一步**:
-  - cifar10 sparsity r=0.75 可补跑(5 seed 全欠训到 36%)补全前沿右端; 非阻塞(趋势已由 r≤0.5 确定)。
+  - ✅ cifar10 sparsity r=0.75 已补跑(0728, 满 200k): mc Δ -0.1pp, 证实 cifar10 全 r 免费(前沿闭合, figE_sparsity_pareto_0728)。
   - revise 若想救回更强信号: 跑 corrupt_prob sweep(cp∈{0.05,0.3,0.5}, `run_overnight --stream revise-robust`)看 final-tick 能否稳定 >+2.5pp。
-  - 出图: figE_sparsity_pareto_0724.png 已出; JEPA/revise 的 final-vs-mc 对照图待补。
+  - JEPA/revise 的 final-vs-mc 对照图待补。
 
 ---
 

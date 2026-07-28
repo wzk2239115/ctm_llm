@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parents[1]
-CSV = ROOT / "paper_repro" / "csv_data" / "repro_summary_0724.csv"
+CSV = ROOT / "paper_repro" / "csv_data" / "repro_summary_0728.csv"
 FIG_DIR = ROOT / "runs" / "figures" / "ctm_paper"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -215,7 +215,7 @@ def plot_sparsity(rows):
     ax.grid(True, alpha=0.3)
     ax.legend(loc="lower right", fontsize=10)
     fig.tight_layout()
-    p = FIG_DIR / "figE_sparsity_pareto_0724.png"
+    p = FIG_DIR / "figE_sparsity_pareto_0728.png"
     fig.savefig(p, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"\n[fig] -> {p}")

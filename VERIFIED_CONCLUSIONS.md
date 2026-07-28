@@ -3,7 +3,7 @@
 本文档汇总经过实验验证、口径正确、可写进论文的三项 CTM 优化方法。
 每一块都标注了**衡量口径**和**边界**(在哪不 work)，避免重蹈"口径错判"的覆辙。
 
-> **数据来源(2026-07-24 更新)**: 下表数字来自 `paper_repro` **5-seed 复现**(`paper_repro/csv_data/repro_summary_0724.csv`, 118 run), baseline 用 repro 的 baseline 组(matched 5-seed), 而非旧的单 seed / st00 常量。分析脚本 `paper/analyze_repro_0724.py`。
+> **数据来源(2026-07-28 更新)**: 下表数字来自 `paper_repro` **5-seed 复现**(`paper_repro/csv_data/repro_summary_0728.csv`, 118 run), baseline 用 repro 的 baseline 组(matched 5-seed), 而非旧的单 seed / st00 常量。分析脚本 `paper/analyze_repro_0724.py`。
 >
 > 衡量口径前提(强制): CTM 有两种打分 —— **final-tick**(只看最后一步, = `best_test_acc`)和 **most-certain-tick**(每样本挑最自信的一步, = `best_test_acc_mc`, 简称 mc)。后者天然高得多, 这是 CTM 机制本身的红利, 不是 idea 的功劳。判 idea 必须 mc 比 mc、final 比 final。
 
@@ -76,24 +76,24 @@ CTM 正常是"思考完直接交答案"; draft-revise 改成**先出草稿, 再�
 - `topk_neurons = r`: 每个 tick 只有 r 比例的 NLM 神经元被激活更新。
 - **算力模型**: NLM 思考回路做 ~r 的功, 省 (1-r) 的 NLM 算力。**backbone(resnet)不稀疏化**, 端到端墙钟加速 < (1-r), 需 sparse kernel 才变现。
 
-### 实验证据(Pareto, mc 口径, 5-seed 复现 0724)
+### 实验证据(Pareto, mc 口径, 5-seed 复现 0728)
 | 任务 | r=0.10 | 0.25 | 0.50 | 0.75 | baseline mc |
 |---|---|---|---|---|---|
 | **mazes** | -0.5 | +0.2 | +0.6 | +0.2 | 90.0% |
-| **cifar10** | -0.4 | +0.1 | +0.3 | (欠训) | 84.2% |
+| **cifar10** | -0.4 | +0.1 | +0.3 | -0.1 | 84.2% |
 | **parity** | **-7.0** | +3.0 | -1.1 | +0.7 | 97.0% |
 
-> cifar10 r=0.75: 5 seed 全部只训到 ~36%(overnight 末尾被中断)→ 剔除, 趋势由 r≤0.5 推断。parity r=0.25/0.75 各 4 seed(2 个 CUDA 失败)。sort r=0.5 = -0.3pp(旧"-12pp 大坑"不复现, 但 sort 仅 1 个 r + inert 嫌疑, 不作前沿点)。
+> cifar10 r=0.75: 已补跑至满 200k iter(0728), mc Δ -0.1pp(此前欠训致假象 -1.6pp 已修正)。parity r=0.25/0.75 各 4 seed(2 个 CUDA 失败); cifar10 r=0.5 为 4 seed(1 个欠训剔除)。sort r=0.5 = -0.3pp(旧"-12pp 大坑"不复现, 但 sort 仅 1 个 r + inert 嫌疑, 不作前沿点)。
 
 ### 关键洞察
-- **视觉/空间任务稀疏近乎免费**: mazes 全 r(0.1–0.75)都在 baseline ±0.6pp 内; cifar10 r≤0.5 在 ±0.4pp 内。即"省 50–90% NLM 算力几乎不掉点"。
+- **视觉/空间任务稀疏近乎免费**: mazes 全 r(0.1–0.75)都在 baseline ±0.6pp 内; cifar10 全 r(0.1–0.75)在 ±0.4pp 内。即"省 25–90% NLM 算力几乎不掉点"。
 - **算法任务有硬边界**: parity 在 r=0.1 崩(mc -7pp)。parity = 64 长二进制序列逐步 XOR 累加, 需要全量神经元参与每一步, 激进稀疏会丢失中间累积。r≥0.25 才稳。
 - **任务差异是论文的诚实卖点**: 不是"稀疏万能", 而是"感知任务廉价的递归思考可被大幅压缩; 需要全神经元协作的算法任务不行"。
 - **诚实前提**: 省的是 NLM(CTM 递归思考部分, 是 CTM 区别于普通 CNN 的核心开销), 不是 backbone。真正变现需 sparse kernel。
 
 ### 代码
 - CTM forward 的 `topk_neurons` 路径(neuron_select_type)
-- `paper/analyze_repro_0724.py` — Pareto 分析 + 出图(`runs/figures/ctm_paper/figE_sparsity_pareto_0724.png`)
+- `paper/analyze_repro_0724.py` — Pareto 分析 + 出图(`runs/figures/ctm_paper/figE_sparsity_pareto_0728.png`)
 
 ---
 
