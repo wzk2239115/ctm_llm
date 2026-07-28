@@ -16,6 +16,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 ROOT = Path(__file__).resolve().parents[1]
 CSV = ROOT / "paper_repro" / "csv_data" / "repro_summary_0728.csv"
@@ -58,8 +60,8 @@ def main():
         for j, p in enumerate(present):
             if not p:
                 bars[j].set_color("#dddddd")
-                ax.text(x[j] + offs, 2, ("killed\n(0-iter)" if (stage, TASKS[j])
-                        == ("jepa", "parity") else "n/a"),
+                ax.text(x[j] + offs, 2, ("退化→随机\n(~50%,图4)" if (stage, TASKS[j])
+                        == ("jepa", "parity") else "未跑"),
                         ha="center", va="bottom", fontsize=7, color="#999999")
             else:
                 ax.text(x[j] + offs, means[j] + errs[j] + 0.6,

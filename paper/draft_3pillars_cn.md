@@ -134,7 +134,7 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 
 ![图1 mc天花板](../runs/figures/ctm_paper/figMC_ceiling_0728.png)
 
-**图 1.** mc 天花板不变:各任务下 baseline / JEPA / draft-revise 的 mc 全部重叠于噪声内(灰色 = 该任务上方法被 0-iter 杀死或未跑)。
+**图 1.** mc 天花板不变:各任务下 baseline / JEPA / draft-revise 的 mc 全部重叠于噪声内(灰色 = 该任务上方法未跑或退化;parity-JEPA 退化至随机 ~50%, 见图 4)。
 
 **分析。** 这是一个跨任务的稳健结论:两种辅助机制都无法抬动 mc 天花板。原因在于 mc 的本质——它取每个样本在整个思考过程中"最自信的一步",本质上由模型**容量**(表征能力上界)决定;JEPA 的跨 tick 一致性正则与 draft-revise 的草稿扰动只塑形思考轨迹,不增加容量,故抬不动这个上界。值得对照的是,mc 相对"跨 tick 均值"的巨大跃升(如 qamnist ~39%→99.6%)本身来自 CTM "挑最自信步"的架构红利,与这两种方法无关。正因天花板不动,下一节转向 per-tick 曲线,考察它们到底改变了什么。
 
@@ -158,6 +158,18 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 
 **分析。** 末 tick 退化的根源在训练目标:CTM 用 most-certain 损失优化"最自信步",并未要求末 tick 最优,模型可在后期松懈甚至漂移。JEPA 的跨 tick 一致性正则逼相邻 tick 隐状态可预测,直接抑制后期漂移;draft-revise 的"扰动后修回"同理,强制后半段轨迹稳健——故二者都把曲线右段抬起来。但峰值由容量决定(§5.1),正则/自检增加不了容量,故峰值与 mc 不动。换言之,这两种方法的真实价值不在"想得更准",而在"**想得更稳**——更多 tick 达到可用精度",这对 any-time / 早停推理有直接意义。mazes 因 baseline 已 ~90% 饱和、曲线本就平坦无退化可修,看不到此效应。
 
+**JEPA 的超参与设计验证。** 我们在历史 ctm_paper 数据(3-seed)上对 JEPA 做两组补充分析(图 4、5)。**权重 sweep**:cifar10 呈明显甜点——$w{=}0.1$ 时与 baseline 持平(84.7 vs 85.2%),$w\geq 0.5$ 掉到 ~77%(−8pp);mazes/qamnist 因饱和而全程持平;**parity 在任意 $w$ 下都退化到 49.9%(二分类随机水平)**。**消融(cifar10)**:完整方法 84.7%;去 stop-gradient 降到 83.8%;**cosine 换 MSE 直接崩到 41.0%**;predict_delta=1 降到 77.4%。
+
+![图4 JEPA权重sweep](../runs/figures/ctm_paper/figJW_jepa_weight_0728.png)
+
+**图 4.** JEPA 权重 sweep(st04, 3-seed)。cifar10 有甜点 $w{=}0.1$,高权重反噬;parity 在任意权重下退化为随机(虚线=50%)。
+
+![图5 JEPA消融](../runs/figures/ctm_paper/figJA_jepa_ablation_0728.png)
+
+**图 5.** JEPA 消融(cifar10)。cosine 损失是关键(MSE 崩至 41%),stop-grad 有正向贡献——验证 §3.1 的两道防坍塌防线。
+
+这说明 JEPA 是"弱正则":仅在小 $w$ 下不伤主任务。消融则证实了设计——只约束方向(cosine)、不回传梯度到 target(sg),才能避免隐状态坍塌;一旦换成 MSE,表示退化、精度崩溃。parity 在所有 $w$ 下退化到随机,进一步暴露其 backbone 与跨 tick 正则的结构性不兼容(§5.4)。
+
 ### 5.3 sparsity:感知任务廉价, 算法任务有硬边界
 
 **结果。** 表与图 3 给出 mc 相对 baseline 的变化(Δpp)对 NLM 激活比例 r 的关系(5-seed):
@@ -177,6 +189,12 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 **图 3.** sparsity 的算力-精度 Pareto(mc vs NLM 算力比例 r)。mazes / cifar10 全程贴近 baseline★(±0.6pp, 近乎免费);parity 在 r=0.1 处暴跌 7pp(算法任务硬边界)。
 
 **分析。** 感知任务对稀疏鲁棒,是因为其精度主要来自 **backbone**(resnet 已提取充分视觉特征),NLM 递归部分仅做精炼——即使每 tick 只激活 10% 神经元,backbone 加少量递归信号仍足以维持精度,说明这类任务的"思考"存在冗余。parity 恰相反:它需要对 64 位序列**逐步 XOR 累加**,运行中的奇偶状态必须**分布在整个神经元群体**上;激进稀疏(10% 神经元)会丢失中间累积,故灾难性掉点,只有保留足够比例(r≥0.25)才能维持分布式累加表示。由此得到一条可操作规则:**感知类任务可大胆压缩 NLM(省 50–90% 算力近乎免费);需全神经元分布式协作的算法类任务须保持稠密。** 再次强调,"省算力"指 NLM 层面,backbone 不稀疏化,端到端墙钟收益需 sparse kernel 才能变现。
+
+**效率的第二根轴:思考步数 $T$(图 6)。** CTM 的算力同时取决于"每 tick 激活多少神经元"(sparsity, 图 3)和"思考多少 tick"(iterations)。历史 tick sweep(st02)显示:**parity 的 mc 随 $T$ 近似单调上升**(tick1 的 65% → tick50 的 92%),印证 XOR 累加需足够思考步;**cifar10 则非单调**(更多 tick 并非更好)。这与 sparsity 的发现同向——parity 对算力两轴都敏感,感知任务两端的"思考"都有冗余。两条轴共同构成 CTM 效率优化的完整空间。
+
+![图6 tick sweep](../runs/figures/ctm_paper/figTS_tick_sweep_0728.png)
+
+**图 6.** 思考步数 $T$ sweep(st02, 3-seed)。parity 强依赖 $T$(XOR 累加需多步);cifar10 非单调。与 sparsity(图 3)并列为效率的两条轴。
 
 ### 5.4 边界与失败模式
 
