@@ -116,7 +116,14 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 
 ## 5 结果与分析
 
-### 5.1 统一发现:mc 天花板不动(figMC)
+### 5.1 JEPA / draft-revise 不抬动 mc 天花板
+
+**结果。** 表与图 1 给出各任务 5-seed 的 most-certain-tick(mc)精度:
+
+- **cifar10**:baseline 84.23±0.68%、JEPA 84.44±0.14%、draft-revise 84.06±0.90%——三者完全重叠,任二者之差 < 0.4pp,远小于 seed 间标准差。
+- **mazes**:90.05 / 89.99 / 90.29%,差值 ≤ 0.3pp,同样落在噪声内。
+- **parity**:baseline 97.02±5.11%(方差大,呈双峰),draft-revise 97.93±3.02% 仍落在该噪声带内;JEPA 在 parity 上 0-iter 崩溃(§5.4)。
+- **qamnist**:baseline 99.57%、JEPA 99.55%,几乎逐位相同(mc 已近上界)。
 
 | 任务 | baseline mc | JEPA mc | draft-revise mc |
 |---|---|---|---|
@@ -127,13 +134,17 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 
 ![图1 mc天花板](../runs/figures/ctm_paper/figMC_ceiling_0728.png)
 
-**图 1.** mc 天花板不变:各任务下 baseline / JEPA / draft-revise 的 most-certain-tick 精度全部重叠于噪声内(灰色 = 该任务上 idea 被 0-iter 杀死或未跑)。
+**图 1.** mc 天花板不变:各任务下 baseline / JEPA / draft-revise 的 mc 全部重叠于噪声内(灰色 = 该任务上方法被 0-iter 杀死或未跑)。
 
-**要点**:JEPA 与 draft-revise 在所有跑通的任务上,mc 均落在 baseline 噪声内(表 + 图 1)——二者都不抬动"最优一步"的天花板,改变的是思考过程的形状(§5.2)。parity 上 JEPA 直接 0-iter 崩溃(§5.4)。
+**分析。** 这是一个跨任务的稳健结论:两种辅助机制都无法抬动 mc 天花板。原因在于 mc 的本质——它取每个样本在整个思考过程中"最自信的一步",本质上由模型**容量**(表征能力上界)决定;JEPA 的跨 tick 一致性正则与 draft-revise 的草稿扰动只塑形思考轨迹,不增加容量,故抬不动这个上界。值得对照的是,mc 相对"跨 tick 均值"的巨大跃升(如 qamnist ~39%→99.6%)本身来自 CTM "挑最自信步"的架构红利,与这两种方法无关。正因天花板不动,下一节转向 per-tick 曲线,考察它们到底改变了什么。
 
-### 5.2 但 per-tick 曲线被抬高了(figS)
+### 5.2 per-tick 曲线:抬后期 tick, 不抬峰值
 
-以 cifar10 为例(5 seed 均值,最后一次 eval):
+**结果。** 图 2 给出 cifar10 / mazes 上 5-seed 平均的 per-tick 精度曲线(每个 thought-tick 的测试精度)。以 cifar10 为例观察到三个现象:
+
+- **曲线非单调**:baseline 精度随 tick 上升,在 tick≈19 达峰 75.3%,随后**末 tick 反跌到 45.7%**——模型在思考后期出现退化。
+- **mc 恒居曲线之上**:mc★ 84.1% 高于任何单一 tick,因为它是逐样本挑最优步,必然 ≥ 任何固定 tick。
+- **JEPA / draft-revise 抬高曲线右段**:二者末 tick 从 45.7% 升到 65.3%(+19.6)/ 62.6%(+16.9),但峰值(75→79 / 74)与 mc★(~84)基本不动——曲线被"右段抬升",天花板未破。
 
 | 模型 | 末 tick(final-tick) | 峰值 tick | mc★ |
 |---|---|---|---|
@@ -143,13 +154,17 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 
 ![图2 per-tick签名](../runs/figures/ctm_paper/figS_per_tick_signature_0728.png)
 
-**图 2.** per-tick 精度签名(cifar10 左 / mazes 右)。CTM 的逐思考步精度非单调:先升、中段见顶、末 tick 反跌;mc★ 坐在曲线之上。JEPA / draft-revise(虚线/点线)把曲线**右段(后期 tick)抬高**,但峰值与 mc★ 基本不动——"让更多 tick 对, 而非让最优 tick 更好"。
+**图 2.** per-tick 精度签名(cifar10 左 / mazes 右)。曲线非单调(中段见顶、末 tick 反跌),mc★ 坐在其上;JEPA / draft-revise 抬高曲线右段,峰值与 mc★ 不动。
 
-**要点**:CTM 的 per-tick 曲线非单调(中段见顶、末 tick 反跌),mc★ 恒居其上。JEPA / draft-revise 显著抬高曲线右段(末 tick +16~20pp),但峰值与 mc★ 不动——即"让更多 tick 可用",而非"让最优 tick 更好"。mazes 因 baseline 已饱和而看不到此效应。
+**分析。** 末 tick 退化的根源在训练目标:CTM 用 most-certain 损失优化"最自信步",并未要求末 tick 最优,模型可在后期松懈甚至漂移。JEPA 的跨 tick 一致性正则逼相邻 tick 隐状态可预测,直接抑制后期漂移;draft-revise 的"扰动后修回"同理,强制后半段轨迹稳健——故二者都把曲线右段抬起来。但峰值由容量决定(§5.1),正则/自检增加不了容量,故峰值与 mc 不动。换言之,这两种方法的真实价值不在"想得更准",而在"**想得更稳**——更多 tick 达到可用精度",这对 any-time / 早停推理有直接意义。mazes 因 baseline 已 ~90% 饱和、曲线本就平坦无退化可修,看不到此效应。
 
-### 5.3 sparsity:感知任务廉价,算法任务有边界(figE)
+### 5.3 sparsity:感知任务廉价, 算法任务有硬边界
 
-以 mc 对 r(激活比例)作 Pareto(5 seed):
+**结果。** 表与图 3 给出 mc 相对 baseline 的变化(Δpp)对 NLM 激活比例 r 的关系(5-seed):
+
+- **mazes**:r 从 0.75 降到 0.10,Δ 在 −0.5 ~ +0.6pp 之间,全程贴近 baseline;即便 r=0.1(省 90% NLM 算力)也只掉 0.5pp。
+- **cifar10**:同样平稳,Δ 在 −0.4 ~ +0.3pp,r=0.75 实测 −0.1pp。
+- **parity**:r=0.1 时 mc **暴跌 7.0pp**(97.0→90.0);但 r≥0.25 即恢复(+3.0 / −1.1 / +0.7),存在一个位于 (0.1, 0.25] 的相变边界。
 
 | 任务 | r=0.10 | 0.25 | 0.50 | 0.75 | baseline mc |
 |---|---|---|---|---|---|
@@ -159,9 +174,9 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 
 ![图3 sparsity Pareto](../runs/figures/ctm_paper/figE_sparsity_pareto_0728.png)
 
-**图 3.** sparsity 的算力-精度 Pareto(mc vs NLM 算力比例 r)。mazes / cifar10 在 r∈[0.1, 0.75] 全程贴近 baseline★(±0.6pp, 近乎免费);parity 在 r=0.1 处暴跌 7pp(算法任务硬边界)。
+**图 3.** sparsity 的算力-精度 Pareto(mc vs NLM 算力比例 r)。mazes / cifar10 全程贴近 baseline★(±0.6pp, 近乎免费);parity 在 r=0.1 处暴跌 7pp(算法任务硬边界)。
 
-**要点**:感知任务(mazes/cifar10)稀疏近乎免费——r 降至 0.1 仍 ±0.6pp,省 90% NLM 算力;算法任务 parity 有硬边界(r=0.1 暴跌 7pp,因其需全神经元逐步 XOR 累加,故 r≥0.25 才稳)。**可操作结论:对感知任务大胆压缩 NLM,对需全神经元协作的算法任务保持稠密**。
+**分析。** 感知任务对稀疏鲁棒,是因为其精度主要来自 **backbone**(resnet 已提取充分视觉特征),NLM 递归部分仅做精炼——即使每 tick 只激活 10% 神经元,backbone 加少量递归信号仍足以维持精度,说明这类任务的"思考"存在冗余。parity 恰相反:它需要对 64 位序列**逐步 XOR 累加**,运行中的奇偶状态必须**分布在整个神经元群体**上;激进稀疏(10% 神经元)会丢失中间累积,故灾难性掉点,只有保留足够比例(r≥0.25)才能维持分布式累加表示。由此得到一条可操作规则:**感知类任务可大胆压缩 NLM(省 50–90% 算力近乎免费);需全神经元分布式协作的算法类任务须保持稠密。** 再次强调,"省算力"指 NLM 层面,backbone 不稀疏化,端到端墙钟收益需 sparse kernel 才能变现。
 
 ### 5.4 边界与失败模式
 
