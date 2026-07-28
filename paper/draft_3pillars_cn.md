@@ -65,15 +65,42 @@ $$\mathcal{L} = \mathcal{L}_{task} + w \cdot \cos\_\text{loss}(\text{pred}(synch
 
 ### 3.2 草稿-修订 draft-revise(对抗式自检)
 
-**动机。** 与其"想完直接交",不如"先打草稿,再故意扰动,学着修回"。
+**动机。** 与其"想完直接交",不如"先打草稿、再故意扰动、学着修回",训练模型对自身中间状态的自检与抗扰能力。
 
-**机制。** `draft_mode="revise"` 分两阶段:先得到 draft(粗答案),再以概率 `draft_corrupt_prob` 对草稿加噪,用 `draft_revise_weight` 加权的修订损失鼓励模型从扰动中恢复正确答案。关键超参:`draft_corrupt_prob`(噪声强度)、`draft_revise_weight`、`draft_block_size`。
+**机制。** 在 CTM 的 $T$ 步思考回路中插入一个草稿边界(tick $b-1$,$b$=`draft_block_size`)。到达边界时把当前预测记为草稿 $\hat{y}_{draft}$(stop-gradient),并以概率 $p$=`draft_corrupt_prob` 对神经元状态注入高斯扰动;模型随后需从被扰动状态继续思考、修订出答案。草稿预测被额外监督为正确答案,迫使模型早期就 commit,同时靠后半段学习抗扰:
+
+$$h_{b} \leftarrow h_{b} + \epsilon,\quad \epsilon \sim \mathcal{N}(0,\sigma^2 I)\ \text{以概率}\ p$$
+
+$$\mathcal{L}_{revise} = \mathcal{L}_{task} + \lambda \cdot \mathrm{CE}\big(\hat{y}_{draft},\ y\big),\qquad \hat{y}_{draft}=\mathrm{sg}(\hat{y}_{b-1})$$
+
+```
+算法 1: draft-revise 前向与训练
+输入: 初始状态 h_0, 块大小 b, 扰动概率 p, 噪声尺度 σ, 权重 λ
+1: for t = 0 … T-1:
+2:    h_{t+1}, ŷ_t ← NLM_step(h_t)              # 思考一步, 得新状态与该 tick 预测
+3:    if t == b-1:                              # 草稿边界
+4:       ŷ_draft ← sg(ŷ_t)                      # 记草稿 (stop-grad)
+5:       if rand() < p:                         # 以概率 p 扰动状态
+6:          h_{t+1} ← h_{t+1} + ε,  ε ~ N(0, σ²·I)
+7: L_task ← CTM 的 anytime / mc 损失(全程 {ŷ_t})
+8: 返回 L = L_task + λ · CE(ŷ_draft, y)
+```
+
+超参:$b$=`draft_block_size`、$p$=`draft_corrupt_prob`、$\lambda$=`draft_revise_weight`、$\sigma{=}0.1$(固定)。仅训练时介入,**推理走标准 CTM 回路,零额外开销**。
 
 ### 3.3 稀疏激活 sparsity(效率优化)
 
-**动机。** NLM 的递归思考是 CTM 区别于普通 CNN 的核心开销。若每个 tick 只让 top-k 比例的神经元被激活更新,能否以可接受的掉点换大幅省算力?
+**动机。** NLM 的递归思考是 CTM 区别于普通前馈网络的核心开销。若每个 tick 只让一小部分神经元参与更新,能否以可接受的掉点换大幅省算力?
 
-**机制。** 设 `topk_neurons = r`,每个 tick 仅 r 比例的 NLM 神经元参与更新。算力模型:NLM 思考回路每 tick 做 ~r 的功,省 (1−r)。**backbone(resnet)不稀疏化**,故端到端墙钟加速 < (1−r),需 sparse kernel 才能真正变现。本文报告的是 NLM 算力比例 r,并明确标注该前提。
+**机制。** 每个 tick,先由 NLM 算出候选状态更新 $h^{(t)}\in\mathbb{R}^{D}$($D$=神经元数),再对其施加 **hard top-$k$ 掩码**——按绝对值保留最大的 $k$ 个分量、其余置零,作为进入下一 tick 的状态:
+
+$$\tilde{h}^{(t)} = h^{(t)} \odot \mathbf{m}^{(t)},\qquad m^{(t)}_i = \mathbb{1}\!\left[|h^{(t)}_i| \geq \tau^{(t)}\right]$$
+
+$$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lfloor r\cdot D \rfloor\big)$$
+
+其中 $r$=`topk_neurons` $\in (0,1]$ 为激活比例;$r{=}1$ 即退化为标准(稠密)CTM。
+
+**算力模型。** NLM 思考回路每 tick 做 $\sim r$ 的功,省 $(1-r)$ 的 NLM 算力。需注意:**backbone(如 resnet)不做稀疏化**,故端到端墙钟加速 $< (1-r)$,真正变现需 sparse kernel。本文报告的是 NLM 算力比例 $r$ 并明确标注该前提。
 
 ---
 
@@ -102,11 +129,9 @@ $$\mathcal{L} = \mathcal{L}_{task} + w \cdot \cos\_\text{loss}(\text{pred}(synch
 
 **图 1.** mc 天花板不变:各任务下 baseline / JEPA / draft-revise 的 most-certain-tick 精度全部重叠于噪声内(灰色 = 该任务上 idea 被 0-iter 杀死或未跑)。
 
-**结论**:JEPA 与 draft-revise 在所有跑通的任务上,mc 都落在 baseline 噪声内——**没有任何一种方法抬动了 mc 天花板**(figMC)。parity 上 JEPA 直接 0-iter 崩溃(见 §5.4)。这一统一发现表明:靠辅助正则/自检,提升不了 CTM 的"最优一步"精度;它们改变的是思考过程的形状(见 §5.2),而非天花板本身。
+**要点**:JEPA 与 draft-revise 在所有跑通的任务上,mc 均落在 baseline 噪声内(表 + 图 1)——二者都不抬动"最优一步"的天花板,改变的是思考过程的形状(§5.2)。parity 上 JEPA 直接 0-iter 崩溃(§5.4)。
 
 ### 5.2 但 per-tick 曲线被抬高了(figS)
-
-既然 mc 不动,这两种方法到底改变了什么?per-tick 精度曲线(figS)给出了答案。
 
 以 cifar10 为例(5 seed 均值,最后一次 eval):
 
@@ -120,11 +145,7 @@ $$\mathcal{L} = \mathcal{L}_{task} + w \cdot \cos\_\text{loss}(\text{pred}(synch
 
 **图 2.** per-tick 精度签名(cifar10 左 / mazes 右)。CTM 的逐思考步精度非单调:先升、中段见顶、末 tick 反跌;mc★ 坐在曲线之上。JEPA / draft-revise(虚线/点线)把曲线**右段(后期 tick)抬高**,但峰值与 mc★ 基本不动——"让更多 tick 对, 而非让最优 tick 更好"。
 
-CTM 的 per-tick 精度曲线呈**非单调**:先随思考步上升、在中间某 tick 见顶,然后**末 tick 反而下跌**(baseline 从峰值 75% 跌到 45.7%)。mc(84%)坐在整条曲线之上——它是"每个样本各自挑最好的一步",故恒高于任何固定 tick。
-
-JEPA / draft-revise 的作用是:**把曲线的右段(后期 tick)显著抬高**(末 tick +16~20pp),但峰值与 mc 基本不动。直觉解释:JEPA 的跨 tick 一致性正则逼相邻 tick 隐状态可预测 → 后期 tick 不再退化;draft-revise 的"修回"训练同理。两者都让"**更多 tick 都对**",而非"**最优 tick 更好**"——这正是它们抬不动 mc 天花板、却仍值得做的理由(更稳健的思考过程)。
-
-mazes 上曲线近乎平坦(baseline 已 ~90% 饱和,无退化可修),故看不到此效应。
+**要点**:CTM 的 per-tick 曲线非单调(中段见顶、末 tick 反跌),mc★ 恒居其上。JEPA / draft-revise 显著抬高曲线右段(末 tick +16~20pp),但峰值与 mc★ 不动——即"让更多 tick 可用",而非"让最优 tick 更好"。mazes 因 baseline 已饱和而看不到此效应。
 
 ### 5.3 sparsity:感知任务廉价,算法任务有边界(figE)
 
@@ -140,9 +161,7 @@ mazes 上曲线近乎平坦(baseline 已 ~90% 饱和,无退化可修),故看不�
 
 **图 3.** sparsity 的算力-精度 Pareto(mc vs NLM 算力比例 r)。mazes / cifar10 在 r∈[0.1, 0.75] 全程贴近 baseline★(±0.6pp, 近乎免费);parity 在 r=0.1 处暴跌 7pp(算法任务硬边界)。
 
-**感知/空间任务(mazes、cifar10)稀疏近乎免费**:r 从 1.0 降到 0.1,mc 变化都在 ±0.6pp 内,却可省 90% 的 NLM 算力。**算法任务 parity 有硬边界**:r=0.1 时 mc 暴跌 7pp——parity 需要对 64 位序列逐步 XOR 累加,激进稀疏会丢失中间累积,只有 r≥0.25 才稳定。
-
-这是本文最可操作的结论:**对感知任务大胆压缩 NLM(省 50–90% 算力几乎不掉点);对需要全神经元协作的算法任务保持稠密**。
+**要点**:感知任务(mazes/cifar10)稀疏近乎免费——r 降至 0.1 仍 ±0.6pp,省 90% NLM 算力;算法任务 parity 有硬边界(r=0.1 暴跌 7pp,因其需全神经元逐步 XOR 累加,故 r≥0.25 才稳)。**可操作结论:对感知任务大胆压缩 NLM,对需全神经元协作的算法任务保持稠密**。
 
 ### 5.4 边界与失败模式
 
