@@ -5,7 +5,9 @@
 
 > **数据来源(2026-07-28 更新)**: 下表数字来自 `paper_repro` **5-seed 复现**(`paper_repro/csv_data/repro_summary_0728.csv`, 118 run), baseline 用 repro 的 baseline 组(matched 5-seed), 而非旧的单 seed / st00 常量。分析脚本 `paper/analyze_repro_0724.py`。
 >
-> 衡量口径前提(强制): CTM 有两种打分 —— **final-tick**(只看最后一步, = `best_test_acc`)和 **most-certain-tick**(每样本挑最自信的一步, = `best_test_acc_mc`, 简称 mc)。后者天然高得多, 这是 CTM 机制本身的红利, 不是 idea 的功劳。判 idea 必须 mc 比 mc、final 比 final。
+> 衡量口径前提(强制): **主指标 = mc(most-certain-tick, `best_test_acc_mc`)** —— 每样本挑最自信的那一步, 是 CTM 论文的标准头条。mc 天然比单步高, 这是 CTM 机制本身的红利, 不归 idea。
+>
+> ⚠️ **口径更正(2026-07-28)**: 此前文档把 csv 的 `best_test_acc` 当作"final-tick"用 —— **错的**。`extract_ctm_paper_results.py` 的 `_to_scalar` 对 per-tick 数组 fallback 到 `np.mean()`, 所以 `best_test_acc` 实际是**跨 tick 均值**(且源于 bug, 非标准 metric, **不作为头条**)。真正的 per-tick 精度曲线存在 checkpoint 的 `test_accuracies` 里(由 `scripts/extract_per_tick.py` 取出, 见 `paper_repro/csv_data/per_tick_0728.json` + 签名图 figS)。判 idea 一律以 **mc 为主**, per-tick 曲线(figS)作机制说明。sparsity 的 Pareto 全程用 mc, **不受此 bug 影响**。
 
 ---
 
@@ -20,17 +22,17 @@
 - **两道防坍塌防线**: stop-gradient on target + cosine(只约束方向不约束幅度)。
 - 作为**辅助损失**加到主任务 loss, **零推理开销**(predictor 只训练时用)。
 
-### 实验证据(5-seed 复现, 0724)
-| 任务 | 配置 | final-tick Δ | mc Δ | n |
+### 实验证据(5-seed 复现, mc 主口径; 0728)
+| 任务 | 配置 | mc Δ(主指标) | n | per-tick 说明 |
 |---|---|---|---|---|
-| cifar10 | w=0.1 | **+4.5pp** (73.6% vs 69.0%) | +0.2pp(中性) | 5 |
-| qamnist | w=0.5 | **+9.0pp** (47.9% vs 38.8%) | -0.0pp(中性) | 5 |
-| mazes | w=0.1 | +0.0pp(中性, baseline 已 89% 饱和) | -0.1pp | 5 |
+| cifar10 | w=0.1 | +0.2pp(中性) | 5 | mc 天花板未抬; 但 per-tick 曲线**后期 tick 被大幅抬高**(末 tick 45.7→65.3, +19.6pp, 见 figS) |
+| qamnist | w=0.5 | -0.0pp(中性) | 5 | mc 已近饱和(99.6%), 无天花板可抬 |
+| mazes | w=0.1 | -0.1pp(中性) | 5 | baseline 已 ~90% 饱和 |
 
 ### 关键洞察
-- **JEPA 抬的是 final-tick(最后一步), 不抬 mc 天花板**。这是它的设计使然: 让"更多 tick 都对", 但最优 tick 由容量决定。复现干净复现了这个机制(cifar10/qamnist final 显著正, mc 处处平)。
-- **任务相关**: 视觉感知任务(cifar10/qamnist, 隐状态质量是瓶颈)受益; 序列任务不兼容(parity/sort 是 idea 坟场, JEPA 在 parity 上 0-iter killed)。
-- 旧报告 cifar10 "+7.5pp" 是因旧 baseline(66.9%)偏低; matched 5-seed baseline 69.0% 下, 真实增益 +4.5pp, 方向稳健、4/5 seed 上升。
+- **JEPA 不抬 mc 天花板(处处中性), 但把 per-tick 精度曲线的后期部分抬高**(cifar10 末 tick +19.6pp) —— 即让"更多 tick 都对", 而非"最优 tick 更好"。签名图 `figS_per_tick_signature_0728.png` 是直接证据: 三模型 mc★ 都~84%, 但 JEPA 的曲线右端(后期 tick)明显高于 baseline。
+- **这是 JEPA 设计的必然**: 跨 tick 一致性正则逼相邻 tick 的隐状态可预测 → 后期 tick 不再退化 → 末 tick 精度回升。但最优 tick(由容量决定)不动, 故 mc 平。
+- **任务相关**: 视觉感知任务(cifar10/qamnist, 隐状态质量是瓶颈)才看得到曲线变化; 序列任务不兼容(parity/sort 是 idea 坟场, JEPA 在 parity 上 0-iter killed)。
 
 ### 代码
 - `baseline/utils/jepa.py` — predictor 定义 + `compute_jepa_loss`
@@ -49,17 +51,17 @@ CTM 正常是"思考完直接交答案"; draft-revise 改成**先出草稿, 再�
 - 关键超参: `draft_corrupt_prob`(噪声强度)、`draft_revise_weight`(修订 loss 权重)、`draft_block_size`。
 - 修订 loss 鼓励模型从被扰动的草稿恢复出正确答案, 训练出"自检"能力。
 
-### 实验证据(5-seed 复现, 0724)
-| 任务 | 配置 | final-tick Δ | mc Δ | n |
+### 实验证据(5-seed 复现, mc 主口径; 0728)
+| 任务 | 配置 | mc Δ(主指标) | n | per-tick 说明 |
 |---|---|---|---|---|
-| parity | w=0.1, cp=0.15 | **+2.5pp** (72.1% vs 69.7%) | +0.9pp(中性) | 5 |
-| cifar10 | w=0.2, cp=0.3 | +1.8pp (70.8% vs 69.0%) | -0.2pp(中性) | 5 |
-| mazes | w=0.1, cp=0.15 | +0.4pp(中性) | +0.3pp(中性) | 5 |
+| parity | w=0.1, cp=0.15 | +0.9pp(中性) | 5 | mc 天花板未抬(parity 无 per-tick 数据, 存标量) |
+| cifar10 | w=0.2, cp=0.3 | -0.2pp(中性) | 5 | mc 未抬; per-tick 后期 tick 抬高(末 tick 45.7→62.6, +16.9pp, 见 figS) |
+| mazes | w=0.1, cp=0.15 | +0.3pp(中性) | 5 | baseline 饱和 |
 
 ### 关键洞察
-- **revise 抬的是 final-tick, 不抬 mc 天花板**(和 JEPA 同性质)。在 parity 上 final +2.5pp(3/5 seed 上升), 是它最稳的正信号。
+- **revise 不抬 mc 天花板**(和 JEPA 同性质); 在 cifar10 上 per-tick 曲线后期也被抬高(末 tick +16.9pp, figS), 机制与 JEPA 相似 —— "让更多 tick 对", 非抬最优 tick。
 - **⚠️ 重要更正**: 此前文档声称 "parity mc +10pp(0.882→0.984), 唯一抬动 mc 天花板的 win" —— **5-seed 复现证伪**。根因: 旧 baseline `0.882` 是**单颗坏种子**(s0); matched 5-seed baseline = `0.970`(双峰: s0=0.882 拉低, 其余 ~1.0)。对照公平 baseline, revise mc `0.979` 仅 +0.9pp(噪声内)。per-seed 显示 revise 抬的是**地板**(把坏种 s0 从 88→93)而非**天花板**(好种子两边都 ~100)。" +10pp" 是拿 revise 均值比 baseline 最差种子的口径错误。
-- **副作用小**: cifar10/mazes 上 delta 在 ±0.3pp 内, 低风险。
+- **副作用小**: cifar10/mazes 上 mc delta 在 ±0.3pp 内, 低风险。
 
 ### 代码
 - `baseline/utils/dtt_ideas.py` — draft_mode 实现
@@ -101,14 +103,14 @@ CTM 正常是"思考完直接交答案"; draft-revise 改成**先出草稿, 再�
 
 | 块 | 性质 | 衡量口径 | 证明什么 |
 |---|---|---|---|
-| **JEPA** | 涨精度(final) | final-tick | CTM 隐状态可被正则化得更连贯, 改善最后一步预测(cifar10 +4.5, qamnist +9.0) |
-| **revise** | 涨精度(final) | final-tick | CTM 的"草稿-修订"思考能改善需要核对的任务(parity final +2.5), 但**不抬 mc 天花板** |
-| **sparsity** | 省算力 | Pareto(精度 vs r) | CTM 神经元稀疏激活对感知任务廉价(mazes/cifar10 近乎免费), 算法任务有边界(parity r=0.1 崩) |
+| **JEPA** | 改 per-tick 曲线形状 | mc(主)+ per-tick 图 | 不抬 mc 天花板, 但把后期 tick 抬高(cifar10 末 tick +19.6pp, figS) —— "让更多 tick 对" |
+| **revise** | 改 per-tick 曲线形状 | mc(主)+ per-tick 图 | 同上性质(cifar10 末 tick +16.9pp); parity mc +10pp 头条已证伪, 降为中性 |
+| **sparsity** | 省算力 | Pareto(mc vs r) | CTM 神经元稀疏激活对感知任务廉价(mazes/cifar10 近乎免费), 算法任务有边界(parity r=0.1 崩) |
 
-三个方法**互补不冲突**: JEPA/revise 改善表示/推理的最终预测质量(final-tick), sparsity 改善效率。可在不同任务/不同目标下分别启用。
+三个方法**互补不冲突**: JEPA/revise 改善 per-tick 曲线后期(让 CTM 思考更连贯/自检, 但不抬 mc 天花板), sparsity 改善效率。可在不同任务/不同目标下分别启用。
 
 ### 共同的边界 / 失败模式(写论文要诚实交代)
-- **parity 是 idea 坳场**: JEPA/halt/EMA/reflex 全 killed(0-iter, break 训练)。**仅 revise 和 sparsity 活下来**(revise 抬 final, sparsity r≥0.25 可用但 r=0.1 崩)。
+- **parity 是 idea 坳场**: JEPA/halt/EMA/reflex 全 killed(0-iter, break 训练)。**仅 revise 和 sparsity 活下来**(revise mc 中性但 per-tick 改善; sparsity r≥0.25 可用但 r=0.1 崩)。
 - **sort 极度脆弱**: tick1-25 全崩(需 tick50), 所有 combo idea 退化到魔数, heads/sparsity/nst 参数对 sort inert(wiring 残缺)。
-- **mc 机制本身是最大红利**: qamnist final 21%→mc 99.6%, 这归 CTM 架构, 不归任何 idea。
-- **revise 的 mc 天花板效应已被复现证伪**: 任何"revise 抬 mc"的旧表述一律以本文档为准(改为抬 final)。
+- **mc 机制本身是最大红利**: qamnist 跨 tick 均值 ~39%→mc 99.6%, 这归 CTM 架构, 不归任何 idea。
+- **revise 的 mc 天花板效应已被复现证伪**: 任何"revise 抬 mc"的旧表述一律以本文档为准(改为: 抬后期 tick 见 figS, 不抬 mc)。

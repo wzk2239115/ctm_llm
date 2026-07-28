@@ -7,6 +7,24 @@
 
 ---
 
+## 2026-07-28 — 口径 bug 发现 + per-tick 签名图 + cifar10 sparsity r=0.75 补全
+
+- **思路(用户提供)**: 准备画图/写稿前, 决定补 CTM "逐 thought-tick 精度" 签名图(展示 CTM 单次推理内精度如何随思考步收敛 + mc 在哪)。写 eval 脚本时发现训练 loop 早把 per-tick 精度数组存进 checkpoint, 直接读即可。读的过程中**暴露了一个口径 bug**。
+- **配置/发现**:
+  1. `scripts/extract_per_tick.py`(新, 无 GPU 读 checkpoint)→ `paper_repro/csv_data/per_tick_0728.json`。cifar10/mazes 有 per-tick 数组; parity/qamnist 存标量(被跳过)。
+  2. **口径 bug**: `extract_ctm_paper_results.py:59` 的 `_to_scalar` 对多 tick 数组 fallback 到 `np.asarray(x).mean()` → csv 里的 `best_test_acc` **实为"跨 tick 均值"**, 不是此前以为的 final-tick。`best_test_acc_mc`(标量)不受影响, **全对**。验证: cifar10 baseline per-tick 曲线均值=70.0% ≈ csv best_test_acc 69.04。
+  3. 顺带补全 cifar10 sparsity r=0.75(此前 5 seed 全欠训到 ~36%): 满 200k 后 mc Δ -0.1pp → cifar10 全 r 免费确认, 前沿闭合(`figE_sparsity_pareto_0728`)。
+- **预期**: 签名图讲清 final/best/mc 三者关系; 核对口径。
+- **结果**:
+  - **核心结论全安全**(都走 mc): sparsity Pareto、revise "mc +10pp 不复现"、JEPA "mc 不动" —— 不受影响。
+  - **per-tick 反而强化了 JEPA/revise**: cifar10 末 tick baseline 45.7% → jepa 65.3(+19.6pp)/ revise 62.6(+16.9), 但 mc★ 都~84% 不动。即 JEPA/revise **抬后期 tick、不抬 mc 天花板**。签名图 `figS_per_tick_signature_0728.png`。
+- **结论**:
+  1. **改以 mc 为唯一主指标**, per-tick 曲线(figS)作机制说明; "跨 tick 均值"(bug 产物)不进论文头条。VERIFIED_CONCLUSIONS 三块的口径前提 + JEPA/revise 表已据此更正。
+  2. 签名图是 CTM 最有说服力的图: 非单调 per-tick 曲线(先涨后跌) + mc 坐在曲线上方, 一图讲清 mc≠final。
+- **下一步**: 用现有 csv + per_tick json + figE/figS 开始画其余图 + 写中文初稿。不再加实验。
+
+---
+
 ## 2026-07-24 — paper_repro 5-seed 三支柱复现 + sparsity gap-fill (cifar10/parity r-sweep)
 
 - **思路(用户提供)**: VERIFIED_CONCLUSIONS 第三块(sparsity)原写着"cifar10/parity 缺完整 r sweep, 暂不判" —— 这是论文三支柱里唯一的明确数据缺口。用 `paper_repro/run_overnight.py --stream sparsity-gap` 在算力机(ctm-2-0, 共享 fs)补跑 cifar10 + parity 的 r∈{0.1,0.25,0.5,0.75} × 5 seed。同时, paper_repro 本身已是 80-run 5-seed 三支柱复现(baseline/jepa/revise 全任务)—— 借这次收菜**一并核验三支柱头条是否在 matched 5-seed baseline 下复现**(AGENTS.md 口径: 不能拿旧单 seed 常量当 baseline)。
