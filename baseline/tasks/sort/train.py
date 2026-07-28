@@ -218,6 +218,7 @@ if __name__=='__main__':
 
     # Set idea attributes on model
     model.topk_neurons = args.topk_neurons
+    model.sparse_nlm_compute = args.sparse_nlm_compute
     model.async_tick_mode = args.async_tick_mode
     model.async_tick_periods = args.async_tick_periods
     model.async_tick_phases = args.async_tick_phases

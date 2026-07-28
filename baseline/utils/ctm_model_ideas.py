@@ -13,6 +13,65 @@ def apply_topk_sparsity(x, topk_fraction, stepi):
     return x * mask
 
 
+def select_active_neurons(state, topk_fraction):
+    """Pick the k active neurons shared across the whole batch, by mean|state|.
+
+    Shared (not per-sample) active set => uniform column gather => the einsum
+    literally runs on k columns, giving a real ~k/N FLOP reduction (measurable,
+    no custom sparse kernel needed).
+    state: (B, N) synapse output at the current tick. Returns sorted LongTensor (k,).
+    """
+    N = state.size(-1)
+    k = max(1, int(N * topk_fraction))
+    if k >= N:
+        return None
+    importance = state.abs().mean(dim=0)            # (N,) batch-aggregate magnitude
+    idx = torch.topk(importance, k).indices
+    return idx.sort().values
+
+
+def nlm_sparse_forward(trace_processor, state_trace, active_idx):
+    """Run the NLM (trace_processor) computing ONLY the active neurons.
+
+    Replays the Sequential (SuperLinear -> GLU -> SuperLinear -> GLU -> Squeeze,
+    or the shallow variant) on the gathered neuron subspace, then scatters the
+    (B, k) result back into a (B, N) tensor with inactive neurons = 0.
+    SuperLinear receives active_idx (real gather on its weights); the GLU/Squeeze
+    are feature-dim ops and work unchanged on the (B, k, *) subspace.
+    """
+    mods = []
+
+    def collect(m):
+        if isinstance(m, nn.Sequential):
+            for c in m.children():
+                collect(c)
+        else:
+            mods.append(m)
+    collect(trace_processor)
+
+    out = state_trace[:, active_idx, :]               # gather input ONCE: (B, k, M)
+    for m in mods:
+        if m.__class__.__name__ == 'SuperLinear':
+            out = m(out, active_idx=active_idx)       # gather THIS layer's weights
+        else:
+            out = m(out)                              # GLU/Squeeze/etc, neuron-agnostic
+    B, N = state_trace.shape[0], state_trace.shape[1]
+    full = out.new_zeros((B, N))
+    full[:, active_idx] = out
+    return full
+
+
+def apply_sparse_nlm(trace_processor, state_trace, state, topk_fraction):
+    """Real sparse NLM compute. Returns (B, N) activated_state with only the
+    selected k neurons computed (rest zero). Falls back to dense if k>=N.
+    """
+    idx = select_active_neurons(state, topk_fraction)
+    if idx is None:
+        return trace_processor(state_trace)
+    return nlm_sparse_forward(trace_processor, state_trace, idx)
+
+
+
 def get_async_tick_mask(stepi, num_neurons, async_tick_periods, async_tick_phases, device='cpu'):
     """Return boolean mask [num_neurons] indicating which neurons are active at stepi.
     Band 0: always active. Band k: active every periods[k] ticks, starting at phase[k].
@@ -121,6 +180,10 @@ def add_all_idea_args(parser):
 
     parser.add_argument("--topk_neurons", type=float, default=1.0,
                         help="Fraction of neurons to keep active (top-k sparsity)")
+    parser.add_argument("--sparse_nlm_compute", action="store_true", default=False,
+                        help="Real sparse NLM compute: select k neurons and run SuperLinear "
+                             "only on them (gather/scatter). Saves ~k/N NLM FLOPs. "
+                             "Default off = legacy post-hoc mask (no FLOP saving).")
 
     parser.add_argument("--async_tick_mode", type=str, default="none", choices=["none", "banded"],
                         help="Async tick mask mode")

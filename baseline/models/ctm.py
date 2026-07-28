@@ -7,7 +7,7 @@ from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 from baseline.models.modules import ParityBackbone, SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
 from baseline.models.resnet import prepare_resnet_backbone
 from baseline.models.utils import compute_normalized_entropy
-from baseline.utils.ctm_model_ideas import apply_topk_sparsity, get_async_tick_mask, should_halt
+from baseline.utils.ctm_model_ideas import apply_topk_sparsity, get_async_tick_mask, should_halt, apply_sparse_nlm
 
 from baseline.models.constants import (
     VALID_NEURON_SELECT_TYPES,
@@ -608,6 +608,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
         # --- Read idea config attributes (set by training script) ---
         topk = getattr(self, 'topk_neurons', 1.0)
+        sparse_nlm = getattr(self, 'sparse_nlm_compute', False)
         async_mode = getattr(self, 'async_tick_mode', 'none')
         async_periods = getattr(self, 'async_tick_periods', None)
         async_phases = getattr(self, 'async_tick_phases', None)
@@ -748,14 +749,21 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 # --- Apply Neuron-Level Models (standard or differentiated) ---
                 if nlm_diff is not None:
                     activated_state = nlm_diff(state_trace)
+                    # --- Top-k Sparsity (post-hoc mask; fallback for nlm_diff path) ---
+                    if topk < 1.0:
+                        activated_state = apply_topk_sparsity(activated_state, topk, stepi)
+                elif sparse_nlm and topk < 1.0:
+                    # --- Real sparse NLM compute: select k neurons from synapse
+                    # output `state`, run SuperLinear only on them (gather/scatter).
+                    # Saves ~k/N of the NLM einsum FLOPs (measurable, no sparse kernel).
+                    activated_state = apply_sparse_nlm(trace_proc, state_trace, state, topk)
                 else:
                     activated_state = trace_proc(state_trace)
+                    # --- Top-k Sparsity (post-hoc mask; legacy default) ---
+                    if topk < 1.0:
+                        activated_state = apply_topk_sparsity(activated_state, topk, stepi)
                 if async_mask is not None:
                     activated_state = activated_state * async_mask.unsqueeze(0).float()
-
-                # --- Top-k Sparsity ---
-                if topk < 1.0:
-                    activated_state = apply_topk_sparsity(activated_state, topk, stepi)
 
                 # --- Hierarchical: H-level update every l_cycles ticks ---
                 if z_H is not None and (stepi + 1) % eff_l_cycles == 0:

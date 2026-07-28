@@ -208,15 +208,29 @@ class SuperLinear(nn.Module):
         # Learnable temperature/scaler T
         self.register_parameter('T', nn.Parameter(torch.Tensor([T]))) 
 
-    def forward(self, x):
+    def forward(self, x, active_idx=None):
         """
         Args:
             x (torch.Tensor): Input tensor, expected shape (B, N, in_dims)
                               where B=batch, N=d_model, in_dims=memory_length.
+            active_idx (torch.LongTensor, optional): If given, compute the NLM
+                              for ONLY these k neurons (real sparse compute: the
+                              einsum runs on k columns instead of N, saving ~k/N
+                              of the FLOPs). Shape (k,). None = dense (all neurons).
         Returns:
-            torch.Tensor: Output tensor, shape (B, N) after squeeze(-1).
+            torch.Tensor: Output tensor, shape (B, N) after squeeze(-1), or
+                          (B, k) when active_idx is given (caller scatters back).
         """
         # Input shape: (B, D, M) where D=d_model=N neurons in CTM, M=history/memory length
+        if active_idx is not None:
+            # x is ALREADY the gathered subspace (B, k, M) [caller gathers once];
+            # here we gather only THIS layer's weights to the k active neurons.
+            w = self.w1[:, :, active_idx]            # (M, H, k)
+            b = self.b1[:, active_idx, :]            # (1, k, H)
+            out = self.dropout(x)
+            out = self.layernorm(out)                # LN across M, per-neuron (no cross-neuron mix)
+            out = torch.einsum('BDM,MHD->BDH', out, w) + b
+            return out.squeeze(-1) / self.T
         out = self.dropout(x)
         # LayerNorm across the memory_length dimension (dim=-1)
         out = self.layernorm(out) # Shape remains (B, N, M)
