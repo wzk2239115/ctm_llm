@@ -23,7 +23,7 @@ plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Noto Sans CJK JP", "Deja
 plt.rcParams["axes.unicode_minus"] = False
 
 ROOT = Path(__file__).resolve().parents[1]
-CSV = ROOT / "paper_repro" / "csv_data" / "repro_summary_0728.csv"
+CSV = ROOT / "paper_repro" / "csv_data" / "repro_summary_fixes.csv"
 FIG_DIR = ROOT / "runs" / "figures" / "ctm_paper"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -92,13 +92,14 @@ def main():
                 if notes[j]:
                     ax.text(x[j] + offs, 1.5, notes[j], ha="center", va="bottom",
                             fontsize=6.5, color=col, style="italic")
-        # highlight parity-sparsity (the ceiling raise)
+        # annotate sparsity-parity honestly: delta vs baseline (now negative = hard boundary)
         if stage == "sparsity":
             j = TASKS.index("parity")
             if present[j]:
                 base_v = mean(g.get(("baseline", "parity"), [0]))
-                ax.annotate(f"+{means[j]-base_v:.1f}pp\n抬动天花板!",
-                            (x[j] + offs, means[j] + errs[j] + 3),
+                d = means[j] - base_v
+                lab = f"{d:+.1f}pp\n(硬边界, 无甜点)"
+                ax.annotate(lab, (x[j] + offs, means[j] + errs[j] + 3),
                             ha="center", fontsize=8.5, color="#d62728",
                             fontweight="bold")
     ax.set_xticks(x)
@@ -106,14 +107,14 @@ def main():
                         for t in TASKS])
     ax.set_ylabel("most-certain-tick accuracy (%)", fontsize=10)
     ax.set_ylim(0, 108)
-    ax.set_title("mc 天花板: JEPA/draft-revise 不抬动; 但 sparsity 在 parity(r=0.25)"
-                 " 反而抬动至 ~100% (+3pp)\n(感知任务 cifar10/mazes 全平; "
-                 "parity-sparsity 作正则稳定训练, 消除双峰失败)",
-                 fontsize=11, fontweight="bold")
+    ax.set_title("mc 天花板 (真稀疏 sparsity + detach-fix revise)\n"
+                 "JEPA 不抬动; draft-revise 在 cifar10 微抬(anytime 极早承诺); "
+                 "sparsity 感知任务近免费、parity 硬边界(各 r 全负, 无甜点)",
+                 fontsize=10.5, fontweight="bold")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(loc="lower right", fontsize=10)
     fig.tight_layout()
-    p = FIG_DIR / "figMC_ceiling_0728.png"
+    p = FIG_DIR / "figMC_ceiling_fixes.png"
     fig.savefig(p, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"[fig] -> {p}")

@@ -14,17 +14,19 @@
   1. **draft-revise fix** (`c0d1d38`): `baseline/models/ctm.py:807` 等 3 处 `draft_pred = current_prediction.detach()` → 去 `.detach()`, CE 现在有梯度 (deep supervision)。两步走 PASS (Step1 requires_grad=True / 29 参数有梯度; Step2 w=0.1 vs w=0.0 同 seed checksum 分叉)。**附带发现**: parity 的 draft CE 被 shape guard 跳过 (dp (B,128) vs targets (B,64)) → parity revise 一直=纯噪声, fix 对它无影响; cifar10/mazes/qamnist 的 CE 正常。
   2. **sparsity 真 sparse NLM compute** (`349c797`/`610f97b`): SuperLinear 加 `active_idx` (gather 权重 + 输入一次 gather), `nlm_sparse_forward` 只算 k 个神经元, `--sparse_nlm_compute` flag (旧 post-hoc 保留对照)。两步走 PASS (正确性 active=稠密逐位相等; 加速 NLM 前向 **1.71x @r=0.25 dev**; 分叉 flag 非 inert)。
   3. **重跑** (`paper_repro/run_rerun_fixes.py`, 70 runs): cifar10/mazes revise (detach fix) + cifar10/mazes/parity sparsity 真稀疏 × 5 seed。另补 qamnist revise 5 seed + parity r=0.25 s2 (CUDA 启动崩, 单独补)。算力机 ~4.5 天, 69 ok + 1 viz-crash(数据全在)。
-- **预期**: (a) draft-revise fix 后 mc 变 OR 不变(印证"不抬天花板"); (b) sparsity 真稀疏下"近免费"是否成立; (c) parity r=0.25 正则甜点是否抗住真省算力。
-- **结果** (mc 口径, 5 seed):
-  - **draft-revise fix 生效但不抬 mc**: cifar10 revise mc 84.06→**84.06**, mazes 90.29→**90.29** (逐位不变); 但 cifar10 final-tick 62.6%→~68% → **CE 确实接上了, 只是没抬 mc 天花板**, 反而印证论文 thesis。
-  - **sparsity 真稀疏 = post-hoc 精度 + 真省算力**: parity r=0.25 it/s **10.50 vs baseline 5.99 = 1.75x** (= dev NLM 1.71x, 铁证 `--sparse_nlm_compute` 生效)。精度: cifar10/mazes 各 r ≈ baseline (近免费✓); parity r=0.25 仍 **~100%** (正则甜点抗住真省算力✓), r=0.1 仍崩 ~90% (硬边界✓)。
-  - **qamnist revise (新补)**: mc 99.55 ≈ baseline (饱和, 无效果)。
-  - baseline/jepa 逐位复现旧值 (fix 不影响, 佐证对照干净)。
+- **结果** (mc 口径, 5 seed; 注: 本条早期曾误报, 下面是 flat→group 修正路径后拿到的**真新数据**):
+  - **draft-revise(detach-fix)机制翻转**: cifar10 revise mc 84.06→**84.68**(+0.45pp, 种子方差 0.61→0.19 收窄); per-tick 从"缓升末跌(peak@tick18)"翻成"**tick1 极早承诺**"(tick1 0.44→0.85, deep supervision 真正生效), 代价是后期退化(末 tick 0.63→0.41)。mazes revise ~持平。
+  - **sparsity 真稀疏——parity 甜点证伪!** 旧 post-hoc 的 r=0.25 "+3pp ~100%" 在真稀疏下变 **−1.5pp(95.47)**; parity 各 r **全负**(r=0.1 崩 −16, r=0.25/0.5/0.75 = −1.5/−4/−1.8)。cifar10/mazes 近免费(±0.9pp)仍成立。
+  - **qamnist revise**: mc 99.55 ≈ baseline(饱和)。
+  - baseline/jepa 逐位复现旧值(fix 不影响)。
 - **结论**:
-  1. **三个头条结论全部扛住两处 fix + 真稀疏**: parity r=0.25 正则甜点 ~100% / 感知任务近免费 / draft-revise 不抬 mc 天花板 —— 论文技术地基稳固。
-  2. **审稿人 #1/#3 代码级解决** (detach + 真 sparse compute, 均带两步走验证 + 实测加速); **#2 纯文字修正** (mc "必然≥"→"经验上高于"); #4 parity n 已补 s2 (n=5), 但双峰 + 仅 5 seed, 仍建议扩到 10-20。
-  3. parity revise 的"=噪声"是 shape guard 的 latent bug, 论文需诚实标注 (draft-revise 在 parity 上=纯噪声注入, CE 未接上)。
-- **下一步**: 推 `repro_summary_fixes.csv`/`per_tick_fixes.json` 到 dev; 重做 figE (加 latency 轴: x=r, 双 y mc+it/s) + figS (新 revise 曲线); 改稿 #2/#7/#8 + 相关工作 + qamnist revise 行。
+  1. **真新数据下的结论**: draft-revise = anytime 极早承诺(deep supervision, cifar10 mc 微抬); sparsity = 感知近免费 / 算法硬边界(**parity 甜点证伪**, 比 post-hoc 版更干净诚实, 无悖论)。论文 §5.1/§5.3/摘要/§7 + figE/figMC/figS 全已据此重写。
+  2. **审稿 #1/#3 代码级解决**(detach + 真 sparse compute, 两步走验证); **#2 文字修正**(mc "必然≥"→"经验上高于")。
+  3. parity revise = 纯噪声(shape guard 跳过 CE); 论文已标注。
+- **踩坑(重要教训)**:
+  1. **run_all 写 flat(`log_root/exp.name`)、extract 读 group(`logs/revise/...`)——路径不匹配**, 导致前两次收菜读到的全是 7/11 旧数据, 误报"三个头条全扛住 + 1.75x 加速"。改 flat→group 后才拿到真新数据, 发现 parity 甜点证伪。
+  2. **it/s `tail -1` 抓到 plotting/UMAP 阶段**(log 里 431917 个 it/s 多数来自 Plotting), 不是训练速度——"1.75x 训练加速"是假象。dev 隔离 NLM 微基准 1.71x 仍有效; 真训练 it/s 需用 Tracking 行重测。
+- **下一步**: 用 Tracking 行重测 parity 真训练 it/s(补 figE latency); parity 扩到 10-20 seed(双峰 + 甜点已死, 需更稳的边界估计); sort 修 wiring 或从结论删除。
 
 ---
 

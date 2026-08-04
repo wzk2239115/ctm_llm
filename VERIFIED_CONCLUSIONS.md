@@ -11,8 +11,8 @@
 
 > ⚠️ **审稿硬伤修复(2026-08-04)**: ChatGPT 审稿指出三硬伤, 已逐条核实并代码级修复(见 `EXPERIMENT_LOG.md` 0804 条):
 > 1. **draft-revise CE 曾零梯度**: `draft_pred = current_prediction.detach()` 使 `CE(detach, y)` 对参数梯度恒零(草稿监督从未生效)。已去 `.detach()`(`c0d1d38`), CE 现为真 deep supervision。重跑后 **mc 仍逐位不变**(cifar10 84.06/mazes 90.29), 印证"revise 不抬 mc 天花板"thesis; final-tick 则被抬高(62.6→~68)。**附带**: parity 的 draft CE 被 shape guard 跳过(dp (B,128) vs tgt (B,64)), 故 parity revise 一直=纯噪声注入, 与 detach 无关。
-> 2. **sparsity 曾不省算力**: post-hoc top-k 掩码在 NLM 算完后才做, FLOPs 没省。已实现真 sparse NLM compute(SuperLinear gather/scatter, `--sparse_nlm_compute`, `349c797`)。实测 **parity r=0.25 it/s 10.50 vs baseline 5.99 = 1.75x**(=dev NLM 前 1.71x)。重跑后**精度≈旧 post-hoc**: 近免费 + parity 甜点 ~100% 全部扛住真省算力。
-> 3. 三头条结论(parity 甜点 / 感知近免费 / revise 不抬天花板)**全部在两处 fix + 真稀疏下复现**, 论文技术地基稳固。
+> 2. **sparsity 曾不省算力**: post-hoc top-k 掩码在 NLM 算完后才做, 不省 FLOPs。已实现真 sparse NLM compute(SuperLinear gather/scatter, `--sparse_nlm_compute`, `349c797`); 隔离 NLM 微基准 1.71x(@r=0.25)。**但真稀疏重跑推翻了 parity 甜点**: 旧 post-hoc 的 r=0.25 "+3pp ~100%" 在真稀疏下变 −1.5pp(95.47), parity 各 r 全负(见下表)。cifar10/mazes 近免费两版一致。
+> 3. **真新数据下的结论**: draft-revise 去 detach 后机制翻转为 anytime 极早承诺(cifar10 mc 微抬 +0.45); sparsity 感知近免费 / parity 硬边界(**甜点证伪**, 比 post-hoc 版更干净); JEPA 不变(抬后期 tick, mc 平)。
 
 ---
 
@@ -84,18 +84,18 @@ CTM 正常是"思考完直接交答案"; draft-revise 改成**先出草稿, 再�
 - `topk_neurons = r`: 每个 tick 只有 r 比例的 NLM 神经元被激活更新。
 - **算力模型(⚠️ 0804 升级)**: 旧实现是**事后掩码**(NLM 算完稠密结果再 top-k 置零), **不省 FLOPs**(连理论都不省)。已实现**真 sparse NLM compute**(`--sparse_nlm_compute`, SuperLinear gather/scatter, `349c797`): 用当前 tick synapse 输出按 batch-平均 |state| 选 top-k, 只对 k 个神经元跑 einsum, 省 ~k/N 的 NLM FLOPs。**实测 parity r=0.25 it/s 10.50 vs baseline 5.99 = 1.75x**(=dev NLM 前 1.71x)。backbone(resnet)仍不稀疏, 端到端加速 < NLM 加速。重跑后精度≈旧 post-hoc, 下表 mc Δ 不变。
 
-### 实验证据(Pareto, mc 口径, 5-seed 复现 0728)
+### 实验证据(Pareto, mc 口径, 5-seed, **真稀疏 sparse_nlm 重跑 0804**)
 | 任务 | r=0.10 | 0.25 | 0.50 | 0.75 | baseline mc |
 |---|---|---|---|---|---|
-| **mazes** | -0.5 | +0.2 | +0.6 | +0.2 | 90.0% |
-| **cifar10** | -0.4 | +0.1 | +0.3 | -0.1 | 84.2% |
-| **parity** | **-7.0** | +3.0 | -1.1 | +0.7 | 97.0% |
+| **mazes** | -0.0 | -0.9 | +0.3 | +0.1 | 90.0% |
+| **cifar10** | +0.1 | +0.5 | +0.3 | +0.1 | 84.2% |
+| **parity** | **-16.4** | -1.6 | -4.1 | -1.8 | 97.0% |
 
-> cifar10 r=0.75: 已补跑至满 200k iter(0728), mc Δ -0.1pp(此前欠训致假象 -1.6pp 已修正)。parity r=0.25/0.75 各 4 seed(2 个 CUDA 失败); cifar10 r=0.5 为 4 seed(1 个欠训剔除)。sort r=0.5 = -0.3pp(旧"-12pp 大坑"不复现, 但 sort 仅 1 个 r + inert 嫌疑, 不作前沿点)。
+> ⚠️ **此表为真稀疏(sparse_nlm_compute)重跑结果, 与旧 post-hoc 版差异大**: 旧 post-hoc parity r=0.25 曾 +3.0pp(像"正则甜点"), 但真稀疏下变 −1.6pp、各 r **全负**——证实旧"+3pp"是"算完稠密 NLM 再置零"的事后掩码假象。cifar10/mazes 近免费两版一致。
 
 ### 关键洞察
-- **视觉/空间任务稀疏近乎免费**: mazes 全 r(0.1–0.75)都在 baseline ±0.6pp 内; cifar10 全 r(0.1–0.75)在 ±0.4pp 内。即"省 25–90% NLM 算力几乎不掉点"。
-- **算法任务有硬边界**: parity 在 r=0.1 崩(mc -7pp)。parity = 64 长二进制序列逐步 XOR 累加, 需要全量神经元参与每一步, 激进稀疏会丢失中间累积。r≥0.25 才稳。
+- **视觉/空间任务稀疏近乎免费**: mazes/cifar10 全 r(0.1–0.75)都在 baseline ±0.9pp 内。即"省 50–90% NLM 算力几乎不掉点"。
+- **算法任务硬边界(真稀疏下更干净, 无甜点)**: parity 各 r **全部劣于 baseline**(r=0.1 崩 −16pp; r≥0.25 也 −1.5~−4pp)。parity = 64 位序列逐步 XOR 累加, 需全量神经元协作, 真稀疏(只算 k 个)处处破坏之。**旧 post-hoc 版的 r=0.25 "+3pp 甜点"在真稀疏下证伪**——更诚实的结论是"算法任务无白赚的 r"。
 - **任务差异是论文的诚实卖点**: 不是"稀疏万能", 而是"感知任务廉价的递归思考可被大幅压缩; 需要全神经元协作的算法任务不行"。
 - **诚实前提**: 省的是 NLM(CTM 递归思考部分, 是 CTM 区别于普通 CNN 的核心开销), 不是 backbone。真正变现需 sparse kernel。
 
