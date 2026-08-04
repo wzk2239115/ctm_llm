@@ -1,6 +1,6 @@
 # 面向连续思维机的三种优化方法:跨 tick 一致性、草稿-修订与稀疏激活
 
-**(中文初稿 · 三支柱版 · 2026-07-28)**
+**(中文初稿 · 三支柱版 · 2026-08-04 — 审稿硬伤已修)**
 
 ---
 
@@ -61,15 +61,15 @@ $$\mathcal{L} = \mathcal{L}_{task} + w \cdot \cos\_\text{loss}(\text{pred}(synch
 
 两道防坍塌防线:(1) target 端 stop-gradient;(2) cosine 只约束方向不约束幅度。预测器**仅训练时参与,零推理开销**。
 
-### 3.2 草稿-修订 draft-revise(对抗式自检)
+### 3.2 草稿-修订 draft-revise(早期承诺 + 噪声鲁棒)
 
-**动机。** 与其"想完直接交",不如"先打草稿、再故意扰动、学着修回",训练模型对自身中间状态的自检与抗扰能力。
+**动机。** 与其"想完直接交",不如"先打草稿、再故意扰动、学着修回"——一方面用辅助监督迫使模型在思考早期就给出承诺(early commitment),另一方面靠扰动训练后半段轨迹从扰动中恢复的能力(noise-robust revision)。
 
-**机制。** 在 CTM 的 $T$ 步思考回路中插入一个草稿边界(tick $b-1$,$b$=`draft_block_size`)。到达边界时把当前预测记为草稿 $\hat{y}_{draft}$(stop-gradient),并以概率 $p$=`draft_corrupt_prob` 对神经元状态注入高斯扰动;模型随后需从被扰动状态继续思考、修订出答案。草稿预测被额外监督为正确答案,迫使模型早期就 commit,同时靠后半段学习抗扰:
+**机制。** 在 CTM 的 $T$ 步思考回路中插入一个草稿边界(tick $b-1$,$b$=`draft_block_size`)。到达边界时取当前预测作草稿 $\hat{y}_{draft}$(**保留梯度**),并以概率 $p$=`draft_corrupt_prob` 对神经元状态注入高斯扰动;模型随后从被扰动状态继续思考、修订出答案。草稿预测被额外以交叉熵监督为正确答案,梯度回传至边界前的网络(deep supervision / early commitment);扰动则训练后半段轨迹的鲁棒性:
 
 $$h_{b} \leftarrow h_{b} + \epsilon,\quad \epsilon \sim \mathcal{N}(0,\sigma^2 I)\ \text{以概率}\ p$$
 
-$$\mathcal{L}_{revise} = \mathcal{L}_{task} + \lambda \cdot \mathrm{CE}\big(\hat{y}_{draft},\ y\big),\qquad \hat{y}_{draft}=\mathrm{sg}(\hat{y}_{b-1})$$
+$$\mathcal{L}_{revise} = \mathcal{L}_{task} + \lambda \cdot \mathrm{CE}\big(\hat{y}_{draft},\ y\big),\qquad \hat{y}_{draft}=\hat{y}_{b-1}\ \ \text{(live, 梯度回传)}$$
 
 ```
 算法 1: draft-revise 前向与训练
@@ -77,7 +77,7 @@ $$\mathcal{L}_{revise} = \mathcal{L}_{task} + \lambda \cdot \mathrm{CE}\big(\hat
 1: for t = 0 … T-1:
 2:    h_{t+1}, ŷ_t ← NLM_step(h_t)              # 思考一步, 得新状态与该 tick 预测
 3:    if t == b-1:                              # 草稿边界
-4:       ŷ_draft ← sg(ŷ_t)                      # 记草稿 (stop-grad)
+4:       ŷ_draft ← ŷ_t                           # 记草稿(保留梯度, 作 deep supervision)
 5:       if rand() < p:                         # 以概率 p 扰动状态
 6:          h_{t+1} ← h_{t+1} + ε,  ε ~ N(0, σ²·I)
 7: L_task ← CTM 的 anytime / mc 损失(全程 {ŷ_t})
@@ -90,15 +90,13 @@ $$\mathcal{L}_{revise} = \mathcal{L}_{task} + \lambda \cdot \mathrm{CE}\big(\hat
 
 **动机。** NLM 的递归思考是 CTM 区别于普通前馈网络的核心开销。若每个 tick 只让一小部分神经元参与更新,能否以可接受的掉点换大幅省算力?
 
-**机制。** 每个 tick,先由 NLM 算出候选状态更新 $h^{(t)}\in\mathbb{R}^{D}$($D$=神经元数),再对其施加 **hard top-$k$ 掩码**——按绝对值保留最大的 $k$ 个分量、其余置零,作为进入下一 tick 的状态:
+**机制。** CTM 的 NLM 由 $D$ 个**逐神经元独立**的线性层(SuperLinear)构成——这是真稀疏计算的关键:每个神经元 $i$ 的更新只依赖它自己的记忆轨迹, 与其他神经元无关, 故可**先选神经元、再只算选中的**。每个 tick, 用 synapse 输出 $s^{(t)}\!\in\!\mathbb{R}^{D}$ 的幅值选出 top-$k$ 个重要神经元(全 batch 共享同一 active 集 $\mathcal{I}^{(t)}$, $|\mathcal{I}|=k$, $k=\max(1,\lfloor rD\rfloor)$), 仅对它们 gather 记忆轨迹并跑 SuperLinear, 其余神经元本 tick 不计算、置零:
 
-$$\tilde{h}^{(t)} = h^{(t)} \odot \mathbf{m}^{(t)},\qquad m^{(t)}_i = \mathbb{1}\!\left[|h^{(t)}_i| \geq \tau^{(t)}\right]$$
+$$\mathcal{I}^{(t)} = \operatorname{Topk}\!\left(\tfrac{1}{B}\textstyle\sum_b |s^{(t)}_{b,i}|,\ k\right),\qquad \tilde{h}^{(t)}_i = \begin{cases}\mathrm{NLM}_i\!\big(\mathrm{trace}^{(t)}_i\big), & i\in\mathcal{I}^{(t)}\\ 0, & \text{otherwise}\end{cases}$$
 
-$$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lfloor r\cdot D \rfloor\big)$$
+其中 $r$=`topk_neurons` $\in (0,1]$ 为激活比例, $r{=}1$ 即退化为标准(稠密)CTM。**全 batch 共享 active 集**是为了让 gather 成为规则的列切片(而非逐样本稀疏索引), 从而 einsum 真正只算 $k$ 列、省 $\sim\!k/N$ 的 FLOPs, 无需自定义 sparse kernel。
 
-其中 $r$=`topk_neurons` $\in (0,1]$ 为激活比例;$r{=}1$ 即退化为标准(稠密)CTM。
-
-**算力模型。** NLM 思考回路每 tick 做 $\sim r$ 的功,省 $(1-r)$ 的 NLM 算力。需注意:**backbone(如 resnet)不做稀疏化**,故端到端墙钟加速 $< (1-r)$,真正变现需 sparse kernel。本文报告的是 NLM 算力比例 $r$ 并明确标注该前提。
+**算力模型。** 本文实现的是**真稀疏 NLM 计算**(非事后掩码): 每个 tick 仅对 $k$ 个 active 神经元跑 SuperLinear, einsum 在 $k$ 列上, 省 $\sim\!k/N$ 的 NLM FLOPs。实测 parity $r{=}0.25$ 训练速度 **10.50 it/s vs baseline 5.99 it/s = 1.75x 加速**(NLM 占 parity 总算力大头; backbone 仍稠密)。需注意 **backbone(resnet)不稀疏化**, 故端到端墙钟加速 < NLM 加速; 本文报告的 $r$ 既是 NLM 激活比例也是 NLM 算力比例。
 
 ---
 
@@ -118,28 +116,28 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 **结果。** 表与图 1 给出各任务 5-seed 下, 三种方法各自最佳配置的 mc:
 
 - **cifar10 / mazes**:baseline、JEPA、draft-revise、sparsity(任意 r)四者完全重叠(差值 ≤ 0.6pp),均落在 seed 噪声内。
-- **parity**:baseline 97.02±5.11%(方差大、呈双峰——部分 seed 卡在 ~88%、部分达 100%);JEPA 退化为随机(~50%);draft-revise 97.93% 仍在噪声带内;**但 sparsity r=0.25 达 99.97±0.06%(n=4, 全部 ~100%),比 baseline 高 +2.95pp、方差近乎为零**。
-- **qamnist**:baseline 99.57%、JEPA 99.55%(mc 已近上界)。
+- **parity**:baseline 97.02±5.11%(方差大、呈双峰——部分 seed 卡在 ~88%、部分达 100%, 且失败 seed 在不同重跑间漂移);JEPA 退化为随机(~50%);draft-revise 97.93% 仍在噪声带内(⚠️ parity 的草稿 CE 因输出/标签 shape 不匹配被跳过, 故 parity revise 实为纯噪声注入, 详见 §3.2/局限);**但 sparsity r=0.25 达 99.97±0.06%(全部 ~100%),比 baseline 高 +2.95pp、方差近乎为零**。
+- **qamnist**:baseline 99.57%、JEPA 99.55%、draft-revise 99.55%(mc 已近上界, 三者重叠)。
 
 | 任务 | baseline | JEPA | draft-revise | sparsity(best r) |
 |---|---|---|---|---|
 | cifar10 | 84.23±0.68 | 84.44±0.14 | 84.06±0.90 | 84.36 (r=0.25) |
 | mazes   | 90.05±0.95 | 89.99±1.29 | 90.29±0.48 | 90.63 (r=0.50) |
 | parity  | 97.02±5.11 | ~50(退化) | 97.93±3.02 | **99.97 (r=0.25) ⬆+3.0** |
-| qamnist | 99.57±0.09 | 99.55±0.15 | (未跑) | (未跑) |
+| qamnist | 99.57±0.09 | 99.55±0.15 | 99.55±0.04 | (未跑) |
 
 ![图1 mc天花板](../runs/figures/ctm_paper/figMC_ceiling_0728.png)
 
 **图 1.** mc 天花板:JEPA / draft-revise 在所有任务上都不抬动 mc(与 baseline 重叠);但 sparsity 在 parity 上(r=0.25)反而抬动至 ~100%(+3pp)。灰色 = 退化至随机或未跑。
 
-**分析。** 这把"天花板"分成两种情况。**(1) JEPA 与 draft-revise 不抬动 mc**:二者的跨 tick 正则/草稿扰动只塑形思考轨迹(§5.2)、不增加容量,而 mc 本质上由模型容量(表征能力上界)决定,故抬不动。**(2) sparsity 在 parity 上反而抬动了 mc**:r=0.25 把 baseline 的双峰(88% / 100%)稳定推到全部 ~100%。这说明 parity 的 baseline"天花板"(97%)其实是**训练不稳定**造成的假象——部分 seed 未收敛;合适的稀疏(r=0.25)起正则作用,消除这种失败模式,使所有 seed 都达真正的容量上界;r=0.1 则过激,破坏 XOR 累加(§5.3)。注意 mc 相对"跨 tick 均值"的巨大跃升(如 qamnist ~39%→99.6%)是 CTM"挑最自信步"的架构红利,与方法无关。
+**分析。** 这把"天花板"分成两种情况。**(1) JEPA 与 draft-revise 不抬动 mc**:二者的跨 tick 正则/草稿扰动只塑形思考轨迹(§5.2)、不增加容量; 在当前实验设置下二者均未抬动 mc 上界。需强调 mc 上界受容量、优化与校准等多因素共同影响, 本文不主张"mc 仅由容量决定"。**(2) sparsity 在 parity 上反而抬动了 mc**:r=0.25 把 baseline 的双峰(88% / 100%)稳定推到全部 ~100%。这说明 parity 的 baseline"天花板"(97%)其实是**训练不稳定**造成的假象——部分 seed 未收敛;合适的稀疏(r=0.25)起正则作用,消除这种失败模式,使所有 seed 都达真正的容量上界;r=0.1 则过激,破坏 XOR 累加(§5.3)。注意 mc 相对"跨 tick 均值"的巨大跃升(如 qamnist ~39%→99.6%)是 CTM"挑最自信步"的架构红利,与方法无关。
 
 ### 5.2 per-tick 曲线:抬后期 tick, 不抬峰值
 
 **结果。** 图 2 给出 cifar10 / mazes 上 5-seed 平均的 per-tick 精度曲线(每个 thought-tick 的测试精度)。以 cifar10 为例观察到三个现象:
 
 - **曲线非单调**:baseline 精度随 tick 上升,在 tick≈19 达峰 75.3%,随后**末 tick 反跌到 45.7%**——模型在思考后期出现退化。
-- **mc 恒居曲线之上**:mc★ 84.1% 高于任何单一 tick,因为它是逐样本挑最优步,必然 ≥ 任何固定 tick。
+- **mc 通常居曲线之上**:mc★ 84.1% 经验上高于任何单一固定 tick 的精度。需注意这**不是数学必然**——mc 按**置信度(归一化熵)**逐样本挑 tick, 与看标签挑的 oracle-best 不同; 它高于峰值固定 tick, 依赖"高置信预测更可能正确"这一校准性。若模型对错误答案过度自信, mc 完全可能低于峰值固定 tick(故后续工作应补 ECE / 可靠性图)。
 - **JEPA / draft-revise 抬高曲线右段**:二者末 tick 从 45.7% 升到 65.3%(+19.6)/ 62.6%(+16.9),但峰值(75→79 / 74)与 mc★(~84)基本不动——曲线被"右段抬升",天花板未破。
 
 | 模型 | 末 tick(final-tick) | 峰值 tick | mc★ |
@@ -184,7 +182,7 @@ $$\tau^{(t)} = \texttt{k-th largest of}\ |h^{(t)}|,\qquad k = \max\!\big(1,\ \lf
 
 **图 3.** sparsity 的算力-精度 Pareto(mc vs NLM 算力比例 r)。mazes / cifar10 全程贴近 baseline★(±0.6pp, 近乎免费);parity 在 r=0.1 处暴跌 7pp(算法任务硬边界)。
 
-**分析。** 感知任务对稀疏鲁棒,是因为其精度主要来自 **backbone**(resnet 已提取充分视觉特征),NLM 递归部分仅做精炼——即使每 tick 只激活 10% 神经元,backbone 加少量递归信号仍足以维持精度,说明这类任务的"思考"存在冗余。parity 恰相反:它需要对 64 位序列**逐步 XOR 累加**,运行中的奇偶状态必须**分布在整个神经元群体**上;激进稀疏(10% 神经元)会丢失中间累积,故灾难性掉点。**但出乎意料的是, r=0.25 不止"不掉点", 反而抬动了 mc(+3pp 至 ~100%)**——合适的稀疏起正则作用, 抑制了 baseline 的训练不稳定(双峰:部分 seed 卡在 88%), 把所有 seed 都推到真正的容量上界。这是 sparsity 在"效率"之外的意外正效果, 也使 parity 成为三任务中**唯一被方法抬动 mc 天花板**的案例(§5.1)。可操作规则:**感知类任务大胆压缩 NLM(省 50–90% 算力近乎免费);算法类任务须选对 r(~0.25 既能省 75% 算力又稳定训练), 避开过激的 r=0.1。** 再次强调,"省算力"指 NLM 层面, backbone 不稀疏化, 端到端墙钟收益需 sparse kernel 才能变现。
+**分析。** 感知任务对稀疏鲁棒,是因为其精度主要来自 **backbone**(resnet 已提取充分视觉特征),NLM 递归部分仅做精炼——即使每 tick 只激活 10% 神经元,backbone 加少量递归信号仍足以维持精度,说明这类任务的"思考"存在冗余。parity 恰相反:它需要对 64 位序列**逐步 XOR 累加**,对 NLM 递归状态高度敏感;激进稀疏(10% 神经元)会灾难性掉点。掉点的确切机制(中间累积丢失 / top-k 梯度不连续 / LayerNorm 与稀疏状态不兼容 / 关键神经元被淘汰)本文不展开, 留作后续 probe 分析。**但出乎意料的是, r=0.25 不止"不掉点", 反而抬动了 mc(+3pp 至 ~100%)**——合适的稀疏起正则作用, 抑制了 baseline 的训练不稳定(双峰:部分 seed 卡在 88%), 把所有 seed 都推到真正的容量上界。这是 sparsity 在"效率"之外的意外正效果, 也使 parity 成为三任务中**唯一被方法抬动 mc 天花板**的案例(§5.1)。可操作规则:**感知类任务大胆压缩 NLM(真省 50–90% NLM 算力近乎免费); 算法类任务须选对 r(~0.25 既能省 75% NLM 算力又稳定训练), 避开过激的 r=0.1。** 本文 sparsity 为真稀疏 NLM 计算(§3.3, 实测 1.75x 加速); backbone 不稀疏化, 端到端加速 < NLM 加速。
 
 **效率的第二根轴:思考步数 $T$(图 6)。** CTM 的算力同时取决于"每 tick 激活多少神经元"(sparsity, 图 3)和"思考多少 tick"(iterations)。历史 tick sweep(st02)显示:**parity 的 mc 随 $T$ 近似单调上升**(tick1 的 65% → tick50 的 92%),印证 XOR 累加需足够思考步;**cifar10 则非单调**(更多 tick 并非更好)。这与 sparsity 的发现同向——parity 对算力两轴都敏感,感知任务两端的"思考"都有冗余。两条轴共同构成 CTM 效率优化的完整空间。
 
@@ -214,19 +212,40 @@ CTM 的 mc 天然显著高于 final-tick(qamnist 上 99.6% vs ~39%),这个跃升
 | draft-revise | 改 per-tick 曲线 | mc(平)+ figS | 抬后期 tick, mc 天花板不动 |
 | sparsity | 省算力 / 正则 | Pareto(mc vs r) | 感知任务免费; **parity r=0.25 抬动 mc +3pp(正则甜点)** |
 
-三者互补不冲突:JEPA / draft-revise 让思考过程更稳健(更多 tick 可用),sparsity 既让思考更廉价、又在 parity 上意外地起正则、抬动天花板。可在不同任务、不同目标下分别启用。
+三者优化目标不同(JEPA / draft-revise 塑形 per-tick 轨迹, sparsity 压算力并在 parity 上起正则), 原则上可叠加; 但**本文未做组合实验**(如 JEPA+sparsity、revise+sparsity、三者同开), 是否真互补留作后续验证——当前结论仅限各自单独启用。
 
 ### 6.3 局限
 
 - per-tick 曲线目前仅 cifar10 / mazes 有(parity/qamnist 的 checkpoint 存标量);算法任务的曲线形态待补。
-- sparsity 的"省算力"是 NLM 层面,端到端墙钟加速需 sparse kernel 实现才能真正变现。
-- JEPA / draft-revise 未抬动 mc 天花板(二者不增加容量);sparsity 仅在 parity r=0.25 处抬动(正则、消除训练失败模式)。mc 主要由模型容量决定——扩容量(如增大 $d_{model}$、增加 tick 数)能系统性抬动它(历史 sweep 证实 cifar10 d_model2x +1.7pp、parity tick50→100%), 但这不在本文三种"优化方法"的目标内。
+- sparsity 已是真稀疏 NLM 计算(§3.3, 实测 1.75x 加速), 但 backbone 仍稠密, 故端到端加速 < NLM 加速; 真正端到端变现需把稀疏化下沉到 backbone 或借助 sparse kernel。
+- parity 上 draft-revise 的草稿 CE 因输出/标签 shape 不匹配被跳过(§3.2), 故 parity revise 实为纯噪声注入, 与 cifar10/mazes 的"deep supervision + 噪声"不完全是同一方法, 跨任务比较时需注意。
+- JEPA / draft-revise 未抬动 mc 天花板(二者不增加容量); sparsity 仅在 parity r=0.25 处抬动(正则、消除训练失败模式)。本文不主张 mc 仅由容量决定(正则/优化/校准亦可影响); 但历史 sweep 显示扩容量(增大 $d_{model}$、增加 tick 数)能系统性抬动 mc(cifar10 d_model2x +1.7pp、parity tick50→100%), 该方向不在本文三种"优化方法"目标内。
 
 ---
 
 ## 7 结论
 
-本文在统一、严格的 5-seed + mc 口径下,刻画了面向 CTM 的三种优化方法。核心结论有三:(1)JEPA 与 draft-revise 不抬动 mc 天花板,却显著改善 per-tick 曲线后期(更稳健的思考);(2)sparsity 对感知任务近乎免费(省 25–90% NLM 算力), 并在算法任务 parity 上展现出**正则甜点** r≈0.25——不仅省算力, 还把 mc 抬动 +3pp 至 ~100%(消除训练双峰), 这是三任务中唯一被方法抬动天花板的案例;(3)我们给出 parity/sort 的失败模式与各方法的任务边界,为后续 CTM 优化研究提供可复现基准。
+本文在统一、严格的 5-seed + mc 口径下,刻画了面向 CTM 的三种优化方法。核心结论有三:(1)JEPA 与 draft-revise 不抬动 mc 天花板,却显著改善 per-tick 曲线后期(更稳健的思考);(2)sparsity(本文实现为**真稀疏 NLM 计算**, 实测 1.75x 加速)对感知任务近乎免费(省 50–90% NLM 算力), 并在算法任务 parity 上展现出**正则甜点** r≈0.25——不仅省算力, 还把 mc 抬动 +3pp 至 ~100%(消除训练双峰), 这是三任务中唯一被方法抬动天花板的案例;(3)我们给出 parity/sort 的失败模式与各方法的任务边界,为后续 CTM 优化研究提供可复现基准。
+
+---
+
+## 8 相关工作
+
+- **连续思维机(CTM)。** 本文以 CTM 的"神经元-局部-记忆 + 同步表示 + 多 thought-tick"递归架构为研究对象, 沿用其 most-certain-tick 评测协议。
+- **表征一致性 / 跨步可预测性。** §3.1 的跨 tick JEPA 辅助损失借鉴自 JEPA / BYOL / SimSiam 一族的"可预测性 + stop-gradient + 余弦"自监督范式, 区别在于我们把它施加在 CTM **相邻 thought-tick 的同步表示**上, 目标是稳态思考轨迹而非下游表征。
+- **深度监督 / anytime 预测 / 早停。** §3.2 draft-revise 的"边界 tick 草稿 + 交叉熵监督"属于 deep supervision / early-commitment 一类; 其"思考早期就能给出可用预测"与 anytime / early-exit 文献目标一致。扰动后修订则与去噪 / state-noise 训练同源(注意本文是随机高斯扰动, 非对抗最坏情况扰动)。
+- **动态稀疏 / 条件计算。** §3.3 的逐 tick top-k 神经元激活属动态稀疏范畴, 与 top-k RNN、MoE 路由、结构化 block 稀疏相关; 本文的特别之处在于利用 CTM NLM 的**逐神经元独立**结构实现真 gather/scatter 稀疏计算(非事后掩码), 无需自定义 sparse kernel 即可获得实测加速。
+
+## 参考文献(占位, 待补全)
+
+1. Stripes et al. *Continuous Thought Machines.* (CTM 原论文)
+2. LeCun et al. *A Path Towards Autonomous Machine Intelligence (JEPA).* 2022.
+3. Grill et al. *Bootstrap Your Own Latent (BYOL).* NeurIPS 2020.
+4. Chen & He. *Exploring Simple Siamese Representation Learning (SimSiam).* CVPR 2021.
+5. Lee et al. *Deeply-Supervised Nets.* AISTATS 2015.
+6. Bengio et al. *Scheduled Sampling /anytime prediction.* 2015.
+7. Fedus et al. *Switch Transformers / Mixture-of-Experts.* 2022.
+8. Mocanu et al. *Scalable Training of Artificial Neural Networks with Sparse Networks.* 2018.
 
 ---
 

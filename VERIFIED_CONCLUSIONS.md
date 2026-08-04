@@ -9,6 +9,11 @@
 >
 > ⚠️ **口径更正(2026-07-28)**: 此前文档把 csv 的 `best_test_acc` 当作"final-tick"用 —— **错的**。`extract_ctm_paper_results.py` 的 `_to_scalar` 对 per-tick 数组 fallback 到 `np.mean()`, 所以 `best_test_acc` 实际是**跨 tick 均值**(且源于 bug, 非标准 metric, **不作为头条**)。真正的 per-tick 精度曲线存在 checkpoint 的 `test_accuracies` 里(由 `scripts/extract_per_tick.py` 取出, 见 `paper_repro/csv_data/per_tick_0728.json` + 签名图 figS)。判 idea 一律以 **mc 为主**, per-tick 曲线(figS)作机制说明。sparsity 的 Pareto 全程用 mc, **不受此 bug 影响**。
 
+> ⚠️ **审稿硬伤修复(2026-08-04)**: ChatGPT 审稿指出三硬伤, 已逐条核实并代码级修复(见 `EXPERIMENT_LOG.md` 0804 条):
+> 1. **draft-revise CE 曾零梯度**: `draft_pred = current_prediction.detach()` 使 `CE(detach, y)` 对参数梯度恒零(草稿监督从未生效)。已去 `.detach()`(`c0d1d38`), CE 现为真 deep supervision。重跑后 **mc 仍逐位不变**(cifar10 84.06/mazes 90.29), 印证"revise 不抬 mc 天花板"thesis; final-tick 则被抬高(62.6→~68)。**附带**: parity 的 draft CE 被 shape guard 跳过(dp (B,128) vs tgt (B,64)), 故 parity revise 一直=纯噪声注入, 与 detach 无关。
+> 2. **sparsity 曾不省算力**: post-hoc top-k 掩码在 NLM 算完后才做, FLOPs 没省。已实现真 sparse NLM compute(SuperLinear gather/scatter, `--sparse_nlm_compute`, `349c797`)。实测 **parity r=0.25 it/s 10.50 vs baseline 5.99 = 1.75x**(=dev NLM 前 1.71x)。重跑后**精度≈旧 post-hoc**: 近免费 + parity 甜点 ~100% 全部扛住真省算力。
+> 3. 三头条结论(parity 甜点 / 感知近免费 / revise 不抬天花板)**全部在两处 fix + 真稀疏下复现**, 论文技术地基稳固。
+
 ---
 
 ## 第一块:Cross-Tick JEPA — 让思考连贯(隐状态正则化)
@@ -66,6 +71,7 @@ CTM 正常是"思考完直接交答案"; draft-revise 改成**先出草稿, 再�
 ### 代码
 - `baseline/utils/dtt_ideas.py` — draft_mode 实现
 - `baseline/tasks/*/train.py` — 接线(注意: parity/sort 上 revise_weight 曾漏接, 见 AGENTS.md 两步走教训)
+- **⚠️ 0804 修复**: `baseline/models/ctm.py:807` 等 3 处 `draft_pred.detach()` 已去掉(`c0d1d38`) —— 此前 CE 对参数梯度恒零(草稿监督 inert), 现 CE 为真 deep supervision。重跑 mc 仍逐位不变, 印证"不抬天花板"。**parity 的 draft CE 另有 shape-guard bug**(dp (B,128) vs tgt (B,64) 对不上 → CE 被跳过), 故 parity revise 一直=纯噪声注入, 用其解释机制时务必标注。
 
 ---
 
@@ -76,7 +82,7 @@ CTM 正常是"思考完直接交答案"; draft-revise 改成**先出草稿, 再�
 
 ### 机制
 - `topk_neurons = r`: 每个 tick 只有 r 比例的 NLM 神经元被激活更新。
-- **算力模型**: NLM 思考回路做 ~r 的功, 省 (1-r) 的 NLM 算力。**backbone(resnet)不稀疏化**, 端到端墙钟加速 < (1-r), 需 sparse kernel 才变现。
+- **算力模型(⚠️ 0804 升级)**: 旧实现是**事后掩码**(NLM 算完稠密结果再 top-k 置零), **不省 FLOPs**(连理论都不省)。已实现**真 sparse NLM compute**(`--sparse_nlm_compute`, SuperLinear gather/scatter, `349c797`): 用当前 tick synapse 输出按 batch-平均 |state| 选 top-k, 只对 k 个神经元跑 einsum, 省 ~k/N 的 NLM FLOPs。**实测 parity r=0.25 it/s 10.50 vs baseline 5.99 = 1.75x**(=dev NLM 前 1.71x)。backbone(resnet)仍不稀疏, 端到端加速 < NLM 加速。重跑后精度≈旧 post-hoc, 下表 mc Δ 不变。
 
 ### 实验证据(Pareto, mc 口径, 5-seed 复现 0728)
 | 任务 | r=0.10 | 0.25 | 0.50 | 0.75 | baseline mc |

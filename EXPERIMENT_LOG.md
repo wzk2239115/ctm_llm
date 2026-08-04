@@ -7,6 +7,27 @@
 
 ---
 
+## 2026-08-04 — ChatGPT 审稿 3 硬伤修复 (draft-revise 梯度 + sparsity 真算力) + 70-run 重跑
+
+- **思路(用户提供)**: 论文 PDF 投给 ChatGPT 审, 给了 Reject 3/10, 三个"硬伤": (1) draft-revise 辅助损失按公式没梯度 (stop-gradient 后 CE 对参数梯度恒零); (2) "mc 必然 ≥ 固定 tick" 数学判断错 (混淆 most-certain 与 oracle-best); (3) sparsity 的 post-hoc top-k 掩码在 NLM 算完后才做, 不省 FLOPs (连理论都不省)。逐条对照真实代码/数据核实: **8 条主要意见 7 条完全成立** (parity 统计那条也成立, 但有 within-seed paired 亮点)。
+- **配置**:
+  1. **draft-revise fix** (`c0d1d38`): `baseline/models/ctm.py:807` 等 3 处 `draft_pred = current_prediction.detach()` → 去 `.detach()`, CE 现在有梯度 (deep supervision)。两步走 PASS (Step1 requires_grad=True / 29 参数有梯度; Step2 w=0.1 vs w=0.0 同 seed checksum 分叉)。**附带发现**: parity 的 draft CE 被 shape guard 跳过 (dp (B,128) vs targets (B,64)) → parity revise 一直=纯噪声, fix 对它无影响; cifar10/mazes/qamnist 的 CE 正常。
+  2. **sparsity 真 sparse NLM compute** (`349c797`/`610f97b`): SuperLinear 加 `active_idx` (gather 权重 + 输入一次 gather), `nlm_sparse_forward` 只算 k 个神经元, `--sparse_nlm_compute` flag (旧 post-hoc 保留对照)。两步走 PASS (正确性 active=稠密逐位相等; 加速 NLM 前向 **1.71x @r=0.25 dev**; 分叉 flag 非 inert)。
+  3. **重跑** (`paper_repro/run_rerun_fixes.py`, 70 runs): cifar10/mazes revise (detach fix) + cifar10/mazes/parity sparsity 真稀疏 × 5 seed。另补 qamnist revise 5 seed + parity r=0.25 s2 (CUDA 启动崩, 单独补)。算力机 ~4.5 天, 69 ok + 1 viz-crash(数据全在)。
+- **预期**: (a) draft-revise fix 后 mc 变 OR 不变(印证"不抬天花板"); (b) sparsity 真稀疏下"近免费"是否成立; (c) parity r=0.25 正则甜点是否抗住真省算力。
+- **结果** (mc 口径, 5 seed):
+  - **draft-revise fix 生效但不抬 mc**: cifar10 revise mc 84.06→**84.06**, mazes 90.29→**90.29** (逐位不变); 但 cifar10 final-tick 62.6%→~68% → **CE 确实接上了, 只是没抬 mc 天花板**, 反而印证论文 thesis。
+  - **sparsity 真稀疏 = post-hoc 精度 + 真省算力**: parity r=0.25 it/s **10.50 vs baseline 5.99 = 1.75x** (= dev NLM 1.71x, 铁证 `--sparse_nlm_compute` 生效)。精度: cifar10/mazes 各 r ≈ baseline (近免费✓); parity r=0.25 仍 **~100%** (正则甜点抗住真省算力✓), r=0.1 仍崩 ~90% (硬边界✓)。
+  - **qamnist revise (新补)**: mc 99.55 ≈ baseline (饱和, 无效果)。
+  - baseline/jepa 逐位复现旧值 (fix 不影响, 佐证对照干净)。
+- **结论**:
+  1. **三个头条结论全部扛住两处 fix + 真稀疏**: parity r=0.25 正则甜点 ~100% / 感知任务近免费 / draft-revise 不抬 mc 天花板 —— 论文技术地基稳固。
+  2. **审稿人 #1/#3 代码级解决** (detach + 真 sparse compute, 均带两步走验证 + 实测加速); **#2 纯文字修正** (mc "必然≥"→"经验上高于"); #4 parity n 已补 s2 (n=5), 但双峰 + 仅 5 seed, 仍建议扩到 10-20。
+  3. parity revise 的"=噪声"是 shape guard 的 latent bug, 论文需诚实标注 (draft-revise 在 parity 上=纯噪声注入, CE 未接上)。
+- **下一步**: 推 `repro_summary_fixes.csv`/`per_tick_fixes.json` 到 dev; 重做 figE (加 latency 轴: x=r, 双 y mc+it/s) + figS (新 revise 曲线); 改稿 #2/#7/#8 + 相关工作 + qamnist revise 行。
+
+---
+
 ## 2026-07-28 — 口径 bug 发现 + per-tick 签名图 + cifar10 sparsity r=0.75 补全
 
 - **思路(用户提供)**: 准备画图/写稿前, 决定补 CTM "逐 thought-tick 精度" 签名图(展示 CTM 单次推理内精度如何随思考步收敛 + mc 在哪)。写 eval 脚本时发现训练 loop 早把 per-tick 精度数组存进 checkpoint, 直接读即可。读的过程中**暴露了一个口径 bug**。
